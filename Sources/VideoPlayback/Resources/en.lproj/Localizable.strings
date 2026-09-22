@@ -1,0 +1,6 @@
+"video.play" = "Play";
+"video.pause" = "Pause";
+"video.fullscreen" = "Play fullscreen";
+"video.progress" = "Playback progress";
+"video.reset_zoom" = "Reset zoom";
+"video.close" = "Close";

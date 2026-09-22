@@ -1,0 +1,6 @@
+"video.play" = "Reproducir";
+"video.pause" = "Pausar";
+"video.fullscreen" = "Reproducir en pantalla completa";
+"video.progress" = "Progreso de reproducción";
+"video.reset_zoom" = "Restablecer zoom";
+"video.close" = "Cerrar";

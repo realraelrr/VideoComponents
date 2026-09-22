@@ -1,0 +1,6 @@
+"video.play" = "再生";
+"video.pause" = "一時停止";
+"video.fullscreen" = "フルスクリーンで再生";
+"video.progress" = "再生の進行状況";
+"video.reset_zoom" = "ズームをリセット";
+"video.close" = "閉じる";

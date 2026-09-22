@@ -1,0 +1,6 @@
+"video.play" = "재생";
+"video.pause" = "일시 정지";
+"video.fullscreen" = "전체 화면으로 재생";
+"video.progress" = "재생 진행률";
+"video.reset_zoom" = "줌 재설정";
+"video.close" = "닫기";

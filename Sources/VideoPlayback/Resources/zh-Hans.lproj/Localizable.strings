@@ -1,0 +1,6 @@
+"video.play" = "播放";
+"video.pause" = "暂停";
+"video.fullscreen" = "全屏播放";
+"video.progress" = "播放进度";
+"video.reset_zoom" = "重置缩放";
+"video.close" = "关闭";
