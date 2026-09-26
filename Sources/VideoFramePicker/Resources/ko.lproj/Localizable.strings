@@ -1,0 +1,6 @@
+"frame_picker.preview" = "프레임 미리보기";
+"frame_picker.time" = "프레임 시간";
+"frame_picker.processing" = "선택한 프레임 처리 중";
+"frame_picker.source_unavailable" = "동영상을 불러올 수 없습니다.";
+"frame_picker.frame_unavailable" = "이 동영상 프레임을 읽을 수 없습니다.";
+"frame_picker.selection_failed" = "선택한 프레임을 처리할 수 없습니다. 다시 시도해 주세요.";

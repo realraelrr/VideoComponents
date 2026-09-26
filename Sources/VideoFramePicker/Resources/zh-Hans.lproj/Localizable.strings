@@ -1,0 +1,6 @@
+"frame_picker.preview" = "画面预览";
+"frame_picker.time" = "画面时间";
+"frame_picker.processing" = "正在处理所选画面";
+"frame_picker.source_unavailable" = "暂时无法读取视频";
+"frame_picker.frame_unavailable" = "暂时无法读取视频帧";
+"frame_picker.selection_failed" = "所选画面处理失败，请重试";

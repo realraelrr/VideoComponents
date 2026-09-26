@@ -1,0 +1,6 @@
+"frame_picker.preview" = "畫面預覽";
+"frame_picker.time" = "畫面時間";
+"frame_picker.processing" = "正在處理所選畫面";
+"frame_picker.source_unavailable" = "暫時無法讀取影片";
+"frame_picker.frame_unavailable" = "暫時無法讀取影片畫面";
+"frame_picker.selection_failed" = "所選畫面處理失敗，請再試一次";

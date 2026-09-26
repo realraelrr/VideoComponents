@@ -1,0 +1,6 @@
+"frame_picker.preview" = "Vista previa del fotograma";
+"frame_picker.time" = "Tiempo del fotograma";
+"frame_picker.processing" = "Procesando selección";
+"frame_picker.source_unavailable" = "El vídeo no está disponible.";
+"frame_picker.frame_unavailable" = "No se puede leer este fotograma.";
+"frame_picker.selection_failed" = "No se puede procesar el fotograma seleccionado. Inténtalo de nuevo.";

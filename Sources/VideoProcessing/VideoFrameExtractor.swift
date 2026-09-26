@@ -31,13 +31,25 @@ public enum VideoFrameExtractor {
     guard seconds.isFinite, seconds >= 0 else {
       throw VideoFrameExtractionError.invalidTime
     }
+    let time = CMTime(seconds: seconds, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+    return try await frame(for: asset, at: time, maximumSize: maximumSize, exact: exact)
+  }
+
+  // Preserve an analyzed frame's rational timestamp for exact poster extraction.
+  // The public seconds API remains the convenience entry point for host callers.
+  static func frame(
+    for asset: AVAsset,
+    at time: CMTime,
+    maximumSize: CGSize,
+    exact: Bool
+  ) async throws -> ExtractedVideoFrame {
+    try Task.checkCancellation()
     guard maximumSize.width.isFinite, maximumSize.height.isFinite,
           (1...4096).contains(maximumSize.width),
           (1...4096).contains(maximumSize.height) else {
       throw VideoFrameExtractionError.invalidSize
     }
-    let time = CMTime(seconds: seconds, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
-    guard time.isNumeric else {
+    guard time.isNumeric, time.seconds.isFinite, time.seconds >= 0 else {
       throw VideoFrameExtractionError.frameUnavailable(cause: nil)
     }
     let generator = AsyncAssetImageGenerator(asset: asset, maximumSize: maximumSize, exact: exact)

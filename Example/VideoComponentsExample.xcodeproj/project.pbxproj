@@ -9,23 +9,29 @@
 		A00000000000000000000003 = {isa = PBXBuildFile; productRef = A00000000000000000000061; };
 		A00000000000000000000004 = {isa = PBXBuildFile; productRef = A00000000000000000000062; };
 		A00000000000000000000005 = {isa = PBXBuildFile; productRef = A00000000000000000000063; };
+		A00000000000000000000006 = {isa = PBXBuildFile; productRef = A00000000000000000000064; };
+		A00000000000000000000007 = {isa = PBXBuildFile; productRef = A00000000000000000000065; };
+		A00000000000000000000008 = {isa = PBXBuildFile; fileRef = A00000000000000000000015; };
+		A00000000000000000000009 = {isa = PBXBuildFile; fileRef = A00000000000000000000016; };
 		A00000000000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoComponentsExampleApp.swift; sourceTree = "<group>"; };
 		A00000000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPlaybackRuntimeResourcesTests.swift; sourceTree = "<group>"; };
 		A00000000000000000000013 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VideoComponentsExample.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A00000000000000000000014 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VideoComponentsExampleTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000015 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoFramePickerMountedTests.swift; sourceTree = "<group>"; };
+		A00000000000000000000016 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../Tests/VideoFramePickerTests/VideoFramePickerTestSupport.swift"; sourceTree = SOURCE_ROOT; };
 		A00000000000000000000020 = {
 			isa = PBXGroup;
 			children = (A00000000000000000000021, A00000000000000000000022, A00000000000000000000023,);
 			sourceTree = "<group>";
 		};
 		A00000000000000000000021 = {isa = PBXGroup; children = (A00000000000000000000011,); path = VideoComponentsExample; sourceTree = "<group>"; };
-		A00000000000000000000022 = {isa = PBXGroup; children = (A00000000000000000000012,); path = VideoComponentsExampleTests; sourceTree = "<group>"; };
+		A00000000000000000000022 = {isa = PBXGroup; children = (A00000000000000000000012, A00000000000000000000015, A00000000000000000000016,); path = VideoComponentsExampleTests; sourceTree = "<group>"; };
 		A00000000000000000000023 = {isa = PBXGroup; children = (A00000000000000000000013, A00000000000000000000014,); name = Products; sourceTree = "<group>"; };
 		A00000000000000000000030 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001,); runOnlyForDeploymentPostprocessing = 0; };
-		A00000000000000000000031 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000003, A00000000000000000000005,); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000031 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000003, A00000000000000000000005, A00000000000000000000006,); runOnlyForDeploymentPostprocessing = 0; };
 		A00000000000000000000032 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
-		A00000000000000000000033 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000002,); runOnlyForDeploymentPostprocessing = 0; };
-		A00000000000000000000034 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000004,); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000033 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000002, A00000000000000000000008, A00000000000000000000009,); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000034 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000004, A00000000000000000000007,); runOnlyForDeploymentPostprocessing = 0; };
 		A00000000000000000000035 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		A00000000000000000000040 = {
 			isa = PBXNativeTarget;
@@ -34,7 +40,7 @@
 			buildRules = ();
 			dependencies = ();
 			name = VideoComponentsExample;
-			packageProductDependencies = (A00000000000000000000061, A00000000000000000000063,);
+			packageProductDependencies = (A00000000000000000000061, A00000000000000000000063, A00000000000000000000064,);
 			productName = VideoComponentsExample;
 			productReference = A00000000000000000000013;
 			productType = "com.apple.product-type.application";
@@ -46,7 +52,7 @@
 			buildRules = ();
 			dependencies = (A00000000000000000000043,);
 			name = VideoComponentsExampleTests;
-			packageProductDependencies = (A00000000000000000000062,);
+			packageProductDependencies = (A00000000000000000000062, A00000000000000000000065,);
 			productName = VideoComponentsExampleTests;
 			productReference = A00000000000000000000014;
 			productType = "com.apple.product-type.bundle.unit-test";
@@ -80,6 +86,8 @@
 		A00000000000000000000061 = {isa = XCSwiftPackageProductDependency; package = A00000000000000000000060; productName = VideoPlayback; };
 		A00000000000000000000062 = {isa = XCSwiftPackageProductDependency; package = A00000000000000000000060; productName = VideoPlayback; };
 		A00000000000000000000063 = {isa = XCSwiftPackageProductDependency; package = A00000000000000000000060; productName = VideoProcessing; };
+		A00000000000000000000064 = {isa = XCSwiftPackageProductDependency; package = A00000000000000000000060; productName = VideoFramePicker; };
+		A00000000000000000000065 = {isa = XCSwiftPackageProductDependency; package = A00000000000000000000060; productName = VideoFramePicker; };
 		A00000000000000000000070 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000080, A00000000000000000000081,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		A00000000000000000000071 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000082, A00000000000000000000083,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		A00000000000000000000072 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000084, A00000000000000000000085,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };

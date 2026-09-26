@@ -16,7 +16,8 @@ fi
 for name in IsolatedConsumer Metadata.log PackageTests.log ConsumerTests.log \
   PackageTests.xcresult ConsumerTests.xcresult PackageDerivedData ConsumerDerivedData \
   ConsumerDeviceDerivedData ConsumerSimulatorBuild.log ConsumerDeviceBuild.log \
-  PlaybackOnlyDerivedData ProcessingOnlyDerivedData PlaybackOnlyBuild.log ProcessingOnlyBuild.log; do
+  PlaybackOnlyDerivedData ProcessingOnlyDerivedData FramePickerOnlyDerivedData \
+  PlaybackOnlyBuild.log ProcessingOnlyBuild.log FramePickerOnlyBuild.log; do
   if [ -e "$result_dir/$name" ]; then
     printf 'error: refusing to overwrite %s\n' "$result_dir/$name" >&2
     exit 1
@@ -48,7 +49,7 @@ print("Simulator OS build: " + runtime["buildversion"])
 } 2>&1 | tee "$result_dir/Metadata.log"
 
 # Each consumer references exactly one product from the same external package copy.
-for product in Playback Processing; do
+for product in Playback Processing FramePicker; do
   (
     cd "$isolated/${product}OnlyConsumer"
     xcodebuild -jobs "$jobs" -scheme "${product}OnlyConsumer" \
@@ -60,19 +61,22 @@ for product in Playback Processing; do
 from pathlib import Path
 import sys
 products = Path(sys.argv[1])
-expected = "Video" + sys.argv[2]
-other = "VideoProcessing" if expected == "VideoPlayback" else "VideoPlayback"
-if not (products / (expected + ".swiftmodule")).exists():
-    raise SystemExit("error: expected product was not built: " + expected)
-if (products / (other + ".swiftmodule")).exists() or (products / (other + ".o")).exists():
-    raise SystemExit("error: product consumer unexpectedly built " + other)
-print("verified independent product: " + expected)
+product = "Video" + sys.argv[2]
+all_products = {"VideoPlayback", "VideoProcessing", "VideoFramePicker"}
+expected = all_products if product == "VideoFramePicker" else {product}
+for name in sorted(expected):
+    if not (products / (name + ".swiftmodule")).exists():
+        raise SystemExit("error: expected product was not built: " + name)
+for name in sorted(all_products - expected):
+    if (products / (name + ".swiftmodule")).exists() or (products / (name + ".o")).exists():
+        raise SystemExit("error: product consumer unexpectedly built " + name)
+print("verified product dependency boundary: " + product)
 PY
 done
 
 (
   cd "$isolated/VideoComponents"
-  # Product schemes do not include test actions; the package scheme runs both targets.
+  # Product schemes do not include test actions; the package scheme runs all targets.
   xcodebuild -jobs "$jobs" -scheme VideoComponents-Package -destination "$destination" \
     -derivedDataPath "$result_dir/PackageDerivedData" \
     -resultBundlePath "$result_dir/PackageTests.xcresult" \
@@ -83,6 +87,9 @@ python3 "$script_dir/assert-results.py" "$result_dir/PackageTests.xcresult" \
   --expectations "$isolated/ExpectedPackageTests.json" \
   --suite VideoFrameTests --suite SlowVideoExportIntegrationTests \
   --suite SlowVideoExportRunnerTests --suite VideoPosterSelectionAlgorithmTests \
+  --suite AutomaticVideoPosterSelectionTests --suite VideoFramePickerOwnerTests \
+  --suite VideoFramePickerLifecycleTests --suite VideoFramePickerBoundaryTests \
+  --suite VideoFramePickerMediaTests \
   --suite VideoAdaptiveLayoutTests --suite PlaybackTransportTests --suite PlaybackAccessTests \
   --suite PlaybackGestureTests --suite PlaybackLocalizationTests \
   --suite PlaybackSeekCancellationTests \
@@ -103,7 +110,34 @@ python3 "$script_dir/assert-results.py" "$result_dir/PackageTests.xcresult" \
   --test PlaybackSeekCancellationTests/testResetRejectsOldCompletionWhenNewRequestHasSameTimeAndPrecision \
   --test PlaybackGestureTests/testPinchImmediatelyBlocksHoldDoubleTapAndPanBeforeSwiftUIRefresh \
   --test PlaybackGestureTests/testDismantleCancelsActivePinchHoldAndRemovesAllRecognizers \
-  --test PlaybackLocalizationTests/testRegionLocalesSelectTheirLanguageResource
+  --test PlaybackLocalizationTests/testRegionLocalesSelectTheirLanguageResource \
+  --test AutomaticVideoPosterSelectionTests/testDeduplicatesEquivalentActualTimesBeforeChoosingRepresentativeFrame \
+  --test AutomaticVideoPosterSelectionTests/testFinalRequestPreservesRationalTimeWithoutDoubleRoundTrip \
+  --test AutomaticVideoPosterSelectionTests/testFinalExtractionRejectsDifferentActualFrameWithoutFallback \
+  --test VideoPosterSelectionAlgorithmTests/testQualityThresholdPrecedesRepresentativeness \
+  --test VideoPosterSelectionAlgorithmTests/testRepresentativeFrameAtQualityThresholdBeatsTechnicalMaximum \
+  --test VideoFramePickerOwnerTests/testInitialPreviewNeverConsumesAndPreservesActualFrameTime \
+  --test VideoFramePickerOwnerTests/testScrubbingDoesNotExtractUntilReleaseAndConsumesLatestValueOnce \
+  --test VideoFramePickerOwnerTests/testTouchWithoutValueChangeDoesNotConsume \
+  --test VideoFramePickerOwnerTests/testPendingRetouchWithoutChangeKeepsIntentAndOriginalCallbacks \
+  --test VideoFramePickerOwnerTests/testNonScrubbingValueChangeUsesExactPipeline \
+  --test VideoFramePickerOwnerTests/testSameTimeReplacementRejectsLateFrameAndLateFailure \
+  --test VideoFramePickerOwnerTests/testHostAwaitLocksSliderAndFailureKeepsExactPreview \
+  --test VideoFramePickerOwnerTests/testHostAwaitSuccessEndsActivityOnlyWhenConsumerReturns \
+  --test VideoFramePickerOwnerTests/testSourceAToBToARejectsOriginalLoaderEvenWhenIdentityMatchesAgain \
+  --test VideoFramePickerOwnerTests/testSourceSwitchDuringConsumerCannotUnlockNewPendingSelection \
+  --test VideoFramePickerOwnerTests/testStopSynchronouslyDetachesPlayerAndRejectsLateFrame \
+  --test VideoFramePickerLifecycleTests/testSuspendedLoaderDoesNotRetainOwnerAndReceivesCancellation \
+  --test VideoFramePickerLifecycleTests/testSuspendedMetadataInspectionDoesNotRetainOwnerOrCancelBorrowedAsset \
+  --test VideoFramePickerLifecycleTests/testSuspendedFrameExtractionDoesNotRetainOwnerAndDetachesItsItem \
+  --test VideoFramePickerLifecycleTests/testSuspendedConsumerDoesNotRetainOwnerAndReceivesCancellation \
+  --test VideoFramePickerBoundaryTests/testInvalidConfigurationFailsBeforeCallingLoader \
+  --test VideoFramePickerBoundaryTests/testInvalidAndUnrepresentableDurationsNeverReachPlayerOrExtractor \
+  --test VideoFramePickerBoundaryTests/testSixLanguageResourcesResolveEveryFieldAndRegionFallback \
+  --test VideoFramePickerMediaTests/testRealInitialPipelineHandlesLandscapePortraitRotationAndFrameBudget \
+  --test VideoFramePickerMediaTests/testRealUserSelectionReturnsDecodedFrameInPausedMutedPlayer \
+  --test VideoFramePickerMediaTests/testRealEndpointReturnsActualEncodedTimeOrTypedFrameFailure \
+  --test VideoFramePickerMediaTests/testRealMissingVideoAndUnreadableFileProduceSourceFailure
 
 xcodebuild -jobs "$jobs" -project "$consumer_project" -scheme VideoComponentsExample \
   -destination "$destination" -derivedDataPath "$result_dir/ConsumerDerivedData" \
@@ -112,10 +146,19 @@ xcodebuild -jobs "$jobs" -project "$consumer_project" -scheme VideoComponentsExa
   2>&1 | tee "$result_dir/ConsumerTests.log"
 
 python3 "$script_dir/assert-results.py" "$result_dir/ConsumerTests.xcresult" \
-  --suite VideoPlaybackRuntimeResourcesTests \
+  --expectations "$isolated/ExpectedConsumerTests.json" \
+  --suite VideoPlaybackRuntimeResourcesTests --suite VideoFramePickerRuntimeResourcesTests \
+  --suite VideoFramePickerMountedTests \
   --test VideoPlaybackRuntimeResourcesTests/testEnglishResourcesResolveFromTheConsumedPackage \
   --test VideoPlaybackRuntimeResourcesTests/testSimplifiedChineseResourcesResolveFromTheConsumedPackage \
-  --test VideoPlaybackRuntimeResourcesTests/testRegionalLocalesResolveFromTheConsumedPackage
+  --test VideoPlaybackRuntimeResourcesTests/testRegionalLocalesResolveFromTheConsumedPackage \
+  --test VideoFramePickerRuntimeResourcesTests/testEnglishResourcesResolveFromTheConsumedPackage \
+  --test VideoFramePickerRuntimeResourcesTests/testSimplifiedChineseResourcesResolveFromTheConsumedPackage \
+  --test VideoFramePickerRuntimeResourcesTests/testRegionalLocalesResolveFromTheConsumedPackage \
+  --test VideoFramePickerMountedTests/testMountedSliderUsesUpdatedHandlerWithoutReloadingSameIdentity \
+  --test VideoFramePickerMountedTests/testMountedConsumerKeepsNativeSliderDisabledAndUnmountUnlocksSynchronously \
+  --test VideoFramePickerMountedTests/testAppearanceCycleRestartsStoppedSameIdentityWithoutRebuildingForRedraw \
+  --test VideoFramePickerMountedTests/testSeparateMountedInstancesSettleOnlyTheirOwnActivity
 
 xcodebuild -jobs "$jobs" -project "$consumer_project" -scheme VideoComponentsExample \
   -destination 'generic/platform=iOS Simulator' -derivedDataPath "$result_dir/ConsumerDerivedData" \

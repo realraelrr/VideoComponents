@@ -1,5 +1,6 @@
 import AVFoundation
 import SwiftUI
+import VideoFramePicker
 import VideoPlayback
 import VideoProcessing
 
@@ -43,6 +44,9 @@ private struct VideoComponentsDemo: View {
               preview(poster, label: "Automatic poster")
             }
           }
+          if let originalURL = media.originalURL {
+            framePicker(for: originalURL)
+          }
           exportControls
         }
         .padding()
@@ -64,6 +68,25 @@ private struct VideoComponentsDemo: View {
       .task(id: exportRequest) {
         guard exportRequest > 0 else { return }
         await media.export()
+      }
+    }
+  }
+
+  private func framePicker(for url: URL) -> some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Choose a frame").font(.headline)
+      VideoFramePickerView(
+        source: VideoFramePickerSource(identity: url, load: { AVURLAsset(url: url) }),
+        onSelection: { selection in
+          try media.acceptSelection(selection, for: url)
+        }
+      )
+      if let selection = media.selectedFrame {
+        preview(UIImage(cgImage: selection.image), label: "Selected frame")
+        Text("Requested: \(selection.requestedSeconds, format: .number.precision(.fractionLength(3))) s")
+          .font(.caption.monospacedDigit())
+        Text("Decoded: \(selection.actualTime.seconds, format: .number.precision(.fractionLength(3))) s")
+          .font(.caption.monospacedDigit())
       }
     }
   }
@@ -114,17 +137,25 @@ private final class DemoMedia: ObservableObject {
   let session = PlaybackSession()
   @Published private(set) var firstFrame: UIImage?
   @Published private(set) var poster: UIImage?
+  @Published private(set) var selectedFrame: VideoFrameSelection?
+  @Published private(set) var originalURL: URL?
   @Published private(set) var exportedURL: URL?
   @Published private(set) var isPreparing = true
   @Published private(set) var isExporting = false
   @Published private(set) var exportProgress = 0.0
   @Published private(set) var message: String?
-  private var originalURL: URL?
 
   isolated deinit {
     session.cleanup()
     if let originalURL { try? FileManager.default.removeItem(at: originalURL) }
     if let exportedURL { try? FileManager.default.removeItem(at: exportedURL) }
+  }
+
+  func acceptSelection(_ selection: VideoFrameSelection, for sourceURL: URL) throws {
+    // The picker owns cancellation; the host guards its final state mutation.
+    try Task.checkCancellation()
+    guard originalURL == sourceURL else { throw CancellationError() }
+    selectedFrame = selection
   }
 
   func prepare() async {

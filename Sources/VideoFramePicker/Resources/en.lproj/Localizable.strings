@@ -1,0 +1,6 @@
+"frame_picker.preview" = "Frame preview";
+"frame_picker.time" = "Frame time";
+"frame_picker.processing" = "Processing selection";
+"frame_picker.source_unavailable" = "The video is unavailable.";
+"frame_picker.frame_unavailable" = "Unable to read this video frame.";
+"frame_picker.selection_failed" = "Unable to process the selected frame. Try again.";

@@ -8,6 +8,24 @@ import shutil
 import sys
 
 
+def discover_tests(root):
+    suites, tests = set(), set()
+    for file in sorted(root.rglob("*.swift")):
+        current = None
+        for line in file.read_text().splitlines():
+            declaration = re.search(r"\bclass\s+(\w+)\s*:\s*([^\{]+)", line)
+            if declaration:
+                current = declaration[1] if "XCTestCase" in declaration[2] else None
+            # XCTest discovery excludes private helpers and methods with parameters.
+            test = re.search(r"^\s*(?:public\s+|internal\s+)?func\s+(test\w+)\s*\(\s*\)", line)
+            if current and test:
+                suites.add(current)
+                tests.add(current + "/" + test[1])
+    if not suites or not tests:
+        raise ValueError(f"no discoverable XCTest cases in {root}")
+    return {"suites": sorted(suites), "tests": sorted(tests)}
+
+
 def copy_validation(source, isolated):
     if isolated.is_relative_to(source):
         raise ValueError("validation consumers must live outside the package")
@@ -20,28 +38,21 @@ def copy_validation(source, isolated):
                     ignore=shutil.ignore_patterns("xcuserdata", ".DS_Store"))
     project = isolated / "Consumer/VideoComponentsExample.xcodeproj/project.pbxproj"
     project_text = project.read_text()
-    reference = 'relativePath = "..";'
-    if project_text.count(reference) != 1:
-        raise ValueError("expected exactly one local package reference")
-    project.write_text(project_text.replace(reference, 'relativePath = "../VideoComponents";'))
+    references = {
+        'relativePath = "..";': 'relativePath = "../VideoComponents";',
+        'path = "../Tests/VideoFramePickerTests/VideoFramePickerTestSupport.swift";':
+            'path = "../VideoComponents/Tests/VideoFramePickerTests/VideoFramePickerTestSupport.swift";',
+    }
+    for original, replacement in references.items():
+        if project_text.count(original) != 1:
+            raise ValueError(f"expected exactly one project reference: {original}")
+        project_text = project_text.replace(original, replacement)
+    project.write_text(project_text)
 
-    suites, tests = set(), set()
-    for file in sorted((package / "Tests").rglob("*.swift")):
-        current = None
-        for line in file.read_text().splitlines():
-            declaration = re.search(r"\bclass\s+(\w+)\s*:\s*([^\{]+)", line)
-            if declaration:
-                current = declaration[1] if "XCTestCase" in declaration[2] else None
-            # XCTest discovery excludes private helpers and methods with parameters.
-            test = re.search(r"^\s*(?:public\s+|internal\s+)?func\s+(test\w+)\s*\(\s*\)", line)
-            if current and test:
-                suites.add(current)
-                tests.add(current + "/" + test[1])
-    if not suites or not tests:
-        raise ValueError("the isolated package contains no discoverable XCTest cases")
-    (isolated / "ExpectedPackageTests.json").write_text(json.dumps({
-        "suites": sorted(suites), "tests": sorted(tests),
-    }, indent=2) + "\n")
+    package_tests = discover_tests(package / "Tests")
+    consumer_tests = discover_tests(isolated / "Consumer/VideoComponentsExampleTests")
+    for name, expectations in [("Package", package_tests), ("Consumer", consumer_tests)]:
+        (isolated / f"Expected{name}Tests.json").write_text(json.dumps(expectations, indent=2) + "\n")
 
     consumers = {
         "PlaybackOnlyConsumer": ("VideoPlayback", """import AVFoundation
@@ -84,6 +95,34 @@ public enum ProcessingOnlyConsumer {
   }
 }
 """),
+        "FramePickerOnlyConsumer": ("VideoFramePicker", """import AVFoundation
+import SwiftUI
+import VideoFramePicker
+
+@MainActor
+public enum FramePickerOnlyConsumer {
+  public static func view(
+    asset: AVAsset,
+    onSelection: @escaping @MainActor (VideoFrameSelection) async throws -> Void
+  ) -> some View {
+    VideoFramePickerView(
+      source: VideoFramePickerSource(identity: "fixture", load: { asset }),
+      initialTime: 0,
+      maximumFrameSize: CGSize(width: 640, height: 640),
+      labels: VideoFramePickerLabels(locale: Locale(identifier: "en")),
+      style: VideoFramePickerStyle(tint: .blue),
+      onSelectionActivityChanged: { _ in },
+      onFailure: { _ in },
+      onSelection: { selection in
+        try Task.checkCancellation()
+        try await onSelection(selection)
+      }
+    )
+  }
+
+  public static func labels() -> VideoFramePickerLabels { .init(locale: Locale(identifier: "zh_CN")) }
+}
+"""),
     }
     for name, (product, code) in consumers.items():
         root = isolated / name
@@ -100,7 +139,8 @@ let package = Package(
 )
 ''')
         (target / (name + ".swift")).write_text(code)
-    print(f"prepared independent consumers and {len(tests)} required tests in {isolated}")
+    print(f"prepared independent consumers and {len(package_tests['tests'])} package / "
+          f"{len(consumer_tests['tests'])} consumer required tests in {isolated}")
 
 
 if __name__ == "__main__":

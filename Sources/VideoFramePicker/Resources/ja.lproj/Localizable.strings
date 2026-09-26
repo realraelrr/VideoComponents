@@ -1,0 +1,6 @@
+"frame_picker.preview" = "フレームのプレビュー";
+"frame_picker.time" = "フレームの時間";
+"frame_picker.processing" = "選択したフレームを処理中";
+"frame_picker.source_unavailable" = "動画を読み込めません。";
+"frame_picker.frame_unavailable" = "この動画フレームを読み込めません。";
+"frame_picker.selection_failed" = "選択したフレームを処理できません。もう一度お試しください。";

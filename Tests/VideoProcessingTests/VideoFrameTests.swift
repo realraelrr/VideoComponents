@@ -73,7 +73,7 @@ final class VideoFrameTests: XCTestCase {
     XCTAssertEqual(frame.actualTime.seconds, 0, accuracy: 0.001)
     XCTAssertEqual(frame.image.width, 96)
     XCTAssertEqual(frame.image.height, 128)
-    XCTAssertEqual(AutomaticVideoPosterSelector.candidateTimes(duration: 1.0 / 30), [0])
+    XCTAssertEqual(AutomaticVideoPosterSelector.candidateTimes(duration: 1.0 / 30), [1.0 / 60])
   }
 
   func testMissingVideoAndDamagedAssetHaveTypedFrameFailures() async throws {
@@ -89,11 +89,15 @@ final class VideoFrameTests: XCTestCase {
     }
   }
 
-  func testAutomaticPosterKeepsVersionOneAndUnknownDurationCandidateStrategy() {
-    XCTAssertEqual(AutomaticVideoPosterSelector.algorithmVersion, 1)
-    XCTAssertEqual(AutomaticVideoPosterSelector.candidateTimes(duration: 20), [2, 5, 9, 13, 17])
-    for duration in [Double.nan, .infinity, -.infinity, 0, -1] {
-      XCTAssertEqual(AutomaticVideoPosterSelector.candidateTimes(duration: duration), [0])
+  func testAutomaticPosterUsesBoundedVersionTwoSamplingAndRejectsInvalidDuration() {
+    XCTAssertEqual(AutomaticVideoPosterSelector.algorithmVersion, 2)
+    let times = AutomaticVideoPosterSelector.candidateTimes(duration: 20)
+    XCTAssertEqual(times.count, 12)
+    XCTAssertEqual(times.first!, 20.0 / 24, accuracy: 0.000001)
+    XCTAssertEqual(times.last!, 20.0 * 23 / 24, accuracy: 0.000001)
+    XCTAssertEqual(AutomaticVideoPosterSelector.candidateTimes(duration: 0), [0])
+    for duration in [Double.nan, .infinity, -.infinity, -1] {
+      XCTAssertEqual(AutomaticVideoPosterSelector.candidateTimes(duration: duration), [])
     }
   }
 
