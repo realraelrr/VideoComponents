@@ -78,7 +78,7 @@ enum VideoZoomConfig {
   }
 }
 
-enum VideoZoomAnchorCalculator {
+enum VideoZoomGeometry {
   static func contentRect(containerSize: CGSize, contentAspectRatio: CGFloat?) -> CGRect {
     guard containerSize.width > 0,
           containerSize.height > 0 else {
@@ -103,59 +103,33 @@ enum VideoZoomAnchorCalculator {
     return CGRect(x: (containerSize.width - width) / 2, y: 0, width: width, height: height)
   }
 
-  static func anchor(
-    for location: CGPoint,
-    containerSize: CGSize,
-    contentAspectRatio: CGFloat?
-  ) -> CGPoint {
-    guard containerSize.width > 0,
-          containerSize.height > 0 else {
-      return CGPoint(x: 0.5, y: 0.5)
-    }
-
-    let rect = contentRect(containerSize: containerSize, contentAspectRatio: contentAspectRatio)
-    let clampedX = min(max(location.x, rect.minX), rect.maxX)
-    let clampedY = min(max(location.y, rect.minY), rect.maxY)
-    return CGPoint(
-      x: clampedX / containerSize.width,
-      y: clampedY / containerSize.height
-    )
-  }
 }
 
 enum VideoZoomBounds {
-  /// Bounds the transformed video, including aspect-fit letterboxing and its scale anchor.
+  /// Bounds center-scaled video, including its aspect-fit letterboxing.
   static func clampedOffset(
-    _ offset: CGSize, scale: CGFloat, anchor: CGPoint,
+    _ offset: CGSize, scale: CGFloat,
     containerSize: CGSize, contentAspectRatio: CGFloat?
   ) -> CGSize {
     guard containerSize.width.isFinite, containerSize.height.isFinite,
       containerSize.width > 0, containerSize.height > 0 else { return .zero }
-    let rect = VideoZoomAnchorCalculator.contentRect(
+    let rect = VideoZoomGeometry.contentRect(
       containerSize: containerSize, contentAspectRatio: contentAspectRatio
     )
     let scale = VideoZoomConfig.clampedScale(scale)
     return CGSize(
-      width: clampedAxis(offset.width, minimum: rect.minX, length: rect.width,
-        viewport: containerSize.width, scale: scale, anchor: anchor.x),
-      height: clampedAxis(offset.height, minimum: rect.minY, length: rect.height,
-        viewport: containerSize.height, scale: scale, anchor: anchor.y)
+      width: clampedAxis(offset.width, length: rect.width, viewport: containerSize.width, scale: scale),
+      height: clampedAxis(offset.height, length: rect.height, viewport: containerSize.height, scale: scale)
     )
   }
 
   private static func clampedAxis(
-    _ offset: CGFloat, minimum: CGFloat, length: CGFloat,
-    viewport: CGFloat, scale: CGFloat, anchor: CGFloat
+    _ offset: CGFloat, length: CGFloat, viewport: CGFloat, scale: CGFloat
   ) -> CGFloat {
-    let anchor = anchor.isFinite ? min(max(anchor, 0), 1) : 0.5
-    let transformedMinimum = minimum * scale + viewport * anchor * (1 - scale)
-    let transformedLength = length * scale
     // An axis smaller than the viewport stays centered; a larger one covers the viewport.
-    if transformedLength <= viewport {
-      return (viewport - transformedLength) / 2 - transformedMinimum
-    }
+    let limit = max(0, (length * scale - viewport) / 2)
     let offset = offset.isFinite ? offset : 0
-    return min(max(offset, viewport - transformedMinimum - transformedLength), -transformedMinimum)
+    return min(max(offset, -limit), limit)
   }
 }
 

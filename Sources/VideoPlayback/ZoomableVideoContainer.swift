@@ -21,7 +21,6 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
   let overlay: (VideoZoomContext) -> Overlay
 
   @State private var currentScale: CGFloat = 1
-  @State private var currentAnchor: UnitPoint = .center
   @State private var currentOffset: CGSize = .zero
   @State private var isActivePinchGesture = false
   @State private var gestureStartLocation: CGPoint = .zero
@@ -61,7 +60,7 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
         ZStack {
           content
             .frame(width: proxy.size.width, height: proxy.size.height)
-            .scaleEffect(currentScale, anchor: currentAnchor)
+            .scaleEffect(currentScale)
             .offset(currentOffset)
         }
         .frame(width: proxy.size.width, height: proxy.size.height)
@@ -116,38 +115,15 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
       guard isActivePinchGesture else { return }
       isMultiTouchGestureActive = true
 
-      let clampedLocation = clampedContentLocation(value.location, containerSize: containerSize)
-      let anchor = VideoZoomAnchorCalculator.anchor(
-        for: clampedLocation,
-        containerSize: containerSize,
-        contentAspectRatio: contentAspectRatio
-      )
-      gestureStartLocation = clampedLocation
+      gestureStartLocation = value.location
       gestureStartOffset = currentOffset
       panStartOffset = currentOffset
       gestureStartScale = currentScale
-      if !VideoZoomConfig.isZoomed(currentScale) {
-        currentAnchor = UnitPoint(x: anchor.x, y: anchor.y)
-      }
-      currentScale = VideoZoomConfig.scale(
-        startScale: gestureStartScale,
-        gestureScale: value.scale
-      )
-      currentOffset = boundedOffset(gestureStartOffset, in: containerSize)
-      updateIsZooming()
+      updatePinch(value, in: containerSize)
     case .changed:
       guard isActivePinchGesture else { return }
       isMultiTouchGestureActive = true
-      let clampedLocation = clampedContentLocation(value.location, containerSize: containerSize)
-      currentScale = VideoZoomConfig.scale(
-        startScale: gestureStartScale,
-        gestureScale: value.scale
-      )
-      currentOffset = boundedOffset(CGSize(
-        width: gestureStartOffset.width + (clampedLocation.x - gestureStartLocation.x),
-        height: gestureStartOffset.height + (clampedLocation.y - gestureStartLocation.y)
-      ), in: containerSize)
-      updateIsZooming()
+      updatePinch(value, in: containerSize)
     case .ended, .cancelled, .failed:
       finishPinchGesture()
     default:
@@ -179,15 +155,16 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
     }
   }
 
-  private func clampedContentLocation(_ location: CGPoint, containerSize: CGSize) -> CGPoint {
-    let rect = VideoZoomAnchorCalculator.contentRect(
-      containerSize: containerSize,
-      contentAspectRatio: contentAspectRatio
-    )
-    return CGPoint(
-      x: min(max(location.x, rect.minX), rect.maxX),
-      y: min(max(location.y, rect.minY), rect.maxY)
-    )
+  private func updatePinch(_ value: SupplementPinchGestureValue, in containerSize: CGSize) {
+    currentScale = VideoZoomConfig.scale(startScale: gestureStartScale, gestureScale: value.scale)
+    let ratio = currentScale / gestureStartScale
+    let center = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+    // Keep the source point beneath the starting fingers beneath the current fingers.
+    currentOffset = boundedOffset(CGSize(
+      width: value.location.x - center.x - (gestureStartLocation.x - center.x - gestureStartOffset.width) * ratio,
+      height: value.location.y - center.y - (gestureStartLocation.y - center.y - gestureStartOffset.height) * ratio
+    ), in: containerSize)
+    updateIsZooming()
   }
 
   private func finishPinchGesture() {
@@ -216,7 +193,6 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
 
   private func restoreIdentityZoom() {
     currentScale = 1
-    currentAnchor = .center
     currentOffset = .zero
     updateIsZooming()
   }
@@ -241,7 +217,6 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
 
   private func boundedOffset(_ offset: CGSize, in containerSize: CGSize) -> CGSize {
     VideoZoomBounds.clampedOffset(offset, scale: currentScale,
-      anchor: CGPoint(x: currentAnchor.x, y: currentAnchor.y),
       containerSize: containerSize, contentAspectRatio: contentAspectRatio)
   }
 

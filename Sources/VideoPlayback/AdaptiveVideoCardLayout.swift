@@ -14,20 +14,13 @@ public struct AdaptiveVideoCardLayout: Layout {
     subviews: Subviews,
     cache: inout ()
   ) -> CGSize {
-    let resolvedMaximumSize = if let contentAspectRatio,
-                                 contentAspectRatio.isFinite,
-                                 contentAspectRatio > 0 {
-      maximumSize
-    } else {
-      VideoPlayerLayout.defaultMaximumSize
-    }
     return VideoPlayerLayout.adaptiveCardSize(
       forAvailableSize: CGSize(
-        width: proposal.width ?? resolvedMaximumSize.width,
-        height: proposal.height ?? resolvedMaximumSize.height
+        width: proposal.width ?? maximumSize.width,
+        height: proposal.height ?? maximumSize.height
       ),
       contentAspectRatio: contentAspectRatio,
-      maximumSize: resolvedMaximumSize
+      maximumSize: maximumSize
     )
   }
 

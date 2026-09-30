@@ -60,10 +60,8 @@ final class PlaybackGestureTests: XCTestCase {
 
   func testAnchorClampAspectFitAndScaleBounds() {
     let size = CGSize(width: 320, height: 450)
-    let rect = VideoZoomAnchorCalculator.contentRect(containerSize: size, contentAspectRatio: 16 / 9)
+    let rect = VideoZoomGeometry.contentRect(containerSize: size, contentAspectRatio: 16 / 9)
     XCTAssertEqual(rect, CGRect(x: 0, y: 135, width: 320, height: 180))
-    XCTAssertEqual(VideoZoomAnchorCalculator.anchor(for: CGPoint(x: -100, y: 900),
-      containerSize: size, contentAspectRatio: 16 / 9), CGPoint(x: 0, y: 0.7))
     XCTAssertEqual(VideoZoomConfig.scale(startScale: 2, gestureScale: 4), 3)
     XCTAssertEqual(VideoZoomConfig.clampedScale(.nan), 1)
     XCTAssertFalse(VideoGesturePolicy.allowsSingleFingerPan(isZoomed: false, isMultiTouchGestureActive: false))

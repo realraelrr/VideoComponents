@@ -18,15 +18,6 @@ final class VideoZoomBoundsTests: XCTestCase {
       CGSize(width: 0, height: -160))
   }
 
-  func testOffCenterAnchorRequiresAsymmetricOffsetBounds() {
-    let size = CGSize(width: 320, height: 450)
-    let anchor = CGPoint(x: 0, y: 0.3)
-    XCTAssertEqual(bound(CGSize(width: 9_000, height: 9_000), size: size, anchor: anchor),
-      CGSize(width: 0, height: -90))
-    XCTAssertEqual(bound(CGSize(width: -9_000, height: -9_000), size: size, anchor: anchor),
-      CGSize(width: -320, height: -90))
-  }
-
   func testUnzoomedVideoCannotMoveAndUnknownAspectRatioUsesViewport() {
     XCTAssertEqual(bound(CGSize(width: 90, height: -90), size: CGSize(width: 320, height: 450), scale: 1), .zero)
     XCTAssertEqual(bound(CGSize(width: 9_000, height: 9_000), size: CGSize(width: 320, height: 450), ratio: nil),
@@ -47,9 +38,9 @@ final class VideoZoomBoundsTests: XCTestCase {
 
   private func bound(
     _ offset: CGSize, size: CGSize, scale: CGFloat = 2,
-    anchor: CGPoint = CGPoint(x: 0.5, y: 0.5), ratio: CGFloat? = 16 / 9
+    ratio: CGFloat? = 16 / 9
   ) -> CGSize {
-    VideoZoomBounds.clampedOffset(offset, scale: scale, anchor: anchor,
+    VideoZoomBounds.clampedOffset(offset, scale: scale,
       containerSize: size, contentAspectRatio: ratio)
   }
 }

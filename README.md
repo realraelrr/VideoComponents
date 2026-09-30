@@ -20,10 +20,11 @@ The exercised toolchain is Xcode 27.0 (27A266a), Apple Swift 6.4, with iOS 27 Si
 
 Choose **File → Add Package Dependencies** in Xcode, enter
 `https://github.com/realraelrr/VideoComponents.git`, and select **Up to Next Major
-Version** from `0.2.1`. Link only the product or products your target needs.
+Version** from `0.2.2`. Link only the product or products your target needs.
 Version `0.2.0` adds the optional picker and automatic poster V2; the original
 `VideoPlayback` and `VideoProcessing` products were introduced in `0.1.0`.
 Version `0.2.1` fixes fullscreen idle chrome, zoomed pan boundaries and cancelled scrubbing.
+Version `0.2.2` fixes repeated-pinch focus, fullscreen status layering, same-source loading and rate consistency, loading presentation, layout limits, frame cancellation ordering and disabled export tracks.
 
 For a Swift package consumer, add the dependency and link the required products in
 `Package.swift`:
@@ -36,7 +37,7 @@ let package = Package(
   name: "MyFeature",
   platforms: [.iOS(.v17)],
   dependencies: [
-    .package(url: "https://github.com/realraelrr/VideoComponents.git", from: "0.2.1"),
+    .package(url: "https://github.com/realraelrr/VideoComponents.git", from: "0.2.2"),
   ],
   targets: [
     .target(
@@ -80,7 +81,7 @@ let source = PlaybackSource(identity: fileURL, load: { AVURLAsset(url: fileURL) 
 session.load(source: source, playbackRate: 1, isLooping: true, autoplayWhenReady: false)
 ```
 
-The source identity must change when the underlying media changes and remain stable across view updates. The source supplies a cancellable `@MainActor` asset loader and an optional thumbnail loader. Supply the host's authorization and resource-access logic there. Access refreshes use `revalidateAccess(source:refreshID:validation:)`; its synchronous validation factory is invoked only for the current source and a new refresh ID. The session owns suspension, cancellation, stale-result rejection and restoration of its existing item.
+The source identity must change when the underlying media changes and remain stable across view updates. The source supplies a cancellable `@MainActor` asset loader and an optional thumbnail loader. Supply the host's authorization and resource-access logic there. Access refreshes use `revalidateAccess(source:refreshID:validation:)`; its synchronous validation factory is invoked only for the current source and a new refresh ID. The session owns suspension, cancellation, stale-result rejection and restoration of its existing item. Same-identity `load` calls preserve in-flight loading or access validation and apply the latest playback configuration; autoplay requests can establish playback intent without ordinary view appearances clearing it.
 
 Pass `isFullscreenPresented` to `InlinePlaybackView` while presenting the fullscreen view. This detaches the inline rendering layer while the fullscreen view renders the same player. Closing fullscreen must not destroy the session. Call `cleanup()` when the feature actually releases its playback work, rather than on every inline view disappearance.
 
@@ -88,7 +89,7 @@ Pass `isFullscreenPresented` to `InlinePlaybackView` while presenting the fullsc
 
 Controls support scrubbing, double-tap play/pause, long-press boost, pinch zoom and panning when zoomed. The inline view accepts an outer-scroll binding; connect it to the containing scroll view's `.scrollDisabled` modifier so video gestures and scrolling do not compete. The host provides accessories, status content, style and optional localized labels.
 
-Fullscreen chrome hides after three idle seconds. Single-tap the video to show or hide it; double-tap still changes playback. Contact with the video or controls suspends the idle countdown until all fingers leave. VoiceOver keeps chrome available. Zoomed panning is limited by the actual aspect-fit video bounds: smaller axes stay centered, larger axes cover the viewport, and resizing recalculates the limits.
+Fullscreen chrome hides after three idle seconds. Single-tap the video to show or hide it; double-tap still changes playback. Contact with the video or controls suspends the idle countdown until all fingers leave. VoiceOver keeps chrome available. Zoomed panning is limited by the actual aspect-fit video bounds: smaller axes stay centered, larger axes cover the viewport, and resizing recalculates the limits. Each pinch keeps the current source point beneath the fingers, including after an earlier pinch or pan. Status content stays below fullscreen chrome so close remains available.
 
 For a separate manual-frame preview, `VideoSeekCoordinator` borrows an independent `AVPlayer`. It must be the only seek initiator for that item while active. Call `reset()` before an external seek or item replacement; it cancels pending seeks. Do not attach a second coordinator to the playback session's player.
 
@@ -160,7 +161,7 @@ The technical score is bounded to `0...1`: capped contrast (`standardDeviation /
 
 Only the selected frame is decoded again at up to 1280 pixels, with exact tolerance and the original rational `CMTime`. The final actual timestamp must match the analyzed frame; mismatch or extraction failure does not silently select another time. Zero duration attempts time zero once; negative or nonfinite durations yield no candidate. No usable candidate produces `noUsableFrame`. Sampling, caps and the 80% threshold are empirical choices, without a claimed blind-review improvement. This heuristic does not identify people, choose a best dance pose, or support live/indefinite media; it adds no Vision/ML, scene clustering, extra cache or background analysis system.
 
-Export accepts only finite rates in `0.25...1.0`, preserves track orientation and scaled audio/video timing, and uses spectral audio time pitch. The destination must be an existing local directory. Each operation gets a unique MP4 filename and does not overwrite existing files. Progress `1` is emitted only after successful native completion. Success transfers the file to the host; cancellation/failure removes only this operation's output. The source and unrelated files remain owned by the host. Photos saving and permission requests are deliberately host responsibilities.
+Export accepts only finite rates in `0.25...1.0`, includes only enabled source tracks, preserves track orientation and scaled audio/video timing, and uses spectral audio time pitch. The destination must be an existing local directory. Each operation gets a unique MP4 filename and does not overwrite existing files. Progress `1` is emitted only after successful native completion. Success transfers the file to the host; cancellation/failure removes only this operation's output. The source and unrelated files remain owned by the host. Photos saving and permission requests are deliberately host responsibilities.
 
 Public errors distinguish validation, unavailable media and export failure. Causes are intended for privacy-safe diagnostics; map them to the host's concise user-facing messages. A genuinely cancelled task throws `CancellationError`; a framework-only cancellation can remain a typed failure.
 
@@ -181,7 +182,7 @@ The xcresult checker requires a successful nonempty result, no failures/skips/ex
 
 The four mounted SwiftUI picker tests and three mounted playback tests run in the existing example app's test target, which supplies the UIKit application host required by `UIWindow` and `UIHostingController`. The picker tests retain their test IDs and share the package's test helper source. Playback tests check idle chrome, contact cancellation and single-tap restoration, and rendered video boundaries after panning and resizing. The example app uses ordinary product imports; these tests use `@testable` access. Package and consumer expectations are discovered and checked separately.
 
-Supplied media coverage includes synthetic image scoring, real short H.264 frames, actual frame times, rotation, multiple slow rates, offset audio and export cancellation/file cleanup. Poster V2 tests independently cover the quality gate, representativeness, timestamp deduplication, the exact final request, rejection, failures and cancellation through an internal extraction closure. Picker tests cover initial preview, gestures versus value changes, suspended consumption, callback snapshots, source replacement and lifecycle cancellation. Started native image-generator cancellation is not directly instrumented. Physical-device permissions, iCloud/Photos behavior, UIKit gesture competition, HDR, long media and a broad codec matrix require separate acceptance evidence. Supplied checks and successful builds do not imply that all those environments have passed.
+Supplied media coverage includes synthetic image scoring, real short H.264 frames, actual frame times, rotation, multiple slow rates, offset audio and export cancellation/file cleanup. Poster V2 tests independently cover the quality gate, representativeness, timestamp deduplication, the exact final request, rejection, failures and cancellation through an internal extraction closure. Picker tests cover initial preview, gestures versus value changes, suspended consumption, callback snapshots, source replacement and lifecycle cancellation. Cancellation registration ordering is covered with controlled native-boundary tests. Started iOS image-generator cancellation is not directly instrumented. Physical-device permissions, iCloud/Photos behavior, UIKit gesture competition, HDR, long media and a broad codec matrix require separate acceptance evidence. Supplied checks and successful builds do not imply that all those environments have passed.
 
 ## License
 

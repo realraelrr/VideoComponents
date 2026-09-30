@@ -4,6 +4,28 @@ import XCTest
 
 @MainActor
 final class PlaybackTransportTests: XCTestCase {
+  func testSameSourceLoadAppliesLatestRateToPlayingAndHoldingTransport() async throws {
+    let url = try temporaryPlayableAudioURL()
+    let source = PlaybackSource(identity: url, load: { AVURLAsset(url: url) })
+    let session = PlaybackSession()
+    defer { session.cleanup() }
+    session.load(source: source, playbackRate: 1, isLooping: true, autoplayWhenReady: true)
+    try await waitUntil { session.isPlayerReady && session.player.rate > 0 }
+    let original = try XCTUnwrap(session.player.currentItem)
+
+    session.load(source: source, playbackRate: 0.5, isLooping: true, autoplayWhenReady: false)
+    XCTAssertTrue(session.player.currentItem === original)
+    XCTAssertTrue(session.isPlaybackRequested)
+    XCTAssertEqual(session.player.rate, 0.5, accuracy: 0.01)
+
+    session.handleHoldGestureStateChanged(.began, allowsHoldBoost: true)
+    session.load(source: source, playbackRate: 1.25, isLooping: true, autoplayWhenReady: false)
+    XCTAssertTrue(session.player.currentItem === original)
+    XCTAssertEqual(session.player.rate, 2.5, accuracy: 0.01)
+    session.cancelHold()
+    XCTAssertEqual(session.player.rate, 1.25, accuracy: 0.01)
+  }
+
   func testPlaybackControlIntentAndToggleAgreeDuringPendingRestart() async throws {
     let transport = ControlledTransportSeek()
     let session = try await makeReadyPlaybackSession(transportSeek: transport.seek)

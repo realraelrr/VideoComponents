@@ -271,7 +271,8 @@ import UIKit
       loadedResource == video.identity,
       playbackCoordinator.isCurrent(token),
       player.currentItem == nil,
-      accessPlaybackSnapshot?.item === snapshot.item
+      let currentSnapshot = accessPlaybackSnapshot,
+      currentSnapshot.item === snapshot.item
     else {
       return
     }
@@ -299,7 +300,7 @@ import UIKit
     observePlaybackEnd(for: snapshot.item, token: token)
     observePlayerBuffering(token: token)
     observePlayerTime(token: token)
-    beginTransport(to: snapshot.time)
+    beginTransport(to: currentSnapshot.time)
     if snapshot.item.status == .readyToPlay {
       handlePlayerReady(token: token)
     } else {
@@ -324,10 +325,20 @@ import UIKit
       return
     }
 
-    guard
-      forceReload || !hasCurrentItem || loadedResource != resource
-    else {
-      startPlaybackIfReady(autoplayWhenReady: autoplayWhenReady)
+    guard forceReload || loadedResource != resource else {
+      if autoplayWhenReady {
+        wantsPlayback = true
+      }
+      if autoplayWhenReady, playbackProgress >= 1 {
+        if let snapshot = accessPlaybackSnapshot {
+          accessPlaybackSnapshot = AccessPlaybackSnapshot(item: snapshot.item, time: .zero)
+          updateTransportPresentation(to: .zero)
+        } else {
+          beginTransport(to: .zero)
+        }
+      } else {
+        reconcilePlayback()
+      }
       return
     }
 
@@ -522,22 +533,6 @@ import UIKit
   private func cancelLoading(token: PlaybackState.GenerationToken) {
     guard playbackCoordinator.isCurrent(token) else { return }
     cleanup()
-  }
-
-  private func startPlaybackIfReady(autoplayWhenReady: Bool) {
-    guard autoplayWhenReady,
-      hasCurrentItem
-    else {
-      return
-    }
-
-    wantsPlayback = true
-    guard isPlayerReady || player.currentItem?.status == .readyToPlay else { return }
-    if playbackProgress >= 1 {
-      beginTransport(to: .zero)
-    } else {
-      reconcilePlayback()
-    }
   }
 
   private func handlePlayerReady(token: PlaybackState.GenerationToken) {

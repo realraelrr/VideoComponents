@@ -62,6 +62,83 @@ final class VideoFramePickerRuntimeResourcesTests: XCTestCase {
 
 @MainActor
 final class VideoPlaybackMountedTests: XCTestCase {
+  func testSecondPinchKeepsTheCurrentFingerFocusAfterPanning() async throws {
+    let probe = PinchFocusProbe()
+    let host = UIHostingController(rootView: MountedZoomProbe(probe: probe))
+    let window = mount(host, size: CGSize(width: 320, height: 450))
+    defer { window.isHidden = true; window.rootViewController = nil }
+    try await Task.sleep(for: .milliseconds(100))
+    let surface = try XCTUnwrap(findGestureSurface(host.view))
+    let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
+    func pinch(at point: CGPoint, scale: CGFloat) async throws {
+      coordinator.onPinchUpdate(.init(scale: 1, location: point, state: .began, numberOfTouches: 2))
+      coordinator.onPinchUpdate(.init(scale: scale, location: point, state: .changed, numberOfTouches: 2))
+      coordinator.onPinchUpdate(.init(scale: scale, location: point, state: .ended, numberOfTouches: 2))
+      try await Task.sleep(for: .milliseconds(50))
+    }
+    try await pinch(at: CGPoint(x: 160, y: 225), scale: 2)
+    coordinator.onPanUpdate(.init(translation: .zero, state: .began, numberOfTouches: 1))
+    coordinator.onPanUpdate(.init(translation: CGSize(width: 20, height: 0), state: .changed, numberOfTouches: 1))
+    coordinator.onPanUpdate(.init(translation: CGSize(width: 20, height: 0), state: .ended, numberOfTouches: 1))
+    try await Task.sleep(for: .milliseconds(50))
+    // This source point is under the second pinch's fingers after the first zoom and pan.
+    let before = try XCTUnwrap(renderedPixels(in: host.view, matching: { $0 > 200 && $1 < 60 && $2 > 200 }))
+    let focusBefore = CGPoint(x: before.midX, y: before.midY)
+    XCTAssertEqual(focusBefore.x, 260, accuracy: 1)
+    try await pinch(at: focusBefore, scale: 1.5)
+    let after = try XCTUnwrap(renderedPixels(in: host.view, matching: { $0 > 200 && $1 < 60 && $2 > 200 }))
+    let focusAfter = CGPoint(x: after.midX, y: after.midY)
+    XCTAssertEqual(focusAfter.x, focusBefore.x, accuracy: 1, "The video point beneath the fingers must remain there on a second pinch")
+    XCTAssertEqual(focusAfter.y, focusBefore.y, accuracy: 1)
+  }
+
+  func testBlockingStatusCannotCoverOrInterceptFullscreenClose() async throws {
+    let session = PlaybackSession()
+    let source = PlaybackSource(identity: "unavailable", load: { throw NSError(domain: "fixture", code: 1) })
+    session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+    for _ in 0..<300 where session.status != .unavailable { try await Task.sleep(for: .milliseconds(5)) }
+    XCTAssertEqual(session.status, .unavailable)
+    let host = UIHostingController(rootView: FullscreenPlaybackView(
+      playbackSession: session, onClose: {}, trailingAccessory: { EmptyView() },
+      statusOverlay: { Color.red.ignoresSafeArea().contentShape(Rectangle()).onTapGesture {} }
+    ).environment(\.scenePhase, .active))
+    let window = mount(host, size: CGSize(width: 390, height: 700))
+    defer { window.isHidden = true; window.rootViewController = nil; session.cleanup() }
+    try await Task.sleep(for: .milliseconds(100))
+    let closePixels = try XCTUnwrap(renderedPixels(in: host.view, matching: { $0 > 230 && $1 > 230 && $2 > 230 }),
+      "The white close icon must remain rendered above the opaque, interactive status layer")
+    XCTAssertLessThan(closePixels.maxX, 60)
+    XCTAssertLessThan(closePixels.maxY, 120)
+  }
+
+  private func renderedPixels(in view: UIView, matching: (UInt8, UInt8, UInt8) -> Bool) -> CGRect? {
+    view.layoutIfNeeded()
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { _ in
+      XCTAssertTrue(view.drawHierarchy(in: view.bounds, afterScreenUpdates: true))
+    }
+    guard let cgImage = image.cgImage,
+      let context = CGContext(data: nil, width: cgImage.width, height: cgImage.height,
+        bitsPerComponent: 8, bytesPerRow: cgImage.width * 4,
+        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+      let data = context.data else { return nil }
+    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+    let pixels = data.assumingMemoryBound(to: UInt8.self)
+    var minX = cgImage.width, minY = cgImage.height, maxX = -1, maxY = -1
+    for y in 0..<cgImage.height {
+      for x in 0..<cgImage.width {
+        let index = (y * cgImage.width + x) * 4
+        if matching(pixels[index], pixels[index + 1], pixels[index + 2]) {
+          minX = min(minX, x); maxX = max(maxX, x)
+          minY = min(minY, y); maxY = max(maxY, y)
+        }
+      }
+    }
+    guard maxX >= minX, maxY >= minY else { return nil }
+    return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+  }
+
   func testContactDefersTimeoutAndSingleTapRestoresHiddenChrome() async throws {
     let session = try await readySession()
     let probe = UIView()
@@ -250,6 +327,15 @@ private struct PlaybackProbe: UIViewRepresentable {
   let view: UIView
   func makeUIView(context: Context) -> UIView { view }
   func updateUIView(_ view: UIView, context: Context) {}
+}
+
+private final class PinchFocusProbe: UIView {
+  override func draw(_ rect: CGRect) {
+    UIColor.yellow.setFill()
+    UIRectFill(bounds)
+    UIColor.magenta.setFill()
+    UIRectFill(CGRect(x: bounds.width * 0.625 - 3, y: bounds.midY - 3, width: 6, height: 6))
+  }
 }
 
 private struct MountedZoomProbe: View {

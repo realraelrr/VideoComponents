@@ -71,6 +71,7 @@ public enum SlowVideoExporter {
 
     let videoTracks = try await asset.loadTracks(withMediaType: .video)
     for sourceTrack in videoTracks {
+      guard try await sourceTrack.load(.isEnabled) else { continue }
       guard let compositionTrack = composition.addMutableTrack(
         withMediaType: .video,
         preferredTrackID: kCMPersistentTrackID_Invalid
@@ -92,6 +93,7 @@ public enum SlowVideoExporter {
 
     let audioTracks = try await asset.loadTracks(withMediaType: .audio)
     for sourceTrack in audioTracks {
+      guard try await sourceTrack.load(.isEnabled) else { continue }
       guard let compositionTrack = composition.addMutableTrack(
         withMediaType: .audio,
         preferredTrackID: kCMPersistentTrackID_Invalid

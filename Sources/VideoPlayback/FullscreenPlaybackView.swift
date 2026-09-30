@@ -89,12 +89,13 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
           videoGravity: .resizeAspect
         )
       } overlay: { zoomContext in
-        fullscreenChrome(zoomContext: zoomContext, safeAreaInsets: safeAreaInsets)
+        ZStack {
+          statusOverlay()
+            .allowsHitTesting(playbackSession.status.allowsHitTesting)
+          fullscreenChrome(zoomContext: zoomContext, safeAreaInsets: safeAreaInsets)
+        }
       }
       .ignoresSafeArea()
-
-      statusOverlay()
-        .allowsHitTesting(playbackSession.status.allowsHitTesting)
 
       fullscreenOverlay
     }

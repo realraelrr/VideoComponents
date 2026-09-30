@@ -4,6 +4,117 @@ import XCTest
 
 @MainActor
 final class PlaybackAccessTests: XCTestCase {
+  func testAutoplayRequestAtEndWhileAccessIsPendingRestartsPlayback() async throws {
+    let (session, source, asset) = try await readySession()
+    let validator = SuspendedAssetOperation()
+    defer { session.cleanup(); validator.finish(asset) }
+    try await wait { session.durationSeconds > 0 }
+    let original = try XCTUnwrap(session.player.currentItem)
+    session.handleScrubEditingChanged(true)
+    session.setScrubProgress(1)
+    session.handleScrubEditingChanged(false)
+    try await wait { abs(session.player.currentTime().seconds - session.durationSeconds) < 0.01 }
+    session.revalidateAccess(source: source, refreshID: 1) { .validate(validator.load) }
+    try await wait { validator.started }
+
+    session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: true)
+    validator.finish(asset)
+    try await wait {
+      session.isPlayerReady && (session.player.rate > 0 || !session.isPlaybackRequested)
+    }
+    XCTAssertTrue(session.player.currentItem === original)
+    XCTAssertTrue(session.isPlaybackRequested)
+    XCTAssertLessThan(session.player.currentTime().seconds, 0.5)
+    XCTAssertGreaterThan(session.player.rate, 0)
+  }
+
+  func testSameSourceLoadDuringResolutionKeepsOriginalLoaderAndPlaybackIntent() async throws {
+    let asset = try audioAsset()
+    for (initialAutoplay, nextAutoplay) in [(true, false), (false, true)] {
+      let loader = SuspendedAssetOperation()
+      let session = PlaybackSession()
+      defer { session.cleanup(); loader.finish(asset) }
+      let identity = UUID()
+      var replacementLoads = 0
+      session.load(source: PlaybackSource(identity: identity, load: loader.load),
+        playbackRate: 1, isLooping: false, autoplayWhenReady: initialAutoplay)
+      try await wait { loader.started }
+
+      session.load(source: PlaybackSource(identity: identity, load: {
+        replacementLoads += 1
+        return asset
+      }), playbackRate: 0.5, isLooping: true, autoplayWhenReady: nextAutoplay)
+      XCTAssertTrue(session.isPlaybackRequested)
+      await Task.yield()
+      XCTAssertFalse(loader.cancelled)
+      XCTAssertEqual(replacementLoads, 0)
+
+      loader.finish(asset)
+      try await wait { session.isPlayerReady }
+      XCTAssertTrue(session.isPlaybackRequested)
+      XCTAssertEqual(session.playbackConfig.playbackRate, 0.5)
+      XCTAssertTrue(session.playbackConfig.isLooping)
+    }
+  }
+
+  func testSameSourceLoadDuringRevalidationKeepsItemPositionAndPlaybackIntent() async throws {
+    let asset = try audioAsset()
+    var sourceLoads = 0
+    let source = PlaybackSource(identity: UUID(), load: {
+      sourceLoads += 1
+      return asset
+    })
+    let validator = SuspendedAssetOperation()
+    let session = PlaybackSession()
+    defer { session.cleanup(); validator.finish(asset) }
+    session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+    try await wait { session.isPlayerReady && session.durationSeconds > 0 }
+    let original = try XCTUnwrap(session.player.currentItem)
+    session.handleScrubEditingChanged(true)
+    session.setScrubProgress(0.4)
+    session.handleScrubEditingChanged(false)
+    try await wait { abs(session.player.currentTime().seconds - 0.4) < 0.01 }
+    session.togglePlayback()
+    session.revalidateAccess(source: source, refreshID: 1) { .validate(validator.load) }
+    try await wait { validator.started }
+
+    session.load(source: source, playbackRate: 0.5, isLooping: true, autoplayWhenReady: false)
+    XCTAssertFalse(session.hasCurrentItem)
+    XCTAssertTrue(session.isPlaybackRequested)
+    XCTAssertEqual(session.status, .loading)
+    await Task.yield()
+    XCTAssertFalse(validator.cancelled)
+    XCTAssertEqual(sourceLoads, 1)
+
+    validator.finish(asset)
+    try await wait { session.isPlayerReady && session.player.rate > 0 }
+    XCTAssertTrue(session.player.currentItem === original)
+    XCTAssertEqual(session.currentTimeSeconds, 0.4, accuracy: 0.05)
+    XCTAssertEqual(session.player.rate, 0.5, accuracy: 0.01)
+    XCTAssertTrue(session.isPlaybackRequested)
+  }
+
+  func testSameSourceLoadDoesNotSupersedePendingAccessDenial() async throws {
+    let (session, source, asset) = try await readySession()
+    let validator = SuspendedAssetOperation()
+    defer { session.cleanup(); validator.finish(asset) }
+    session.revalidateAccess(source: source, refreshID: 1) {
+      .validate {
+        _ = try await validator.load()
+        throw TestError.denied
+      }
+    }
+    try await wait { validator.started }
+    session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: true)
+    validator.finish(asset)
+
+    try await wait { session.status == .unavailable || session.hasCurrentItem }
+    XCTAssertEqual(session.status, .unavailable)
+    XCTAssertFalse(session.hasCurrentItem)
+    guard case .source(let error) = session.failure else { return XCTFail("Expected access denial") }
+    XCTAssertTrue(error is TestError)
+  }
+
   func testDeniedRefreshFactoryRunsOncePerIdentityAndIsSynchronous() async throws {
     let asset = try audioAsset()
     let session = PlaybackSession()

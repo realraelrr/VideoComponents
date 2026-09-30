@@ -45,11 +45,11 @@ public struct PlaybackStatusOverlay: View {
   public init(status: PlaybackStatus) { self.status = status }
   public var body: some View {
     switch status {
-    case .none, .slowPreparing, .slowBuffering:
+    case .none:
       EmptyView()
     case .unavailable:
       Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.white)
-    case .loading, .loadingPlayerItem, .buffering:
+    case .loading, .loadingPlayerItem, .buffering, .slowPreparing, .slowBuffering:
       ProgressView().tint(.white)
     }
   }

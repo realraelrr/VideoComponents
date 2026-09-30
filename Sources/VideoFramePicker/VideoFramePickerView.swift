@@ -109,7 +109,7 @@ public struct VideoFramePickerView: View {
             Image(decorative: preview.image, scale: 1)
               .resizable()
               .scaledToFit()
-          } else {
+          } else if owner.failure == nil {
             ProgressView()
               .tint(.white)
           }

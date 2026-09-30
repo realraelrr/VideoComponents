@@ -2,6 +2,7 @@ import AVFoundation
 import Observation
 import SwiftUI
 import UIKit
+import VideoPlayback
 import XCTest
 @testable import VideoFramePicker
 
@@ -208,4 +209,120 @@ private struct MountedPickerHost: View {
       .padding(20)
     }
   }
+}
+
+@MainActor
+final class VideoComponentStatusAndLayoutMountedTests: XCTestCase {
+  func testSourceFailureStopsPickerLoadingIndicator() async throws {
+    let loader = PickerGate<AVAsset>()
+    var failures = 0
+    let host = UIHostingController(rootView: VideoFramePickerView(
+      source: VideoFramePickerSource(identity: "failed-source", load: loader.run),
+      onFailure: { _ in failures += 1 }, onSelection: { _ in }
+    ))
+    let window = mount(host)
+    defer { unmount(window); loader.finish(.failure(PickerTestError.failed)) }
+    try await waitForPicker { loader.started }
+    try await Task.sleep(for: .milliseconds(100))
+    host.view.layoutIfNeeded()
+    recordPickerState(in: host.view, phase: "Loading baseline", failures: failures)
+    XCTAssertTrue(visibleIndicators(in: host.view).contains(where: \.isAnimating),
+      "The suspended source must show a visible loading indicator")
+    loader.finish(.failure(PickerTestError.failed))
+    try await waitForPicker { failures == 1 }
+    try await Task.sleep(for: .milliseconds(100))
+    host.view.layoutIfNeeded()
+    recordPickerState(in: host.view, phase: "Source failed", failures: failures)
+    XCTAssertEqual(failures, 1)
+    XCTAssertFalse(visibleIndicators(in: host.view).contains(where: \.isAnimating),
+      "A terminal source failure has no loading operation to indicate")
+  }
+
+  func testSlowPreparingAndBufferingRetainLoadingIndication() async throws {
+    for status in [PlaybackStatus.loading, .slowPreparing, .slowBuffering] {
+      let host = UIHostingController(rootView: PlaybackStatusOverlay(status: status))
+      let window = mount(host)
+      defer { unmount(window) }
+      try await Task.sleep(for: .milliseconds(100))
+      XCTAssertTrue(indicators(in: host.view).contains(where: \.isAnimating),
+        "A pending operation must keep its loading indication in \(status)")
+    }
+  }
+
+  func testUnknownAspectHonorsExplicitMaximumSize() async throws {
+    let probe = UIView()
+    let host = UIHostingController(rootView:
+      AdaptiveVideoCardLayout(contentAspectRatio: nil, maximumSize: CGSize(width: 160, height: 90)) {
+        VideoCardSizeProbe(view: probe)
+      }.frame(maxWidth: .infinity, maxHeight: .infinity).ignoresSafeArea()
+    )
+    let window = mount(host)
+    defer { unmount(window) }
+    try await waitForPicker { probe.bounds.width > 0 && probe.bounds.height > 0 }
+    XCTAssertLessThanOrEqual(probe.bounds.width, 160,
+      "The explicit width cap still applies while the aspect ratio is unknown")
+    XCTAssertLessThanOrEqual(probe.bounds.height, 90,
+      "The explicit height cap still applies while the aspect ratio is unknown")
+  }
+
+  private func indicators(in view: UIView) -> [UIActivityIndicatorView] {
+    let current = (view as? UIActivityIndicatorView).map { [$0] } ?? []
+    return current + view.subviews.flatMap { indicators(in: $0) }
+  }
+
+  private func visibleIndicators(in root: UIView) -> [UIActivityIndicatorView] {
+    indicators(in: root).filter { isVisible($0, in: root) }
+  }
+
+  private func isVisible(_ view: UIView, in root: UIView) -> Bool {
+    guard view.window != nil, view.window === root.window else { return false }
+    var visibleRect = view.convert(view.bounds, to: root).intersection(root.bounds)
+    var ancestor: UIView? = view
+    while let current = ancestor {
+      guard !current.isHidden, current.alpha > 0.01, current.layer.opacity > 0.01,
+        !visibleRect.isEmpty else { return false }
+      if current.clipsToBounds {
+        visibleRect = visibleRect.intersection(current.convert(current.bounds, to: root))
+      }
+      if current === root { return !visibleRect.isEmpty }
+      ancestor = current.superview
+    }
+    return false
+  }
+
+  private func recordPickerState(in view: UIView, phase: String, failures: Int) {
+    let states = indicators(in: view).map {
+      "animating=\($0.isAnimating), hidden=\($0.isHidden), alpha=\($0.alpha), "
+        + "opacity=\($0.layer.opacity), frame=\($0.frame), visible=\(isVisible($0, in: view))"
+    }
+    print("Picker \(phase): failures=\(failures), indicators=\(states)")
+    let screenshot = UIGraphicsImageRenderer(bounds: view.bounds).image { _ in
+      view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+    }
+    let attachment = XCTAttachment(image: screenshot)
+    attachment.name = "Picker \(phase)"
+    attachment.lifetime = .keepAlways
+    add(attachment)
+  }
+
+  private func mount<V: View>(_ host: UIHostingController<V>) -> UIWindow {
+    let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 700))
+    window.rootViewController = host
+    window.makeKeyAndVisible()
+    host.view.frame = window.bounds
+    host.view.layoutIfNeeded()
+    return window
+  }
+
+  private func unmount(_ window: UIWindow) {
+    window.isHidden = true
+    window.rootViewController = nil
+  }
+}
+
+@MainActor
+private struct VideoCardSizeProbe: UIViewRepresentable {
+  let view: UIView
+  func makeUIView(context: Context) -> UIView { view }
+  func updateUIView(_ uiView: UIView, context: Context) {}
 }
