@@ -1,6 +1,8 @@
 import SwiftUI
 
 public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: View>: View {
+  @Environment(\.accessibilityVoiceOverEnabled) private var isVoiceOverEnabled
+  @Environment(\.scenePhase) private var scenePhase
   @ObservedObject var playbackSession: PlaybackSession
   let allowsHoldBoost: Bool
   let onClose: @MainActor @Sendable () -> Void
@@ -10,6 +12,9 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
 
   @State private var isZooming = false
   @State private var isMultiTouchGestureActive = false
+  @State private var isChromeVisible = true
+  @State private var isVideoTouchActive = false
+  @State private var interactionID = UUID()
 
   public init(
     playbackSession: PlaybackSession,
@@ -31,11 +36,26 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
     GeometryReader { proxy in
       fullscreenBody(safeAreaInsets: proxy.safeAreaInsets)
     }
+    .background(FullscreenContactObserver { active in
+      isVideoTouchActive = active
+      interactionID = UUID()
+    })
     .onAppear {
       playbackSession.cancelHold()
+      showChrome()
     }
     .onDisappear {
       playbackSession.cancelHold()
+    }
+    .onChange(of: playbackSession.canUsePlaybackControls) { _, _ in showChrome() }
+    .onChange(of: playbackSession.isPlaybackRequested) { _, _ in showChrome() }
+    .onChange(of: scenePhase) { _, _ in showChrome() }
+    .task(id: autoHideRequestID) {
+      guard let request = autoHideRequestID else { return }
+      do { try await Task.sleep(for: .seconds(3)) }
+      catch { return }
+      guard !Task.isCancelled, autoHideRequestID == request else { return }
+      isChromeVisible = false
     }
     .statusBarHidden(true)
   }
@@ -52,10 +72,16 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
         cornerRadius: 0,
         shouldReceivePlaybackTouch: shouldReceiveFullscreenPlaybackTouch,
         onLongPressStateChanged: { state in
+          if state == .began { showChrome() }
           playbackSession.handleHoldGestureStateChanged(state, allowsHoldBoost: allowsHoldBoost)
         },
         onDoubleTap: {
+          showChrome()
           playbackSession.togglePlayback()
+        },
+        onSingleTap: {
+          isChromeVisible.toggle()
+          interactionID = UUID()
         }
       ) {
         InlineVideoPlayerLayer(
@@ -78,8 +104,12 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
     VStack(spacing: 0) {
       Spacer()
 
-      if playbackSession.canUsePlaybackControls && !isZooming && !isMultiTouchGestureActive {
+      if playbackSession.canUsePlaybackControls {
+        let showsControls = showsChrome && !isZooming && !isMultiTouchGestureActive
         fullscreenControls
+          .opacity(showsControls ? 1 : 0)
+          .allowsHitTesting(showsControls)
+          .accessibilityHidden(!showsControls)
           .padding(.horizontal, 16)
           .padding(.bottom, 20)
       }
@@ -97,7 +127,10 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
       safeAreaInsets: safeAreaInsets,
       playbackRateText: playbackSession.playbackRateIndicatorText,
       labels: labels,
-      onResetZoom: zoomContext.resetZoom,
+      onResetZoom: {
+        zoomContext.resetZoom()
+        showChrome()
+      },
       leadingAction: {
         VideoChromeIconButton(
           systemName: "xmark",
@@ -109,6 +142,9 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
         trailingAccessory()
       }
     )
+    .opacity(showsChrome ? 1 : 0)
+    .allowsHitTesting(showsChrome)
+    .accessibilityHidden(!showsChrome)
   }
 
   private var fullscreenControls: some View {
@@ -128,6 +164,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
 
   private func shouldReceiveFullscreenPlaybackTouch(_ touch: UITouch, in view: UIView) -> Bool {
     guard !playbackSession.status.allowsHitTesting else { return false }
+    if !showsChrome { return true }
     let location = touch.location(in: view)
     return VideoGestureRegion.containsFullscreenPoint(
       y: location.y,
@@ -137,4 +174,95 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
     )
   }
 
+  private var showsChrome: Bool {
+    isChromeVisible || isVoiceOverEnabled || !playbackSession.canUsePlaybackControls
+  }
+
+  private var autoHideRequestID: UUID? {
+    guard isChromeVisible, playbackSession.canUsePlaybackControls,
+      !isVideoTouchActive, !isMultiTouchGestureActive,
+      !isVoiceOverEnabled, scenePhase == .active else { return nil }
+    return interactionID
+  }
+
+  private func showChrome() {
+    isChromeVisible = true
+    interactionID = UUID()
+  }
+
+}
+
+/// Observes contact across video and controls without recognizing or competing with their gestures.
+private struct FullscreenContactObserver: UIViewRepresentable {
+  let onContactChanged: @MainActor (Bool) -> Void
+
+  func makeUIView(context: Context) -> ContactView {
+    let view = ContactView()
+    view.isUserInteractionEnabled = false
+    view.recognizer.onContactChanged = onContactChanged
+    return view
+  }
+
+  func updateUIView(_ view: ContactView, context: Context) {
+    view.recognizer.onContactChanged = onContactChanged
+  }
+
+  static func dismantleUIView(_ view: ContactView, coordinator: ()) {
+    view.recognizer.view?.removeGestureRecognizer(view.recognizer)
+    view.recognizer.finishContact()
+  }
+
+  final class ContactView: UIView {
+    let recognizer = ContactRecognizer()
+    override func didMoveToWindow() {
+      super.didMoveToWindow()
+      recognizer.view?.removeGestureRecognizer(recognizer)
+      recognizer.finishContact()
+      window?.addGestureRecognizer(recognizer)
+    }
+  }
+
+  final class ContactRecognizer: UIGestureRecognizer {
+    var onContactChanged: @MainActor (Bool) -> Void = { _ in }
+    private var contacts: Set<UITouch> = []
+
+    init() {
+      super.init(target: nil, action: nil)
+      cancelsTouchesInView = false
+      delaysTouchesBegan = false
+      delaysTouchesEnded = false
+    }
+
+    override func canPrevent(_ other: UIGestureRecognizer) -> Bool { false }
+    override func canBePrevented(by other: UIGestureRecognizer) -> Bool { false }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+      contacts.formUnion(touches)
+      onContactChanged(true)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+      endContact(touches)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+      endContact(touches)
+    }
+
+    override func reset() { finishContact() }
+
+    func finishContact() {
+      guard !contacts.isEmpty else { return }
+      contacts.removeAll()
+      onContactChanged(false)
+    }
+
+    private func endContact(_ touches: Set<UITouch>) {
+      contacts.subtract(touches)
+      if contacts.isEmpty {
+        onContactChanged(false)
+        state = .failed
+      }
+    }
+  }
 }

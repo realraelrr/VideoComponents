@@ -20,9 +20,10 @@ The exercised toolchain is Xcode 27.0 (27A266a), Apple Swift 6.4, with iOS 27 Si
 
 Choose **File → Add Package Dependencies** in Xcode, enter
 `https://github.com/realraelrr/VideoComponents.git`, and select **Up to Next Major
-Version** from `0.2.0`. Link only the product or products your target needs.
+Version** from `0.2.1`. Link only the product or products your target needs.
 Version `0.2.0` adds the optional picker and automatic poster V2; the original
 `VideoPlayback` and `VideoProcessing` products were introduced in `0.1.0`.
+Version `0.2.1` fixes fullscreen idle chrome, zoomed pan boundaries and cancelled scrubbing.
 
 For a Swift package consumer, add the dependency and link the required products in
 `Package.swift`:
@@ -35,7 +36,7 @@ let package = Package(
   name: "MyFeature",
   platforms: [.iOS(.v17)],
   dependencies: [
-    .package(url: "https://github.com/realraelrr/VideoComponents.git", from: "0.2.0"),
+    .package(url: "https://github.com/realraelrr/VideoComponents.git", from: "0.2.1"),
   ],
   targets: [
     .target(
@@ -86,6 +87,8 @@ Pass `isFullscreenPresented` to `InlinePlaybackView` while presenting the fullsc
 `session.player` is a rendering surface. Do not replace its item, seek it directly, or maintain a second transport state. Configure playback through session methods. Global audio category/activation, photo access, screen orientation, haptics and recovery copy belong to the host; `onEvent` exposes playback/cleanup/hold events for host integration.
 
 Controls support scrubbing, double-tap play/pause, long-press boost, pinch zoom and panning when zoomed. The inline view accepts an outer-scroll binding; connect it to the containing scroll view's `.scrollDisabled` modifier so video gestures and scrolling do not compete. The host provides accessories, status content, style and optional localized labels.
+
+Fullscreen chrome hides after three idle seconds. Single-tap the video to show or hide it; double-tap still changes playback. Contact with the video or controls suspends the idle countdown until all fingers leave. VoiceOver keeps chrome available. Zoomed panning is limited by the actual aspect-fit video bounds: smaller axes stay centered, larger axes cover the viewport, and resizing recalculates the limits.
 
 For a separate manual-frame preview, `VideoSeekCoordinator` borrows an independent `AVPlayer`. It must be the only seek initiator for that item while active. Call `reset()` before an external seek or item replacement; it cancels pending seeks. Do not attach a second coordinator to the playback session's player.
 
@@ -176,7 +179,7 @@ The script copies the package and public example to an external directory. It bu
 
 The xcresult checker requires a successful nonempty result, no failures/skips/expected failures, all test IDs discovered from the isolated snapshot, and explicit critical cases. Runtime resource tests resolve each compiled package bundle through `VideoPlaybackLabels(locale:)` and `VideoFramePickerLabels(locale:)`: all six labels per module in English and Simplified Chinese, plus regional Chinese/Spanish resolution. They do not read resource source files.
 
-The four mounted SwiftUI picker tests run in the existing example app's test target, which supplies the UIKit application host required by `UIWindow` and `UIHostingController`. They retain their test IDs and share the package's test helper source. The example app uses ordinary product imports; only these white-box tests use `@testable` owner injection. Package and consumer expectations are discovered and checked separately.
+The four mounted SwiftUI picker tests and three mounted playback tests run in the existing example app's test target, which supplies the UIKit application host required by `UIWindow` and `UIHostingController`. The picker tests retain their test IDs and share the package's test helper source. Playback tests check idle chrome, contact cancellation and single-tap restoration, and rendered video boundaries after panning and resizing. The example app uses ordinary product imports; these tests use `@testable` access. Package and consumer expectations are discovered and checked separately.
 
 Supplied media coverage includes synthetic image scoring, real short H.264 frames, actual frame times, rotation, multiple slow rates, offset audio and export cancellation/file cleanup. Poster V2 tests independently cover the quality gate, representativeness, timestamp deduplication, the exact final request, rejection, failures and cancellation through an internal extraction closure. Picker tests cover initial preview, gestures versus value changes, suspended consumption, callback snapshots, source replacement and lifecycle cancellation. Started native image-generator cancellation is not directly instrumented. Physical-device permissions, iCloud/Photos behavior, UIKit gesture competition, HDR, long media and a broad codec matrix require separate acceptance evidence. Supplied checks and successful builds do not imply that all those environments have passed.
 

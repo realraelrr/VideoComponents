@@ -123,6 +123,42 @@ enum VideoZoomAnchorCalculator {
   }
 }
 
+enum VideoZoomBounds {
+  /// Bounds the transformed video, including aspect-fit letterboxing and its scale anchor.
+  static func clampedOffset(
+    _ offset: CGSize, scale: CGFloat, anchor: CGPoint,
+    containerSize: CGSize, contentAspectRatio: CGFloat?
+  ) -> CGSize {
+    guard containerSize.width.isFinite, containerSize.height.isFinite,
+      containerSize.width > 0, containerSize.height > 0 else { return .zero }
+    let rect = VideoZoomAnchorCalculator.contentRect(
+      containerSize: containerSize, contentAspectRatio: contentAspectRatio
+    )
+    let scale = VideoZoomConfig.clampedScale(scale)
+    return CGSize(
+      width: clampedAxis(offset.width, minimum: rect.minX, length: rect.width,
+        viewport: containerSize.width, scale: scale, anchor: anchor.x),
+      height: clampedAxis(offset.height, minimum: rect.minY, length: rect.height,
+        viewport: containerSize.height, scale: scale, anchor: anchor.y)
+    )
+  }
+
+  private static func clampedAxis(
+    _ offset: CGFloat, minimum: CGFloat, length: CGFloat,
+    viewport: CGFloat, scale: CGFloat, anchor: CGFloat
+  ) -> CGFloat {
+    let anchor = anchor.isFinite ? min(max(anchor, 0), 1) : 0.5
+    let transformedMinimum = minimum * scale + viewport * anchor * (1 - scale)
+    let transformedLength = length * scale
+    // An axis smaller than the viewport stays centered; a larger one covers the viewport.
+    if transformedLength <= viewport {
+      return (viewport - transformedLength) / 2 - transformedMinimum
+    }
+    let offset = offset.isFinite ? offset : 0
+    return min(max(offset, viewport - transformedMinimum - transformedLength), -transformedMinimum)
+  }
+}
+
 enum VideoPlayerLayout {
   static let targetWidth: CGFloat = 320
   static let targetHeight: CGFloat = 450

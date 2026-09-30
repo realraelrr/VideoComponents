@@ -16,6 +16,7 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
   let shouldReceivePlaybackTouch: ((UITouch, UIView) -> Bool)?
   let onLongPressStateChanged: @MainActor (UIGestureRecognizer.State) -> Void
   let onDoubleTap: @MainActor () -> Void
+  let onSingleTap: (@MainActor () -> Void)?
   let content: Content
   let overlay: (VideoZoomContext) -> Overlay
 
@@ -37,6 +38,7 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
     shouldReceivePlaybackTouch: ((UITouch, UIView) -> Bool)?,
     onLongPressStateChanged: @escaping @MainActor (UIGestureRecognizer.State) -> Void,
     onDoubleTap: @escaping @MainActor () -> Void,
+    onSingleTap: (@MainActor () -> Void)? = nil,
     @ViewBuilder content: () -> Content,
     @ViewBuilder overlay: @escaping (VideoZoomContext) -> Overlay
   ) {
@@ -48,6 +50,7 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
     self.shouldReceivePlaybackTouch = shouldReceivePlaybackTouch
     self.onLongPressStateChanged = onLongPressStateChanged
     self.onDoubleTap = onDoubleTap
+    self.onSingleTap = onSingleTap
     self.content = content()
     self.overlay = overlay
   }
@@ -62,7 +65,7 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
             .offset(currentOffset)
         }
         .frame(width: proxy.size.width, height: proxy.size.height)
-        .clipShape(clipShape(for: currentScale, in: proxy.size))
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
 
         if isGestureEnabled {
           VideoGestureSurface(
@@ -72,9 +75,10 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
             onPinchUpdate: { value in
               handlePinch(value, in: proxy.size)
             },
-            onPanUpdate: handlePan,
+            onPanUpdate: { value in handlePan(value, in: proxy.size) },
             onLongPressStateChanged: onLongPressStateChanged,
-            onDoubleTap: onDoubleTap
+            onDoubleTap: onDoubleTap,
+            onSingleTap: onSingleTap
           )
           .frame(width: proxy.size.width, height: proxy.size.height)
           .onDisappear {
@@ -84,6 +88,12 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
 
         overlay(zoomContext)
           .frame(width: proxy.size.width, height: proxy.size.height)
+      }
+      .onChange(of: proxy.size) { _, _ in
+        constrainOffset(in: proxy.size)
+      }
+      .onChange(of: contentAspectRatio) { _, _ in
+        constrainOffset(in: proxy.size)
       }
     }
     .onDisappear {
@@ -123,7 +133,7 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
         startScale: gestureStartScale,
         gestureScale: value.scale
       )
-      currentOffset = gestureStartOffset
+      currentOffset = boundedOffset(gestureStartOffset, in: containerSize)
       updateIsZooming()
     case .changed:
       guard isActivePinchGesture else { return }
@@ -133,10 +143,10 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
         startScale: gestureStartScale,
         gestureScale: value.scale
       )
-      currentOffset = CGSize(
+      currentOffset = boundedOffset(CGSize(
         width: gestureStartOffset.width + (clampedLocation.x - gestureStartLocation.x),
         height: gestureStartOffset.height + (clampedLocation.y - gestureStartLocation.y)
-      )
+      ), in: containerSize)
       updateIsZooming()
     case .ended, .cancelled, .failed:
       finishPinchGesture()
@@ -145,7 +155,7 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
     }
   }
 
-  private func handlePan(_ value: SupplementPanGestureValue) {
+  private func handlePan(_ value: SupplementPanGestureValue, in containerSize: CGSize) {
     guard VideoGesturePolicy.allowsSingleFingerPan(
       isZoomed: VideoZoomConfig.isZoomed(currentScale),
       isMultiTouchGestureActive: isMultiTouchGestureActive
@@ -158,10 +168,10 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
     case .began:
       panStartOffset = currentOffset
     case .changed:
-      currentOffset = CGSize(
+      currentOffset = boundedOffset(CGSize(
         width: panStartOffset.width + value.translation.width,
         height: panStartOffset.height + value.translation.height
-      )
+      ), in: containerSize)
     case .ended, .cancelled, .failed:
       panStartOffset = currentOffset
     default:
@@ -229,19 +239,16 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
     )
   }
 
-  private func clipShape(for scale: CGFloat, in containerSize: CGSize) -> some InsettableShape {
-    let clampedScale = VideoZoomConfig.clampedScale(scale)
-    let expansion: CGFloat
-    if clampedScale <= VideoZoomConfig.zoomThreshold {
-      expansion = 0
-    } else {
-      let extraWidth = containerSize.width * (clampedScale - 1)
-      let extraHeight = containerSize.height * (clampedScale - 1)
-      expansion = max(extraWidth, extraHeight)
-    }
+  private func boundedOffset(_ offset: CGSize, in containerSize: CGSize) -> CGSize {
+    VideoZoomBounds.clampedOffset(offset, scale: currentScale,
+      anchor: CGPoint(x: currentAnchor.x, y: currentAnchor.y),
+      containerSize: containerSize, contentAspectRatio: contentAspectRatio)
+  }
 
-    return RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-      .inset(by: -expansion)
+  private func constrainOffset(in containerSize: CGSize) {
+    currentOffset = boundedOffset(currentOffset, in: containerSize)
+    panStartOffset = currentOffset
+    gestureStartOffset = currentOffset
   }
 }
 
@@ -293,6 +300,7 @@ struct VideoGestureSurface: UIViewRepresentable {
   let onPanUpdate: (SupplementPanGestureValue) -> Void
   let onLongPressStateChanged: @MainActor (UIGestureRecognizer.State) -> Void
   let onDoubleTap: @MainActor () -> Void
+  var onSingleTap: (@MainActor () -> Void)? = nil
 
   func makeCoordinator() -> Coordinator {
     Coordinator(
@@ -302,7 +310,8 @@ struct VideoGestureSurface: UIViewRepresentable {
       onPinchUpdate: onPinchUpdate,
       onPanUpdate: onPanUpdate,
       onLongPressStateChanged: onLongPressStateChanged,
-      onDoubleTap: onDoubleTap
+      onDoubleTap: onDoubleTap,
+      onSingleTap: onSingleTap
     )
   }
 
@@ -350,6 +359,16 @@ struct VideoGestureSurface: UIViewRepresentable {
     context.coordinator.panRecognizer = panRecognizer
     context.coordinator.longPressRecognizer = longPressRecognizer
     context.coordinator.tapRecognizer = tapRecognizer
+    if onSingleTap != nil {
+      let singleTap = UITapGestureRecognizer(
+        target: context.coordinator, action: #selector(Coordinator.handleSingleTap(_:))
+      )
+      singleTap.cancelsTouchesInView = false
+      singleTap.delegate = context.coordinator
+      singleTap.require(toFail: tapRecognizer)
+      view.addGestureRecognizer(singleTap)
+      context.coordinator.singleTapRecognizer = singleTap
+    }
     return view
   }
 
@@ -361,6 +380,7 @@ struct VideoGestureSurface: UIViewRepresentable {
     context.coordinator.onPanUpdate = onPanUpdate
     context.coordinator.onLongPressStateChanged = onLongPressStateChanged
     context.coordinator.onDoubleTap = onDoubleTap
+    context.coordinator.onSingleTap = onSingleTap
   }
 
   static func dismantleUIView(_ view: UIView, coordinator: Coordinator) {
@@ -375,10 +395,12 @@ struct VideoGestureSurface: UIViewRepresentable {
     var onPanUpdate: (SupplementPanGestureValue) -> Void
     @MainActor var onLongPressStateChanged: (UIGestureRecognizer.State) -> Void
     @MainActor var onDoubleTap: () -> Void
+    @MainActor var onSingleTap: (() -> Void)?
     weak var pinchRecognizer: UIPinchGestureRecognizer?
     weak var panRecognizer: UIPanGestureRecognizer?
     weak var longPressRecognizer: UILongPressGestureRecognizer?
     weak var tapRecognizer: UITapGestureRecognizer?
+    weak var singleTapRecognizer: UITapGestureRecognizer?
 
     private var isPinchActive = false
 
@@ -393,7 +415,8 @@ struct VideoGestureSurface: UIViewRepresentable {
       onPinchUpdate: @escaping (SupplementPinchGestureValue) -> Void,
       onPanUpdate: @escaping (SupplementPanGestureValue) -> Void,
       onLongPressStateChanged: @escaping @MainActor (UIGestureRecognizer.State) -> Void,
-      onDoubleTap: @escaping @MainActor () -> Void
+      onDoubleTap: @escaping @MainActor () -> Void,
+      onSingleTap: (@MainActor () -> Void)? = nil
     ) {
       self.isZoomed = isZoomed
       self.isMultiTouchGestureActive = isMultiTouchGestureActive
@@ -402,6 +425,7 @@ struct VideoGestureSurface: UIViewRepresentable {
       self.onPanUpdate = onPanUpdate
       self.onLongPressStateChanged = onLongPressStateChanged
       self.onDoubleTap = onDoubleTap
+      self.onSingleTap = onSingleTap
     }
 
     func removeGestures() {
@@ -420,10 +444,12 @@ struct VideoGestureSurface: UIViewRepresentable {
       remove(panRecognizer)
       remove(longPressRecognizer)
       remove(tapRecognizer)
+      remove(singleTapRecognizer)
       pinchRecognizer = nil
       panRecognizer = nil
       longPressRecognizer = nil
       tapRecognizer = nil
+      singleTapRecognizer = nil
       isPinchActive = false
     }
 
@@ -495,6 +521,12 @@ struct VideoGestureSurface: UIViewRepresentable {
       Task { @MainActor in onDoubleTap() }
     }
 
+    @objc
+    func handleSingleTap(_ recognizer: UITapGestureRecognizer) {
+      guard recognizer.state == .ended, !hasActiveMultiTouchGesture else { return }
+      Task { @MainActor in onSingleTap?() }
+    }
+
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
       if let panRecognizer, gestureRecognizer === panRecognizer {
         return VideoGesturePolicy.allowsSingleFingerPan(
@@ -532,6 +564,7 @@ struct VideoGestureSurface: UIViewRepresentable {
     }
 
     private func isPlaybackGesture(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+      if let singleTapRecognizer, gestureRecognizer === singleTapRecognizer { return true }
       if let longPressRecognizer,
          gestureRecognizer === longPressRecognizer {
         return true

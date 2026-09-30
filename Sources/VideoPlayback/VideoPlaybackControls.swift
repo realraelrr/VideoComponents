@@ -37,7 +37,6 @@ struct VideoPlaybackControls: View {
   let labels: VideoPlaybackLabels
   let tint: Color
   let fullscreenAction: (() -> Void)?
-
   var body: some View {
     HStack(spacing: style.spacing) {
       Button(action: playbackSession.togglePlayback) {
@@ -126,6 +125,7 @@ private struct VideoScrubBar: View {
   let onEditingChanged: (Bool) -> Void
 
   @State private var isDragging = false
+  @GestureState private var isDragActive = false
 
   var body: some View {
     GeometryReader { proxy in
@@ -151,6 +151,10 @@ private struct VideoScrubBar: View {
       .gesture(dragGesture(width: width))
     }
     .frame(height: style.hitHeight)
+    .onChange(of: isDragActive) { _, active in
+      if !active { finishDragging() }
+    }
+    .onDisappear { finishDragging() }
     .accessibilityElement()
     .accessibilityLabel(label)
     .accessibilityValue(accessibilityValue)
@@ -189,6 +193,7 @@ private struct VideoScrubBar: View {
 
   private func dragGesture(width: CGFloat) -> some Gesture {
     DragGesture(minimumDistance: 0)
+      .updating($isDragActive) { _, active, _ in active = true }
       .onChanged { value in
         if !isDragging {
           isDragging = true
@@ -198,9 +203,14 @@ private struct VideoScrubBar: View {
       }
       .onEnded { value in
         progress = VideoScrubBarGeometry.progress(forX: value.location.x, width: width)
-        isDragging = false
-        onEditingChanged(false)
+        finishDragging()
       }
+  }
+
+  private func finishDragging() {
+    guard isDragging else { return }
+    isDragging = false
+    onEditingChanged(false)
   }
 
   private func adjustProgress(by delta: Double) {
