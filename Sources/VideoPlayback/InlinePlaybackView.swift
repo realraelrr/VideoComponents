@@ -11,6 +11,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
   let topTrailingAccessory: () -> TopTrailingAccessory
   let onRequestFullscreen: (() -> Void)?
   let statusOverlay: () -> StatusOverlay
+  let placeholderImage: (@MainActor () -> UIImage?)?
   let labels: VideoPlaybackLabels
   let style: VideoPlaybackStyle
 
@@ -27,6 +28,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
     onRequestFullscreen: (() -> Void)? = nil,
     labels: VideoPlaybackLabels = .init(),
     style: VideoPlaybackStyle = .init(),
+    placeholderImage: (@MainActor () -> UIImage?)? = nil,
     @ViewBuilder statusOverlay: @escaping () -> StatusOverlay
   ) {
     self.playbackSession = playbackSession
@@ -39,6 +41,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
     self.labels = labels
     self.style = style
     self.statusOverlay = statusOverlay
+    self.placeholderImage = placeholderImage
   }
 
   public var body: some View {
@@ -117,22 +120,15 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
   }
 
   private var mediaLayer: some View {
-    ZStack {
-      Color.black
-
-      if let thumbnailImage = playbackSession.thumbnailImage {
-        Image(uiImage: thumbnailImage)
-          .resizable()
-          .scaledToFit()
-          .opacity(!playbackSession.hasCurrentItem || !playbackSession.isPlayerReady ? 1 : 0.18)
-      }
-
-      InlineVideoPlayerLayer(
-        player: inlineLayerPlayer,
-        videoGravity: .resizeAspect
-      )
-      .opacity(playbackSession.hasCurrentItem ? 1 : 0)
-    }
+    // A host provider is authoritative even when the current poster is unavailable.
+    let image = if let placeholderImage { placeholderImage() } else { playbackSession.thumbnailImage }
+    return InlineVideoPlayerLayer(
+      player: inlineLayerPlayer,
+      videoGravity: .resizeAspect,
+      placeholderImage: image,
+      isPlayerReady: playbackSession.isPlayerReady
+    )
+    .background(.black)
   }
 
   private var inlineLayerPlayer: AVPlayer? {

@@ -9,6 +9,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
   let labels: VideoPlaybackLabels
   let trailingAccessory: () -> TrailingAccessory
   let statusOverlay: () -> StatusOverlay
+  let placeholderImage: (@MainActor () -> UIImage?)?
 
   @State private var isZooming = false
   @State private var isMultiTouchGestureActive = false
@@ -21,6 +22,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
     allowsHoldBoost: Bool = true,
     onClose: @escaping @MainActor @Sendable () -> Void,
     labels: VideoPlaybackLabels = .init(),
+    placeholderImage: (@MainActor () -> UIImage?)? = nil,
     @ViewBuilder trailingAccessory: @escaping () -> TrailingAccessory,
     @ViewBuilder statusOverlay: @escaping () -> StatusOverlay
   ) {
@@ -30,6 +32,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
     self.labels = labels
     self.trailingAccessory = trailingAccessory
     self.statusOverlay = statusOverlay
+    self.placeholderImage = placeholderImage
   }
 
   public var body: some View {
@@ -86,7 +89,9 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
       ) {
         InlineVideoPlayerLayer(
           player: playbackSession.hasCurrentItem ? playbackSession.player : nil,
-          videoGravity: .resizeAspect
+          videoGravity: .resizeAspect,
+          placeholderImage: placeholderImageValue,
+          isPlayerReady: playbackSession.isPlayerReady
         )
       } overlay: { zoomContext in
         ZStack {
@@ -99,6 +104,11 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
 
       fullscreenOverlay
     }
+  }
+
+  private var placeholderImageValue: UIImage? {
+    if let placeholderImage { return placeholderImage() }
+    return playbackSession.thumbnailImage
   }
 
   private var fullscreenOverlay: some View {

@@ -16,6 +16,7 @@ fi
 for name in IsolatedConsumer Metadata.log PackageTests.log ConsumerTests.log \
   PackageTests.xcresult ConsumerTests.xcresult PackageDerivedData ConsumerDerivedData \
   ConsumerDeviceDerivedData ConsumerSimulatorBuild.log ConsumerDeviceBuild.log \
+  CaptureScreens CaptureDriver.log \
   PlaybackOnlyDerivedData ProcessingOnlyDerivedData FramePickerOnlyDerivedData \
   PlaybackOnlyBuild.log ProcessingOnlyBuild.log FramePickerOnlyBuild.log; do
   if [ -e "$result_dir/$name" ]; then
@@ -139,11 +140,41 @@ python3 "$script_dir/assert-results.py" "$result_dir/PackageTests.xcresult" \
   --test VideoFramePickerMediaTests/testRealEndpointReturnsActualEncodedTimeOrTypedFrameFailure \
   --test VideoFramePickerMediaTests/testRealMissingVideoAndUnreadableFileProduceSourceFailure
 
+# Application-host XCTest cannot use XCUIAutomation screen capture. A bounded
+# external driver supplies real compositor pixels for the poster handoff tests.
+capture_dir="$result_dir/CaptureScreens"
+python3 "$script_dir/capture-player-screen.py" --directory "$capture_dir" --udid "$simulator_id" \
+  > "$result_dir/CaptureDriver.log" 2>&1 &
+capture_pid=$!
+trap 'kill "$capture_pid" 2>/dev/null || true; wait "$capture_pid" 2>/dev/null || true' EXIT
+python3 - "$capture_dir/driver.json" <<'PYTHON'
+from pathlib import Path
+import json
+import sys
+import time
+path = Path(sys.argv[1])
+deadline = time.monotonic() + 20
+while time.monotonic() < deadline:
+    if path.exists():
+        state = json.loads(path.read_text())
+        if state["state"] == "ready":
+            break
+        raise SystemExit("capture driver failed: " + str(state))
+    time.sleep(0.05)
+else:
+    raise SystemExit("capture driver did not become ready; see CaptureDriver.log")
+PYTHON
+export TEST_RUNNER_VIDEO_COMPONENTS_CAPTURE_DIRECTORY="$capture_dir"
+
 xcodebuild -jobs "$jobs" -project "$consumer_project" -scheme VideoComponentsExample \
   -destination "$destination" -derivedDataPath "$result_dir/ConsumerDerivedData" \
   -resultBundlePath "$result_dir/ConsumerTests.xcresult" \
   -parallel-testing-enabled NO -collect-test-diagnostics never CODE_SIGNING_ALLOWED=NO test \
   2>&1 | tee "$result_dir/ConsumerTests.log"
+
+touch "$capture_dir/quit"
+wait "$capture_pid"
+trap - EXIT
 
 python3 "$script_dir/assert-results.py" "$result_dir/ConsumerTests.xcresult" \
   --expectations "$isolated/ExpectedConsumerTests.json" \

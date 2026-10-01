@@ -355,3 +355,1080 @@ private struct MountedZoomProbe: View {
 private final class MountedTap: UITapGestureRecognizer {
   override var state: UIGestureRecognizer.State { get { .ended } set {} }
 }
+
+/// Uses external simctl screen captures: unit-host XCTest is not authorized to use XCUIScreen.
+/// drawHierarchy/layer.render can omit AVPlayerLayer's video.
+/// Every handoff must positively reach green video; black or an isHidden assertion cannot pass.
+@MainActor
+final class VideoPlaybackPosterHandoffTests: XCTestCase {
+  private typealias NativeView = InlineVideoPlayerLayer.PlayerLayerView
+  private enum Presentation: String, CaseIterable { case inline, fullscreen }
+  private enum PixelColor: String { case red, green, blue, other }
+  private struct ScreenFrame {
+    let image: UIImage
+    let color: PixelColor
+    let description: String
+  }
+  private struct CaptureRect: Codable {
+    let x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat
+    init(_ rect: CGRect) { x = rect.minX; y = rect.minY; width = rect.width; height = rect.height }
+  }
+  private struct NativeFacts: Codable {
+    let hasPlayer: Bool
+    let hasCurrentItem: Bool
+    let itemStatus: String
+    let isReadyForDisplay: Bool
+  }
+  private struct CaptureDriver: Decodable {
+    let protocolVersion: Int
+    let simulatorUDID: String
+    let runToken: String
+    let state: String
+    let failure: String?
+  }
+  private struct CaptureRequest: Encodable {
+    let protocolVersion = 1
+    let token: String
+    let runToken: String
+    let simulatorUDID: String
+    let processID: Int32
+    let test: String
+    let stage: String
+    let createdAt: Double
+    let expiresAt: Double
+    let mediaROI: CaptureRect
+    let screenBounds: CaptureRect
+    let nativeFacts: NativeFacts
+  }
+  private struct CaptureResponse: Decodable {
+    let protocolVersion: Int
+    let token: String
+    let runToken: String
+    let simulatorUDID: String
+    let success: Bool
+    let failure: String?
+    let png: String?
+    let byteCount: Int?
+    let captureStartedAt: Double?
+  }
+  private struct CaptureError: Error, CustomStringConvertible {
+    let description: String
+    init(_ description: String) { self.description = description }
+  }
+  private enum FixtureError: Error { case timeout(String), writerFailed }
+  private var previousKeyWindow: UIWindow?
+
+  func testScreenCaptureCalibratesRealGreenVideoAgainstRedPoster() async throws {
+    let asset = try await greenVideo()
+    let surface = UIView()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { unmount(window) }
+    place(surface, in: controller.view)
+    let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+    let layer = AVPlayerLayer(player: player)
+    layer.videoGravity = .resizeAspect
+    layer.frame = surface.bounds
+    surface.layer.addSublayer(layer)
+    defer { layer.player = nil; player.replaceCurrentItem(with: nil) }
+    let poster = UIImageView(image: image(.red))
+    poster.frame = surface.bounds
+    poster.contentMode = .scaleAspectFit
+    surface.addSubview(poster)
+    try await assertColor(.red, in: surface, name: "calibration-opaque-red-poster")
+    try await poll("real calibration layer readiness") { layer.isReadyForDisplay }
+    // Calibration is independent of the component's placeholder implementation.
+    poster.removeFromSuperview()
+    try await waitForGreen(in: surface, name: "calibration-real-video", allowing: [.red, .green])
+    XCTAssertTrue(layer.isReadyForDisplay)
+  }
+
+  func testItemReadinessFalseKeepsRedAfterNativeLayerIsReady() async throws {
+    let asset = try await greenVideo()
+    let view = NativeView()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { view.detach(); unmount(window) }
+    place(view, in: controller.view)
+    let poster = image(.red)
+    let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+    configure(view, player: player, poster: poster, ready: false)
+    try await assertColor(.red, in: view, name: "item-not-ready-before-native-ready")
+    try await poll("native layer ready while host item readiness remains false") {
+      view.playerLayer.isReadyForDisplay
+    }
+    XCTAssertEqual(player.currentItem?.status, .readyToPlay)
+    try await assertColor(.red, in: view, name: "native-ready-item-not-ready-red")
+    XCTAssertTrue(view.playerLayer.player === player, "The video must remain attached beneath the poster")
+    configure(view, player: player, poster: poster, ready: true)
+    try await waitForGreen(in: view, name: "both-ready-reveals-real-green")
+  }
+
+  func testHostReadyBeforeNativeLayerKeepsRedUntilRealGreen() async throws {
+    let asset = try await greenVideo()
+    let view = NativeView()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { view.detach(); unmount(window) }
+    place(view, in: controller.view)
+    let poster = image(.red)
+    let player = AVPlayer()
+    configure(view, player: player, poster: poster, ready: true)
+    XCTAssertFalse(view.playerLayer.isReadyForDisplay)
+    try await assertColor(.red, in: view, name: "host-ready-layer-not-ready-red")
+    player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
+    // No configure call follows replacement: native KVO must complete the handoff.
+    try await waitForGreen(in: view, name: "host-first-native-readiness-handoff")
+    XCTAssertTrue(view.playerLayer.isReadyForDisplay)
+  }
+
+  func testNewNativeFullscreenLayerAndReturnInlineKeepCurrentPoster() async throws {
+    let asset = try await greenVideo()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { unmount(window) }
+    let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+    let poster = image(.red)
+    let inline = NativeView()
+    place(inline, in: controller.view)
+    configure(inline, player: player, poster: poster, ready: false)
+    try await assertColor(.red, in: inline, name: "inline-preparing-red")
+    configure(inline, player: player, poster: poster, ready: true)
+    try await waitForGreen(in: inline, name: "inline-real-green")
+
+    inline.detach()
+    inline.removeFromSuperview()
+    let fullscreen = NativeView()
+    place(fullscreen, in: controller.view)
+    configure(fullscreen, player: player, poster: poster, ready: false)
+    try await poll("new fullscreen layer readiness") { fullscreen.playerLayer.isReadyForDisplay }
+    try await assertColor(.red, in: fullscreen, name: "new-fullscreen-layer-preparing-current-red")
+    XCTAssertNil(inline.playerLayer.player)
+    XCTAssertTrue(fullscreen.playerLayer.player === player)
+    configure(fullscreen, player: player, poster: poster, ready: true)
+    try await waitForGreen(in: fullscreen, name: "fullscreen-real-green")
+
+    fullscreen.detach()
+    fullscreen.removeFromSuperview()
+    let returnedInline = NativeView()
+    defer { returnedInline.detach() }
+    place(returnedInline, in: controller.view)
+    configure(returnedInline, player: player, poster: poster, ready: false)
+    try await poll("new return-inline layer readiness") { returnedInline.playerLayer.isReadyForDisplay }
+    try await assertColor(.red, in: returnedInline, name: "new-return-inline-preparing-current-red")
+    XCTAssertNil(fullscreen.playerLayer.player)
+    XCTAssertTrue(returnedInline.playerLayer.player === player)
+    configure(returnedInline, player: player, poster: poster, ready: true)
+    try await waitForGreen(in: returnedInline, name: "return-inline-real-green")
+  }
+
+  func testNilPlayerAndNilItemKeepRedPoster() async throws {
+    let asset = try await greenVideo()
+    let view = NativeView()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { view.detach(); unmount(window) }
+    place(view, in: controller.view)
+    let poster = image(.red)
+    configure(view, player: nil, poster: poster, ready: true)
+    try await assertColor(.red, in: view, name: "nil-player-red")
+    let player = AVPlayer()
+    configure(view, player: player, poster: poster, ready: true)
+    try await assertColor(.red, in: view, name: "nil-current-item-red")
+    player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
+    try await waitForGreen(in: view, name: "nil-item-to-real-green")
+    player.replaceCurrentItem(with: nil)
+    try await assertColor(.red, in: view, name: "removed-item-restores-red-without-configure")
+    configure(view, player: nil, poster: poster, ready: true)
+    try await assertColor(.red, in: view, name: "removed-player-keeps-red")
+  }
+
+  func testPlayerAndItemReplacementRejectObsoleteReadiness() async throws {
+    let asset = try await greenVideo()
+    let view = NativeView()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { view.detach(); unmount(window) }
+    place(view, in: controller.view)
+    let oldPlayer = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+    configure(view, player: oldPlayer, poster: image(.red), ready: true)
+    try await waitForGreen(in: view, name: "old-player-real-green")
+
+    // Queue real currentItem changes, then supersede the observed player before yielding.
+    oldPlayer.replaceCurrentItem(with: nil)
+    oldPlayer.replaceCurrentItem(with: AVPlayerItem(asset: asset))
+    let currentPlayer = AVPlayer()
+    let currentPoster = image(.blue)
+    configure(view, player: currentPlayer, poster: currentPoster, ready: true)
+    let obsoleteSurface = UIView(frame: CGRect(x: 12, y: 80, width: 80, height: 60))
+    controller.view.addSubview(obsoleteSurface)
+    let obsoleteLayer = AVPlayerLayer(player: oldPlayer)
+    obsoleteLayer.frame = obsoleteSurface.bounds
+    obsoleteSurface.layer.addSublayer(obsoleteLayer)
+    defer { obsoleteLayer.player = nil }
+    // The obsolete item's readiness really advances; it cannot reveal the current empty layer.
+    try await poll("obsolete player renders on another layer") { obsoleteLayer.isReadyForDisplay }
+    try await waitForGreen(in: obsoleteSurface, name: "obsolete-player-positive-green", allowing: [.blue, .green])
+    try await assertColor(.blue, in: view, name: "replacement-rejects-obsolete-ready-and-old-red")
+    XCTAssertTrue(view.playerLayer.player === currentPlayer)
+    XCTAssertNil(currentPlayer.currentItem)
+    currentPlayer.replaceCurrentItem(with: AVPlayerItem(asset: asset))
+    try await waitForGreen(in: view, name: "replacement-current-video-green", allowing: [.blue, .green])
+
+    // Replacement on the same player must rebind the observed item, without a view update.
+    currentPlayer.replaceCurrentItem(with: nil)
+    try await assertColor(.blue, in: view, name: "same-player-nil-item-current-poster")
+    currentPlayer.replaceCurrentItem(with: AVPlayerItem(asset: asset))
+    try await waitForGreen(in: view, name: "same-player-new-item-green", allowing: [.blue, .green])
+  }
+
+  func testDetachAndDismantleRejectLateReadinessAndReleaseView() async throws {
+    let asset = try await greenVideo()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { unmount(window) }
+    let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+    var mounted: NativeView? = NativeView()
+    weak var releasedView = mounted
+    do {
+      let view = try XCTUnwrap(mounted)
+      place(view, in: controller.view)
+      configure(view, player: player, poster: image(.red), ready: true)
+      try await waitForGreen(in: view, name: "before-detach-real-green")
+      view.detach()
+      XCTAssertNil(view.playerLayer.player)
+      configure(view, player: nil, poster: image(.red), ready: true)
+      // Exercise late currentItem notifications after detach, while a new nil-player binding is mounted.
+      player.replaceCurrentItem(with: nil)
+      player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
+      try await assertColor(.red, in: view, name: "detached-old-player-cannot-reveal-new-binding")
+      XCTAssertNil(view.playerLayer.player)
+      InlineVideoPlayerLayer.dismantleUIView(view, coordinator: ())
+      XCTAssertNil(view.playerLayer.player)
+      view.removeFromSuperview()
+    }
+    mounted = nil
+    player.replaceCurrentItem(with: nil)
+    try await poll("dismantled native view released despite obsolete observers") { releasedView == nil }
+  }
+
+  func testNativeNoPosterDoesNotSynthesizeRed() async throws {
+    let asset = try await greenVideo()
+    let view = NativeView()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { view.detach(); unmount(window) }
+    place(view, in: controller.view)
+    // A known blue substrate makes absence observable without accepting black as evidence.
+    view.backgroundColor = .blue
+    configure(view, player: nil, poster: nil, ready: false)
+    try await assertColor(.blue, in: view, name: "no-poster-positive-blue-substrate")
+    let player = AVPlayer()
+    configure(view, player: player, poster: nil, ready: true)
+    try await assertColor(.blue, in: view, name: "no-poster-no-item-positive-blue")
+    player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
+    try await waitForGreen(in: view, name: "no-poster-real-green", allowing: [.blue, .green])
+  }
+
+  func testSharedInlineAndFullscreenDefaultPosterSurvivesHeldAccessValidation() async throws {
+    let asset = try await greenVideo()
+    for mode in Presentation.allCases {
+      let poster = image(.red)
+      let gate = PosterHandoffAssetGate(asset: asset)
+      let validationGate = PosterHandoffAssetGate(asset: asset)
+      let session = PlaybackSession()
+      defer { gate.release(); validationGate.release(); session.cleanup() }
+      let source = PlaybackSource(identity: UUID(), load: { try await gate.load() }, thumbnail: { _ in poster })
+      session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+      try await poll("initial source acquisition started") { gate.started }
+      XCTAssertNil(session.thumbnailImage, "The source thumbnail starts only after source acquisition returns")
+      gate.release()
+      try await poll("source thumbnail and item ready after acquisition") {
+        session.thumbnailImage === poster && session.isPlayerReady
+      }
+      // Existing access revalidation retains the thumbnail while detaching the item.
+      // Hold this separate operation, not the source loader that supplies the thumbnail.
+      session.revalidateAccess(source: source, refreshID: 1) { .validate { try await validationGate.load() } }
+      try await poll("access validation held with retained source thumbnail") { validationGate.started }
+      let host = UIHostingController(rootView: sharedView(mode, session: session))
+      let window = try mount(host)
+      defer { unmount(window) }
+      let media = try await mountedMedia(in: host.view)
+      XCTAssertFalse(session.hasCurrentItem)
+      XCTAssertFalse(session.isPlayerReady)
+      XCTAssertTrue(session.thumbnailImage === poster)
+      try await assertColor(.red, in: media, name: "\(mode.rawValue)-held-validation-default-red")
+      validationGate.release()
+      try await waitForGreen(in: media, name: "\(mode.rawValue)-default-poster-to-real-green")
+      XCTAssertTrue(session.isPlayerReady)
+      XCTAssertTrue(media.playerLayer.isReadyForDisplay)
+      XCTAssertTrue(media.playerLayer.player === session.player)
+    }
+  }
+
+  func testSharedInlineAndFullscreenAuthoritativeNilSuppressesSessionThumbnail() async throws {
+    let asset = try await greenVideo()
+    for mode in Presentation.allCases {
+      let obsoletePoster = image(.red)
+      let gate = PosterHandoffAssetGate(asset: asset)
+      let validationGate = PosterHandoffAssetGate(asset: asset)
+      let session = PlaybackSession()
+      defer { gate.release(); validationGate.release(); session.cleanup() }
+      let source = PlaybackSource(identity: UUID(), load: { try await gate.load() }, thumbnail: { _ in obsoletePoster })
+      session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+      try await poll("initial source acquisition started") { gate.started }
+      gate.release()
+      try await poll("obsolete session thumbnail available after acquisition") {
+        session.thumbnailImage === obsoletePoster && session.isPlayerReady
+      }
+      session.revalidateAccess(source: source, refreshID: 1) { .validate { try await validationGate.load() } }
+      try await poll("access validation held with obsolete session thumbnail") { validationGate.started }
+      let host = UIHostingController(rootView: sharedView(mode, session: session))
+      let window = try mount(host)
+      defer { unmount(window) }
+      let oldMedia = try await mountedMedia(in: host.view)
+      XCTAssertFalse(session.hasCurrentItem)
+      XCTAssertFalse(session.isPlayerReady)
+      try await assertColor(.red, in: oldMedia, name: "\(mode.rawValue)-calibrate-obsolete-session-red")
+      host.rootView = sharedView(mode, session: session, provider: { nil })
+      let media = try await mountedMedia(in: host.view)
+      media.backgroundColor = .blue
+      try await assertColor(.blue, in: media, name: "\(mode.rawValue)-authoritative-nil-positive-blue")
+      XCTAssertTrue(session.thumbnailImage === obsoletePoster, "The obsolete thumbnail still exists in the session")
+      validationGate.release()
+      try await waitForGreen(in: media, name: "\(mode.rawValue)-authoritative-nil-real-green", allowing: [.blue, .green])
+    }
+  }
+
+  func testSharedViewsTransferSamePlayerToFullscreenAndBack() async throws {
+    let asset = try await greenVideo()
+    let poster = image(.red)
+    let gate = PosterHandoffAssetGate(asset: asset)
+    let session = PlaybackSession()
+    defer { gate.release(); session.cleanup() }
+    session.load(source: PlaybackSource(identity: UUID(), load: { try await gate.load() }),
+      playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+    try await poll("held shared source") { gate.started }
+    let host = UIHostingController(rootView: sharedView(.inline, session: session, provider: { poster }))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let inline = try await mountedMedia(in: host.view)
+    try await assertColor(.red, in: inline, name: "shared-inline-current-provider-red-while-preparing")
+    gate.release()
+    try await waitForGreen(in: inline, name: "shared-inline-before-transfer-green")
+    let item = try XCTUnwrap(session.player.currentItem)
+    host.rootView = sharedView(.fullscreen, session: session, provider: { poster })
+    let fullscreen = try await mountedMedia(in: host.view)
+    XCTAssertFalse(fullscreen === inline, "Fullscreen owns a newly mounted native layer")
+    try await waitForGreen(in: fullscreen, name: "shared-new-fullscreen-handoff")
+    XCTAssertNil(inline.playerLayer.player, "SwiftUI dismantle must detach the previous inline layer")
+    XCTAssertTrue(fullscreen.playerLayer.player === session.player)
+    XCTAssertTrue(session.player.currentItem === item)
+    host.rootView = sharedView(.inline, session: session, provider: { poster })
+    let returnedInline = try await mountedMedia(in: host.view)
+    XCTAssertFalse(returnedInline === inline)
+    XCTAssertFalse(returnedInline === fullscreen)
+    try await waitForGreen(in: returnedInline, name: "shared-new-return-inline-handoff")
+    XCTAssertNil(fullscreen.playerLayer.player)
+    XCTAssertTrue(returnedInline.playerLayer.player === session.player)
+    XCTAssertTrue(session.player.currentItem === item)
+  }
+
+  func testSharedProviderRefreshUsesCurrentPosterWhileAcquisitionIsHeld() async throws {
+    let asset = try await greenVideo()
+    for mode in Presentation.allCases {
+      let obsoletePoster = image(.red)
+      let currentPoster = image(.blue)
+      let gate = PosterHandoffAssetGate(asset: asset)
+      let session = PlaybackSession()
+      var sourceThumbnailRequests = 0
+      defer { gate.release(); session.cleanup() }
+      session.load(source: PlaybackSource(identity: UUID(), load: { try await gate.load() },
+        thumbnail: { _ in sourceThumbnailRequests += 1; return obsoletePoster }),
+        playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+      try await poll("held initial source acquisition") { gate.started }
+      XCTAssertNil(session.thumbnailImage)
+      XCTAssertEqual(sourceThumbnailRequests, 0, "The host provider is independent of source thumbnail acquisition")
+      let host = UIHostingController(rootView: sharedView(mode, session: session, provider: { obsoletePoster }))
+      let window = try mount(host)
+      defer { unmount(window) }
+      let media = try await mountedMedia(in: host.view)
+      try await assertColor(.red, in: media, name: "\(mode.rawValue)-provider-before-refresh-red")
+      host.rootView = sharedView(mode, session: session, provider: { currentPoster })
+      try await assertColor(.blue, in: media, name: "\(mode.rawValue)-current-provider-replaces-obsolete-red")
+      XCTAssertNil(session.thumbnailImage)
+      XCTAssertEqual(sourceThumbnailRequests, 0)
+      XCTAssertFalse(session.hasCurrentItem)
+      gate.release()
+      try await waitForGreen(in: media, name: "\(mode.rawValue)-current-provider-to-real-green", allowing: [.blue, .green])
+      try await poll("obsolete source thumbnail delivered after acquisition") { session.thumbnailImage === obsoletePoster }
+    }
+  }
+
+  func testAspectFillOversizedPosterKeepsOutsideFixtureBlueWhileHostNotReady() async throws {
+    let asset = try await greenVideo()
+    let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+    let view = NativeView()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { view.detach(); unmount(window) }
+    place(view, in: controller.view)
+    // Transparent siblings sample actual pixels outside the media; they cannot hide a leaking poster.
+    let outsideRects = [
+      CGRect(x: view.frame.minX - 24, y: view.frame.midY - 8, width: 16, height: 16),
+      CGRect(x: view.frame.maxX + 8, y: view.frame.midY - 8, width: 16, height: 16),
+      CGRect(x: view.frame.midX - 8, y: view.frame.minY - 24, width: 16, height: 16),
+      CGRect(x: view.frame.midX - 8, y: view.frame.maxY + 8, width: 16, height: 16)
+    ]
+    let outside = outsideRects.map { rect in
+      let probe = UIView(frame: rect)
+      probe.backgroundColor = .clear
+      controller.view.addSubview(probe)
+      XCTAssertTrue(controller.view.bounds.contains(rect), "Outside samples must remain on screen")
+      XCTAssertFalse(view.frame.intersects(rect), "Outside samples must exclude the media bounds")
+      return probe
+    }
+    for (ratio, size) in [
+      ("wide", CGSize(width: 600, height: 60)),
+      ("tall", CGSize(width: 60, height: 600))
+    ] {
+      let poster = UIGraphicsImageRenderer(size: size).image { context in
+        UIColor.red.setFill()
+        context.fill(CGRect(origin: .zero, size: size))
+      }
+      view.configure(player: player, videoGravity: .resizeAspectFill,
+        placeholderImage: poster, isPlayerReady: false)
+      try await poll("aspect-fill native video ready beneath the held poster") { view.playerLayer.isReadyForDisplay }
+      XCTAssertEqual(player.currentItem?.status, .readyToPlay)
+      try await assertColor(.red, in: view, name: "aspect-fill-\(ratio)-held-red-poster")
+      for (edge, probe) in zip(["left", "right", "top", "bottom"], outside) {
+        try await assertColor(.blue, in: probe, name: "aspect-fill-\(ratio)-outside-\(edge)-blue")
+      }
+    }
+  }
+
+  func testQueuedBackgroundCurrentItemCallbackCannotOverrideReboundPlayer() async throws {
+    let greenAsset = try await greenVideo()
+    let redAsset = try await solidVideo(red: 255, green: 0, blue: 0)
+    let oldPlayer = AVPlayer(playerItem: AVPlayerItem(asset: greenAsset))
+    let view = NativeView()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { view.detach(); unmount(window) }
+    place(view, in: controller.view)
+    configure(view, player: oldPlayer, poster: image(.red), ready: true)
+    try await waitForGreen(in: view, name: "queued-rebind-original-real-green")
+
+    let currentPlayer = AVPlayer(playerItem: AVPlayerItem(asset: redAsset))
+    let currentPoster = image(.blue)
+    // This call blocks MainActor until the background setter and native KVO have returned.
+    // Do not await between this call and rebind: the component's old Task must still be queued.
+    try replaceCurrentItemOnBackgroundWhileMainActorIsBlocked(
+      oldPlayer, with: AVPlayerItem(asset: greenAsset))
+    configure(view, player: currentPlayer, poster: currentPoster, ready: false)
+    try await poll("rebound native red layer ready under the held blue poster") { view.playerLayer.isReadyForDisplay }
+    try await assertColor(.blue, in: view, name: "queued-old-callback-rebound-held-blue")
+    XCTAssertTrue(view.playerLayer.player === currentPlayer)
+    XCTAssertEqual(currentPlayer.currentItem?.status, .readyToPlay)
+    configure(view, player: currentPlayer, poster: currentPoster, ready: true)
+    try await waitForRedVideo(in: view, name: "queued-rebind-current-real-red-rejects-old-green")
+  }
+
+  func testMountedViewReleaseCalibrationWithoutQueuedBackgroundKVO() async throws {
+    let asset = try await greenVideo()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { unmount(window) }
+    let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+    var mounted: NativeView? = NativeView()
+    weak var releasedView = mounted
+    do {
+      let view = try XCTUnwrap(mounted)
+      place(view, in: controller.view)
+      configure(view, player: player, poster: image(.red), ready: true)
+      try await waitForGreen(in: view, name: "release-control-real-green-without-background-kvo")
+      view.detach()
+      view.removeFromSuperview()
+    }
+    mounted = nil
+    let attachment = XCTAttachment(string: "No background item replacement: alive before render tick=\(releasedView != nil)")
+    attachment.name = "mounted-release-control-before-render-tick"
+    attachment.lifetime = .keepAlways
+    add(attachment)
+    print("POSTER_RELEASE_CONTROL aliveBeforeRenderTick=\(releasedView != nil)")
+    try await nextRenderFrame()
+    XCTAssertNil(releasedView, "The control must release after the native render transaction settles")
+    player.replaceCurrentItem(with: nil)
+  }
+
+  func testQueuedBackgroundCurrentItemCallbackDoesNotRetainDetachedOrDismantledView() async throws {
+    let asset = try await greenVideo()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { unmount(window) }
+    for teardown in ["detach", "dismantle"] {
+      let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+      var mounted: NativeView? = NativeView()
+      defer { mounted?.detach(); mounted?.removeFromSuperview() }
+      weak var releasedView = mounted
+      do {
+        let view = try XCTUnwrap(mounted)
+        place(view, in: controller.view)
+        configure(view, player: player, poster: image(.red), ready: true)
+        try await waitForGreen(in: view, name: "queued-\(teardown)-original-real-green")
+        try replaceCurrentItemOnBackgroundWhileMainActorIsBlocked(
+          player, with: AVPlayerItem(asset: asset))
+        // Teardown and release both happen before any queued MainActor callback can run.
+        if teardown == "detach" {
+          view.detach()
+        } else {
+          InlineVideoPlayerLayer.dismantleUIView(view, coordinator: ())
+        }
+        XCTAssertNil(view.playerLayer.player)
+        view.removeFromSuperview()
+      }
+      mounted = nil
+      // The no-background-KVO control also retains a mounted view until this render tick.
+      // Immediate weak ownership is covered separately without UIKit's mounted transaction.
+      try await nextRenderFrame()
+      XCTAssertNil(releasedView, "\(teardown): obsolete KVO must not restore or retain the dismantled view")
+      player.replaceCurrentItem(with: nil)
+    }
+  }
+
+  func testQueuedBackgroundKVOHoldsAnUnmountedViewWeaklyBeforeMainActorCanRun() async throws {
+    let asset = try await greenVideo()
+    for teardown in ["detach", "dismantle"] {
+      let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+      weak var releasedView: NativeView?
+      try autoreleasepool {
+        var view: NativeView? = NativeView()
+        releasedView = view
+        let native = try XCTUnwrap(view)
+        configure(native, player: player, poster: image(.red), ready: false)
+        try replaceCurrentItemOnBackgroundWhileMainActorIsBlocked(
+          player, with: AVPlayerItem(asset: asset))
+        if teardown == "detach" {
+          native.detach()
+        } else {
+          InlineVideoPlayerLayer.dismantleUIView(native, coordinator: ())
+        }
+        XCTAssertNil(native.playerLayer.player)
+        view = nil
+      }
+      // There was no await or run-loop pumping after queuing the old native callback.
+      XCTAssertNil(releasedView, "\(teardown): queued delivery must not strongly own the unmounted view")
+      try await nextRenderFrame()
+      XCTAssertNil(releasedView, "\(teardown): obsolete callbacks must not recreate or retain the released view")
+      player.replaceCurrentItem(with: nil)
+    }
+  }
+
+  func testDirectSamePlayerItemReplacementKeepsBluePosterUntilRealRedVideo() async throws {
+    let greenAsset = try await greenVideo()
+    let redAsset = try await solidVideo(red: 255, green: 0, blue: 0)
+    let firstItem = AVPlayerItem(asset: greenAsset)
+    let secondItem = AVPlayerItem(asset: redAsset)
+    let player = AVPlayer(playerItem: firstItem)
+    let view = NativeView()
+    let controller = UIViewController()
+    let window = try mount(controller)
+    defer { view.detach(); unmount(window) }
+    place(view, in: controller.view)
+    configure(view, player: player, poster: image(.red), ready: true)
+    try await waitForGreen(in: view, name: "direct-replacement-A-real-green")
+    let poster = image(.blue)
+    configure(view, player: player, poster: poster, ready: false)
+    let evidence = PosterHandoffBackgroundItemReplacement(player: player, item: secondItem)
+    let observation = player.observe(\.currentItem, options: [.new]) { @Sendable player, _ in
+      evidence.recordCallback(from: player)
+    }
+    defer { observation.invalidate() }
+    player.replaceCurrentItem(with: secondItem)
+    XCTAssertTrue(player.currentItem === secondItem)
+    XCTAssertTrue(view.playerLayer.player === player, "Direct replacement must keep the same player attached")
+    let facts = evidence.snapshot()
+    XCTAssertGreaterThan(facts.callbackCount, 0, "Direct A-to-B replacement must emit native currentItem KVO")
+    XCTAssertTrue(facts.sawExpectedItem)
+    XCTAssertFalse(facts.sawNilItem, "Direct replacement has no intermediate nil item")
+    try await assertColor(.blue, in: view, name: "direct-replacement-B-held-blue-rejects-old-green")
+    try await poll("direct replacement B native readiness") {
+      secondItem.status == .readyToPlay && view.playerLayer.isReadyForDisplay
+    }
+    try await assertColor(.blue, in: view, name: "direct-replacement-B-native-ready-still-held-blue")
+    configure(view, player: player, poster: poster, ready: true)
+    try await waitForRedVideo(in: view, name: "direct-replacement-B-real-red-rejects-old-green")
+    XCTAssertTrue(player.currentItem === secondItem)
+    XCTAssertTrue(view.playerLayer.isReadyForDisplay)
+  }
+
+  private func replaceCurrentItemOnBackgroundWhileMainActorIsBlocked(
+    _ player: AVPlayer, with item: AVPlayerItem
+  ) throws {
+    XCTAssertTrue(Thread.isMainThread, "This bounded barrier must occupy the MainActor's main thread")
+    let evidence = PosterHandoffBackgroundItemReplacement(player: player, item: item)
+    let observation = player.observe(\.currentItem, options: [.new]) { @Sendable player, _ in
+      evidence.recordCallback(from: player)
+    }
+    defer { observation.invalidate() }
+    DispatchQueue.global(qos: .userInitiated).async {
+      autoreleasepool { evidence.replace() }
+      // Drain bridge temporaries before unblocking MainActor; only its queued Task remains.
+      evidence.setterReturned.signal()
+    }
+    // No run-loop pumping or actor suspension: the component's off-main KVO Task cannot execute yet.
+    let result = evidence.setterReturned.wait(timeout: .now() + 2)
+    XCTAssertEqual(result, .success, "Background currentItem setter must return while MainActor remains blocked")
+    guard result == .success else { throw FixtureError.timeout("background currentItem setter") }
+    let facts = evidence.snapshot()
+    let attachment = XCTAttachment(string: "setterReturned=true; setterOffMain=\(facts.setterWasOffMain); "
+      + "callbackCount=\(facts.callbackCount); callbacksOffMain=\(facts.allCallbacksOffMain); "
+      + "sawExpectedItem=\(facts.sawExpectedItem); sawNilItem=\(facts.sawNilItem)")
+    attachment.name = "background-current-item-kvo-before-main-actor-yield"
+    attachment.lifetime = .keepAlways
+    add(attachment)
+    XCTAssertTrue(facts.setterWasOffMain)
+    XCTAssertGreaterThan(facts.callbackCount, 0, "Independent native KVO must actually fire before rebind/teardown")
+    XCTAssertTrue(facts.allCallbacksOffMain, "The test must exercise queued delivery, not inline main-thread KVO")
+    XCTAssertTrue(facts.sawExpectedItem)
+    XCTAssertFalse(facts.sawNilItem)
+    guard facts.setterWasOffMain, facts.callbackCount > 0, facts.allCallbacksOffMain,
+      facts.sawExpectedItem, !facts.sawNilItem else {
+      throw FixtureError.timeout("off-main native currentItem KVO evidence")
+    }
+  }
+
+  private func waitForRedVideo(in view: UIView, name: String) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(8))
+    var previous: PixelColor?
+    while clock.now < deadline {
+      try await nextRenderFrame()
+      let frame = try await screenFrame(in: view, stage: name)
+      if frame.color != previous || frame.color == .red {
+        retain(frame, name: "\(name)-\(frame.color.rawValue)")
+      }
+      XCTAssertTrue(frame.color == .blue || frame.color == .red,
+        "\(name) must show the current blue poster or real red video; old green/black is forbidden: \(frame.description)")
+      guard frame.color == .blue || frame.color == .red else { throw FixtureError.timeout(name) }
+      if frame.color == .red { return }
+      previous = frame.color
+    }
+    XCTFail("\(name) never displayed real red video; remaining on the blue poster is not success")
+    throw FixtureError.timeout(name)
+  }
+
+  private func sharedView(
+    _ mode: Presentation, session: PlaybackSession,
+    provider: (@MainActor () -> UIImage?)? = nil
+  ) -> AnyView {
+    switch mode {
+    case .inline:
+      AnyView(InlinePlaybackView(playbackSession: session, topTrailingAccessory: { EmptyView() },
+        placeholderImage: provider, statusOverlay: { EmptyView() })
+        .frame(maxWidth: .infinity, maxHeight: .infinity).id(mode.rawValue))
+    case .fullscreen:
+      AnyView(FullscreenPlaybackView(playbackSession: session, onClose: {}, placeholderImage: provider,
+        trailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() })
+        .environment(\.scenePhase, .active).id(mode.rawValue))
+    }
+  }
+
+  private func configure(_ view: NativeView, player: AVPlayer?, poster: UIImage?, ready: Bool) {
+    view.configure(player: player, videoGravity: .resizeAspect, placeholderImage: poster, isPlayerReady: ready)
+  }
+
+  private func image(_ color: UIColor) -> UIImage {
+    UIGraphicsImageRenderer(size: CGSize(width: 160, height: 120)).image { context in
+      color.setFill()
+      context.fill(CGRect(x: 0, y: 0, width: 160, height: 120))
+    }
+  }
+
+  private func mount(_ controller: UIViewController) throws -> UIWindow {
+    let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+      .first { $0.activationState == .foregroundActive }, "A visible host app scene is required for screen capture")
+    previousKeyWindow = scene.windows.first { $0.isKeyWindow }
+    let window = UIWindow(windowScene: scene)
+    window.frame = scene.coordinateSpace.bounds
+    window.windowLevel = .alert + 1
+    window.rootViewController = controller
+    window.makeKeyAndVisible()
+    controller.view.frame = window.bounds
+    controller.view.layoutIfNeeded()
+    XCTAssertFalse(window.isHidden)
+    XCTAssertTrue(window.isKeyWindow)
+    return window
+  }
+
+  private func unmount(_ window: UIWindow) {
+    window.isHidden = true
+    window.rootViewController = nil
+    previousKeyWindow?.makeKey()
+    previousKeyWindow = nil
+  }
+
+  private func place(_ view: UIView, in root: UIView) {
+    root.backgroundColor = .blue
+    let width = min(CGFloat(320), root.bounds.width - 64)
+    let height = width * 0.75
+    view.frame = CGRect(x: (root.bounds.width - width) / 2,
+      y: (root.bounds.height - height) / 2, width: width, height: height)
+    root.addSubview(view)
+    view.layoutIfNeeded()
+  }
+
+  private func mountedMedia(in root: UIView) async throws -> NativeView {
+    try await poll("mounted shared native media view") {
+      root.layoutIfNeeded()
+      return self.findMedia(in: root) != nil
+    }
+    try await nextRenderFrame()
+    return try XCTUnwrap(findMedia(in: root))
+  }
+
+  private func findMedia(in view: UIView) -> NativeView? {
+    if let media = view as? NativeView { return media }
+    for child in view.subviews {
+      if let media = findMedia(in: child) { return media }
+    }
+    return nil
+  }
+
+  private func assertColor(_ color: PixelColor, in view: UIView, name: String) async throws {
+    try await nextRenderFrame()
+    let frame = try await screenFrame(in: view, stage: name)
+    retain(frame, name: name)
+    XCTAssertEqual(frame.color, color, "\(name): \(frame.description)")
+    guard frame.color == color else { throw FixtureError.timeout(name) }
+  }
+
+  private func waitForGreen(
+    in view: UIView, name: String, allowing: Set<PixelColor> = [.red, .green]
+  ) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(8))
+    var previous: PixelColor?
+    while clock.now < deadline {
+      try await nextRenderFrame()
+      let frame = try await screenFrame(in: view, stage: name)
+      if frame.color != previous || frame.color == .green {
+        retain(frame, name: "\(name)-\(frame.color.rawValue)")
+      }
+      XCTAssertTrue(allowing.contains(frame.color),
+        "\(name) leaked a non-poster/non-video frame: \(frame.description)")
+      guard allowing.contains(frame.color) else { throw FixtureError.timeout(name) }
+      if frame.color == .green { return }
+      previous = frame.color
+    }
+    XCTFail("\(name) never displayed real green video; a poster or black frame is not success")
+    throw FixtureError.timeout(name)
+  }
+
+  private func screenFrame(in view: UIView, stage: String) async throws -> ScreenFrame {
+    view.layoutIfNeeded()
+    let window = try XCTUnwrap(view.window)
+    XCTAssertFalse(window.isHidden)
+    XCTAssertTrue(window.screen === UIScreen.main, "External capture must sample this Simulator's main screen")
+    // The center avoids letterboxing, rounded corners, and playback/chrome controls.
+    let mediaRect = view.bounds.insetBy(dx: view.bounds.width * 0.4, dy: view.bounds.height * 0.4)
+    let windowRect = view.convert(mediaRect, to: window)
+    let screenRect = window.convert(windowRect, to: window.screen.coordinateSpace)
+    let screenBounds = window.screen.coordinateSpace.bounds
+    let (screenshot, captureEvidence) = try await externalScreenCapture(
+      in: view, roi: screenRect, screenBounds: screenBounds, stage: stage)
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = screenshot.scale
+    format.opaque = true
+    let normalized = UIGraphicsImageRenderer(size: screenshot.size, format: format).image { _ in
+      screenshot.draw(in: CGRect(origin: .zero, size: screenshot.size))
+    }
+    let cgImage = try XCTUnwrap(normalized.cgImage)
+    XCTAssertEqual(normalized.size.width / normalized.size.height,
+      screenBounds.width / screenBounds.height, accuracy: 0.01, "Capture orientation must match screen coordinates")
+    let scaleX = CGFloat(cgImage.width) / screenBounds.width
+    let scaleY = CGFloat(cgImage.height) / screenBounds.height
+    let pixelsRect = CGRect(x: (screenRect.minX - screenBounds.minX) * scaleX,
+      y: (screenRect.minY - screenBounds.minY) * scaleY,
+      width: screenRect.width * scaleX, height: screenRect.height * scaleY).integral
+    XCTAssertGreaterThan(pixelsRect.width, 4)
+    XCTAssertGreaterThan(pixelsRect.height, 4)
+    XCTAssertTrue(CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height).contains(pixelsRect),
+      "The media sampling region must be on screen: \(pixelsRect)")
+    let crop = try XCTUnwrap(cgImage.cropping(to: pixelsRect))
+    let context = try XCTUnwrap(CGContext(data: nil, width: 12, height: 12,
+      bitsPerComponent: 8, bytesPerRow: 48, space: CGColorSpaceCreateDeviceRGB(),
+      bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue))
+    context.draw(crop, in: CGRect(x: 0, y: 0, width: 12, height: 12))
+    let bytes = try XCTUnwrap(context.data).assumingMemoryBound(to: UInt8.self)
+    var red = 0, green = 0, blue = 0
+    for pixel in 0..<144 {
+      let r = bytes[pixel * 4], g = bytes[pixel * 4 + 1], b = bytes[pixel * 4 + 2]
+      if r > 200 && g < 70 && b < 70 { red += 1 }
+      if g > 170 && r < 80 && b < 80 { green += 1 }
+      if b > 200 && r < 70 && g < 70 { blue += 1 }
+    }
+    let color: PixelColor = red >= 137 ? .red : green >= 137 ? .green : blue >= 137 ? .blue : .other
+    return ScreenFrame(image: normalized, color: color,
+      description: "ROI=\(screenRect); red=\(red)/144 green=\(green)/144 blue=\(blue)/144\n\(captureEvidence)")
+  }
+
+  private func nativeFacts(in view: UIView) -> NativeFacts {
+    let layer = (view.layer as? AVPlayerLayer)
+      ?? view.layer.sublayers?.compactMap { $0 as? AVPlayerLayer }.first
+    let itemStatus: String
+    switch layer?.player?.currentItem?.status {
+    case .readyToPlay?: itemStatus = "readyToPlay"
+    case .failed?: itemStatus = "failed"
+    case .unknown?: itemStatus = "unknown"
+    default: itemStatus = "noItem"
+    }
+    return NativeFacts(hasPlayer: layer?.player != nil, hasCurrentItem: layer?.player?.currentItem != nil,
+      itemStatus: itemStatus, isReadyForDisplay: layer?.isReadyForDisplay ?? false)
+  }
+
+  private func externalScreenCapture(
+    in view: UIView, roi: CGRect, screenBounds: CGRect, stage: String
+  ) async throws -> (UIImage, String) {
+    let environment = ProcessInfo.processInfo.environment
+    guard let path = environment["VIDEO_COMPONENTS_CAPTURE_DIRECTORY"], path.hasPrefix("/") else {
+      throw CaptureError("External screen capture is required. Start Scripts/capture-player-screen.py and pass "
+        + "TEST_RUNNER_VIDEO_COMPONENTS_CAPTURE_DIRECTORY to the consumer test run; no screenshot fallback or skip is allowed.")
+    }
+    guard let simulatorUDID = environment["SIMULATOR_UDID"] else {
+      throw CaptureError("External screen capture requires an explicit Simulator UDID in the test host environment.")
+    }
+    let directory = URL(fileURLWithPath: path, isDirectory: true)
+    let decoder = JSONDecoder()
+    let driverURL = directory.appendingPathComponent("driver.json")
+    guard FileManager.default.fileExists(atPath: driverURL.path) else {
+      throw CaptureError("Capture driver is not ready at \(path); stage=\(stage)")
+    }
+    let driver = try decoder.decode(CaptureDriver.self, from: Data(contentsOf: driverURL))
+    guard driver.protocolVersion == 1, driver.simulatorUDID == simulatorUDID, driver.state == "ready" else {
+      throw CaptureError("Capture driver mismatch/unavailable: state=\(driver.state), UDID=\(driver.simulatorUDID), "
+        + "failure=\(driver.failure ?? "none"); stage=\(stage)")
+    }
+    let token = UUID().uuidString
+    let createdAt = Date().timeIntervalSince1970
+    let request = CaptureRequest(token: token, runToken: driver.runToken, simulatorUDID: simulatorUDID,
+      processID: ProcessInfo.processInfo.processIdentifier, test: name, stage: stage,
+      createdAt: createdAt, expiresAt: createdAt + 20, mediaROI: CaptureRect(roi),
+      screenBounds: CaptureRect(screenBounds), nativeFacts: nativeFacts(in: view))
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    let requestData = try encoder.encode(request)
+    try requestData.write(to: directory.appendingPathComponent(token + ".request.json"), options: .atomic)
+    let responseURL = directory.appendingPathComponent(token + ".response.json")
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(20))
+    while clock.now < deadline {
+      try Task.checkCancellation()
+      if FileManager.default.fileExists(atPath: responseURL.path) {
+        let responseData = try Data(contentsOf: responseURL)
+        let response = try decoder.decode(CaptureResponse.self, from: responseData)
+        guard response.protocolVersion == 1, response.token == token, response.runToken == driver.runToken,
+          response.simulatorUDID == simulatorUDID else {
+          throw CaptureError("Rejected stale/mismatched capture response; token=\(token), stage=\(stage)")
+        }
+        guard response.success else {
+          // Preserve the driver's original error, including simctl timeout/exit evidence.
+          throw CaptureError("Capture failed: \(response.failure ?? "unspecified driver error"); token=\(token), stage=\(stage)")
+        }
+        guard response.png == token + ".png", let startedAt = response.captureStartedAt,
+          startedAt >= request.createdAt else {
+          throw CaptureError("Rejected non-current capture PNG; token=\(token), stage=\(stage)")
+        }
+        let pngData = try Data(contentsOf: directory.appendingPathComponent(token + ".png"))
+        guard pngData.count == response.byteCount, pngData.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]),
+          let screenshot = UIImage(data: pngData) else {
+          throw CaptureError("Capture response has an invalid PNG; token=\(token), stage=\(stage)")
+        }
+        let after = try encoder.encode(nativeFacts(in: view))
+        return (screenshot, "request=\(String(decoding: requestData, as: UTF8.self))\n"
+          + "response=\(String(decoding: responseData, as: UTF8.self))\n"
+          + "nativeFactsAfterCapture=\(String(decoding: after, as: UTF8.self))")
+      }
+      let currentDriver = try decoder.decode(CaptureDriver.self, from: Data(contentsOf: driverURL))
+      guard currentDriver.runToken == driver.runToken, currentDriver.state == "ready" else {
+        throw CaptureError("Capture driver stopped: \(currentDriver.failure ?? currentDriver.state); token=\(token), stage=\(stage)")
+      }
+      // This bounds a test-only external operation; it never changes product loading/transport timing.
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    throw CaptureError("Timed out after 20 seconds waiting for external capture; token=\(token), stage=\(stage). "
+      + "Request/native facts and any capture output are retained in \(path).")
+  }
+
+  private func retain(_ frame: ScreenFrame, name: String) {
+    let screenshot = XCTAttachment(image: frame.image)
+    screenshot.name = name
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+    let sample = XCTAttachment(string: frame.description)
+    sample.name = name + "-media-sample"
+    sample.lifetime = .keepAlways
+    add(sample)
+  }
+
+  private func poll(_ name: String, until condition: @MainActor () -> Bool) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(8))
+    while clock.now < deadline {
+      try Task.checkCancellation()
+      if condition() { return }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    XCTFail("Timed out waiting for \(name)")
+    throw FixtureError.timeout(name)
+  }
+
+  private func nextRenderFrame() async throws {
+    CATransaction.flush()
+    try await PosterHandoffDisplayTick().wait()
+  }
+
+  private func greenVideo() async throws -> AVURLAsset {
+    try await solidVideo(red: 0, green: 255, blue: 0)
+  }
+
+  private func solidVideo(red: UInt8, green: UInt8, blue: UInt8) async throws -> AVURLAsset {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("poster-handoff-\(UUID()).mov")
+    addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+    let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+    var completed = false
+    defer { if !completed { writer.cancelWriting() } }
+    let width = 160, height = 120, frameCount = 60
+    let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+      AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height
+    ])
+    let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+      kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height
+    ])
+    XCTAssertTrue(writer.canAdd(input))
+    writer.add(input)
+    guard writer.startWriting() else { throw writer.error ?? FixtureError.writerFailed }
+    writer.startSession(atSourceTime: .zero)
+    for frame in 0..<frameCount {
+      try await poll("solid-color fixture writer input") { input.isReadyForMoreMediaData || writer.status != .writing }
+      guard writer.status == .writing else { throw writer.error ?? FixtureError.writerFailed }
+      var buffer: CVPixelBuffer?
+      XCTAssertEqual(CVPixelBufferPoolCreatePixelBuffer(nil, try XCTUnwrap(adaptor.pixelBufferPool), &buffer),
+        kCVReturnSuccess)
+      let pixel = try XCTUnwrap(buffer)
+      XCTAssertEqual(CVPixelBufferLockBaseAddress(pixel, []), kCVReturnSuccess)
+      let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixel)).assumingMemoryBound(to: UInt8.self)
+      let stride = CVPixelBufferGetBytesPerRow(pixel)
+      for y in 0..<height {
+        for x in 0..<width {
+          let offset = y * stride + x * 4
+          bytes[offset] = blue; bytes[offset + 1] = green; bytes[offset + 2] = red; bytes[offset + 3] = 255
+        }
+      }
+      XCTAssertEqual(CVPixelBufferUnlockBaseAddress(pixel, []), kCVReturnSuccess)
+      guard adaptor.append(pixel, withPresentationTime: CMTime(value: Int64(frame), timescale: 30)) else {
+        throw writer.error ?? FixtureError.writerFailed
+      }
+    }
+    writer.endSession(atSourceTime: CMTime(value: Int64(frameCount), timescale: 30))
+    input.markAsFinished()
+    await writer.finishWriting()
+    XCTAssertEqual(writer.status, .completed)
+    guard writer.status == .completed else { throw writer.error ?? FixtureError.writerFailed }
+    completed = true
+    return AVURLAsset(url: url)
+  }
+}
+
+/// Only this test fixture crosses threads; its mutable evidence is protected by the lock.
+private final class PosterHandoffBackgroundItemReplacement: @unchecked Sendable {
+  struct Facts {
+    var setterWasOffMain = false
+    var callbackCount = 0
+    var allCallbacksOffMain = true
+    var sawExpectedItem = false
+    var sawNilItem = false
+  }
+  let setterReturned = DispatchSemaphore(value: 0)
+  private let player: AVPlayer
+  private let item: AVPlayerItem
+  private let lock = NSLock()
+  private var facts = Facts()
+
+  init(player: AVPlayer, item: AVPlayerItem) { self.player = player; self.item = item }
+
+  func replace() {
+    lock.lock()
+    facts.setterWasOffMain = !Thread.isMainThread
+    lock.unlock()
+    player.replaceCurrentItem(with: item)
+  }
+
+  func recordCallback(from observedPlayer: AVPlayer) {
+    let currentItem = observedPlayer.currentItem
+    lock.lock()
+    defer { lock.unlock() }
+    facts.callbackCount += 1
+    facts.allCallbacksOffMain = facts.allCallbacksOffMain && !Thread.isMainThread
+    facts.sawExpectedItem = facts.sawExpectedItem || currentItem === item
+    facts.sawNilItem = facts.sawNilItem || currentItem == nil
+  }
+
+  func snapshot() -> Facts {
+    lock.lock()
+    defer { lock.unlock() }
+    return facts
+  }
+}
+
+@MainActor
+private final class PosterHandoffAssetGate {
+  private let asset: AVAsset
+  private var continuation: CheckedContinuation<Void, Never>?
+  private var isReleased = false
+  private(set) var started = false
+
+  init(asset: AVAsset) { self.asset = asset }
+
+  func load() async throws -> AVAsset {
+    started = true
+    if !isReleased { await withCheckedContinuation { continuation = $0 } }
+    try Task.checkCancellation()
+    return asset
+  }
+
+  func release() {
+    isReleased = true
+    continuation?.resume()
+    continuation = nil
+  }
+}
+
+@MainActor
+private final class PosterHandoffDisplayTick: NSObject {
+  private var continuation: CheckedContinuation<Void, any Error>?
+  private var displayLink: CADisplayLink?
+  private enum TickError: Error { case timeout }
+
+  func wait() async throws {
+    try await withCheckedThrowingContinuation { continuation in
+      self.continuation = continuation
+      let link = CADisplayLink(target: self, selector: #selector(tick))
+      displayLink = link
+      link.add(to: .main, forMode: .common)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+        self?.finish(.failure(TickError.timeout))
+      }
+    }
+  }
+
+  @objc private func tick() { finish(.success(())) }
+
+  private func finish(_ result: Result<Void, any Error>) {
+    displayLink?.invalidate()
+    displayLink = nil
+    continuation?.resume(with: result)
+    continuation = nil
+  }
+}
