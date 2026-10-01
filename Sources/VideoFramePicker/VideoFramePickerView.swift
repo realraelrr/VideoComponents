@@ -14,7 +14,7 @@ import VideoPlayback
 /// Replacing the closure does not replay current activity. To transfer observation
 /// to a different state container, unmount this picker before mounting another.
 @MainActor
-public struct VideoFramePickerView: View {
+public struct VideoFramePickerView<StatusOverlay: View>: View {
   private let source: VideoFramePickerSource
   private let initialTime: Double?
   private let maximumFrameSize: CGSize
@@ -23,6 +23,8 @@ public struct VideoFramePickerView: View {
   private let onSelectionActivityChanged: @MainActor (Bool) -> Void
   private let onFailure: @MainActor (VideoFramePickerFailure) -> Void
   private let onSelection: @MainActor (VideoFrameSelection) async throws -> Void
+  private let statusOverlay: @MainActor (VideoFramePickerSourceStatus) -> StatusOverlay
+  private let usesDefaultSourcePresentation: Bool
   @State private var owner: VideoFramePickerOwner
 
   public init(
@@ -31,6 +33,7 @@ public struct VideoFramePickerView: View {
     maximumFrameSize: CGSize = CGSize(width: 1280, height: 1280),
     labels: VideoFramePickerLabels = .init(),
     style: VideoFramePickerStyle = .init(),
+    @ViewBuilder statusOverlay: @escaping @MainActor (VideoFramePickerSourceStatus) -> StatusOverlay,
     onSelectionActivityChanged: @escaping @MainActor (Bool) -> Void = { _ in },
     onFailure: @escaping @MainActor (VideoFramePickerFailure) -> Void = { _ in },
     onSelection: @escaping @MainActor (VideoFrameSelection) async throws -> Void
@@ -38,7 +41,8 @@ public struct VideoFramePickerView: View {
     self.init(
       source: source, initialTime: initialTime, maximumFrameSize: maximumFrameSize,
       labels: labels, style: style, onSelectionActivityChanged: onSelectionActivityChanged,
-      onFailure: onFailure, onSelection: onSelection, owner: VideoFramePickerOwner()
+      onFailure: onFailure, onSelection: onSelection, statusOverlay: statusOverlay,
+      usesDefaultSourcePresentation: false, owner: VideoFramePickerOwner()
     )
   }
 
@@ -51,6 +55,8 @@ public struct VideoFramePickerView: View {
     onSelectionActivityChanged: @escaping @MainActor (Bool) -> Void = { _ in },
     onFailure: @escaping @MainActor (VideoFramePickerFailure) -> Void = { _ in },
     onSelection: @escaping @MainActor (VideoFrameSelection) async throws -> Void,
+    statusOverlay: @escaping @MainActor (VideoFramePickerSourceStatus) -> StatusOverlay,
+    usesDefaultSourcePresentation: Bool,
     owner: VideoFramePickerOwner
   ) {
     self.source = source
@@ -61,6 +67,8 @@ public struct VideoFramePickerView: View {
     self.onSelectionActivityChanged = onSelectionActivityChanged
     self.onFailure = onFailure
     self.onSelection = onSelection
+    self.statusOverlay = statusOverlay
+    self.usesDefaultSourcePresentation = usesDefaultSourcePresentation
     _owner = State(initialValue: owner)
   }
 
@@ -68,7 +76,7 @@ public struct VideoFramePickerView: View {
     VStack(spacing: 16) {
       previewCard
       timeControl
-      if let failure = owner.failure {
+      if let failure = owner.failure, usesDefaultSourcePresentation || owner.player != nil {
         Text(labels.message(for: failure))
           .font(.footnote)
           .foregroundStyle(style.error)
@@ -109,11 +117,12 @@ public struct VideoFramePickerView: View {
             Image(decorative: preview.image, scale: 1)
               .resizable()
               .scaledToFit()
-          } else if owner.failure == nil {
+          } else if owner.failure == nil && usesDefaultSourcePresentation {
             ProgressView()
               .tint(.white)
           }
         }
+        statusOverlay(owner.sourceStatus)
       }
       .clipShape(RoundedRectangle(cornerRadius: 14))
     }
@@ -159,5 +168,43 @@ public struct VideoFramePickerView: View {
       .font(.caption.monospacedDigit())
       .foregroundStyle(.secondary)
     }
+  }
+}
+
+extension VideoFramePickerView where StatusOverlay == EmptyView {
+  public init(
+    source: VideoFramePickerSource,
+    initialTime: Double? = nil,
+    maximumFrameSize: CGSize = CGSize(width: 1280, height: 1280),
+    labels: VideoFramePickerLabels = .init(),
+    style: VideoFramePickerStyle = .init(),
+    onSelectionActivityChanged: @escaping @MainActor (Bool) -> Void = { _ in },
+    onFailure: @escaping @MainActor (VideoFramePickerFailure) -> Void = { _ in },
+    onSelection: @escaping @MainActor (VideoFrameSelection) async throws -> Void
+  ) {
+    self.init(
+      source: source, initialTime: initialTime, maximumFrameSize: maximumFrameSize,
+      labels: labels, style: style, onSelectionActivityChanged: onSelectionActivityChanged,
+      onFailure: onFailure, onSelection: onSelection, owner: VideoFramePickerOwner()
+    )
+  }
+
+  init(
+    source: VideoFramePickerSource,
+    initialTime: Double? = nil,
+    maximumFrameSize: CGSize = CGSize(width: 1280, height: 1280),
+    labels: VideoFramePickerLabels = .init(),
+    style: VideoFramePickerStyle = .init(),
+    onSelectionActivityChanged: @escaping @MainActor (Bool) -> Void = { _ in },
+    onFailure: @escaping @MainActor (VideoFramePickerFailure) -> Void = { _ in },
+    onSelection: @escaping @MainActor (VideoFrameSelection) async throws -> Void,
+    owner: VideoFramePickerOwner
+  ) {
+    self.init(
+      source: source, initialTime: initialTime, maximumFrameSize: maximumFrameSize,
+      labels: labels, style: style, onSelectionActivityChanged: onSelectionActivityChanged,
+      onFailure: onFailure, onSelection: onSelection, statusOverlay: { _ in EmptyView() },
+      usesDefaultSourcePresentation: true, owner: owner
+    )
   }
 }

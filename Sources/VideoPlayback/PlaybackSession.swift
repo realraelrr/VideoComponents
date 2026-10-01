@@ -6,6 +6,7 @@ import UIKit
 @MainActor public final class PlaybackSession: ObservableObject {
   typealias TransportSeek = @MainActor (AVPlayer, CMTime, @escaping @MainActor (Bool) -> Void) -> Void
   typealias SlowStatusDelay = @MainActor (UInt64) async throws -> Void
+  typealias PrepareReplacement = @MainActor (AVAsset) async throws -> AVPlayerItem
 
   private enum PlaybackInteraction {
     case idle
@@ -43,6 +44,12 @@ import UIKit
 
   private let transportSeek: TransportSeek
   private let slowStatusDelay: SlowStatusDelay
+  private let prepareReplacement: PrepareReplacement
+  private var replacementGeneration = UUID()
+  private var replacementItem: AVPlayerItem?
+  private var replacementObservation: NSKeyValueObservation?
+  private var replacementContinuation: CheckedContinuation<Void, any Error>?
+  private var replacementSnapshot: AccessPlaybackSnapshot?
   private var loadedResource: AnyHashable?
   private var lastAccessRefreshID: UInt64?
   private var pendingTransport: PendingTransport?
@@ -67,10 +74,12 @@ import UIKit
   init(
     transportSeek: @escaping TransportSeek,
     slowStatusDelay: @escaping SlowStatusDelay = { try await Task.sleep(nanoseconds: $0) },
+    prepareReplacement: @escaping PrepareReplacement = PlaybackSession.prepareReplacementItem,
     onEvent: @escaping @MainActor (PlaybackEvent) -> Void = { _ in }
   ) {
     self.transportSeek = transportSeek
     self.slowStatusDelay = slowStatusDelay
+    self.prepareReplacement = prepareReplacement
     self.onEvent = onEvent
   }
 
@@ -150,6 +159,145 @@ import UIKit
 
   public func isCurrentSource(_ identity: AnyHashable) -> Bool { loadedResource == identity }
 
+  /// Replaces the current source's representation without interrupting its old item
+  /// during asset preparation. Native item readiness briefly pauses transport after
+  /// installation; failure restores the previous item. Completion waits for the
+  /// restoring seek, unless a newer user seek adopts the ready candidate first.
+  public func replaceAsset(_ asset: AVAsset, for identity: AnyHashable) async throws {
+    guard loadedResource == identity else { throw CancellationError() }
+    cancelReplacement()
+    guard isPlayerReady, let original = player.currentItem,
+      accessPlaybackSnapshot == nil else { throw CancellationError() }
+    let generation = replacementGeneration
+    do {
+      try Task.checkCancellation()
+      let candidate = try await prepareReplacement(asset)
+      try Task.checkCancellation()
+      guard replacementGeneration == generation, loadedResource == identity,
+        player.currentItem === original else { throw CancellationError() }
+
+      let interruptedTarget = endInteractionForAccessRefresh()
+      let time = pendingTransport?.target ?? interruptedTarget ?? player.currentTime()
+      replacementSnapshot = AccessPlaybackSnapshot(item: original, time: time)
+      cancelPendingTransport()
+      scrubSeekCoordinator?.reset()
+      scrubSeekCoordinator = nil
+      removePlayerObservers()
+      cancelAspectRatioLoad()
+      cancelPreviewImageLoad()
+      player.pause()
+      isPlayerReady = false
+      let token = playbackCoordinator.startLoading()
+      scheduleSlowStatusOverlay(token: token)
+
+      try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+          replacementItem = candidate
+          replacementContinuation = continuation
+          replacementObservation = candidate.observe(\.status, options: [.initial, .new]) {
+            [weak self] _, _ in
+            Task { @MainActor in self?.finishReplacementPreparation(generation: generation) }
+          }
+          player.replaceCurrentItem(with: candidate)
+        }
+      } onCancel: {
+        Task { @MainActor [weak self] in
+          guard self?.replacementGeneration == generation else { return }
+          self?.cancelReplacement()
+        }
+      }
+      try Task.checkCancellation()
+      guard replacementGeneration == generation, loadedResource == identity,
+        player.currentItem === candidate, replacementItem === candidate,
+        candidate.status == .readyToPlay else { throw CancellationError() }
+
+      replacementObservation?.invalidate()
+      replacementObservation = nil
+      durationSeconds = playableSeconds(from: candidate.duration) ?? durationSeconds
+      observePlayerItemStatus(candidate, token: token)
+      observePlaybackEnd(for: candidate, token: token)
+      observePlayerBuffering(token: token)
+      observePlayerTime(token: token)
+      startAspectRatioLoad(for: asset, token: token)
+      try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+          replacementContinuation = continuation
+          beginTransport(to: time)
+          handlePlayerReady(token: token)
+        }
+      } onCancel: {
+        Task { @MainActor [weak self] in
+          guard self?.replacementGeneration == generation else { return }
+          self?.cancelReplacement()
+        }
+      }
+      try Task.checkCancellation()
+      guard replacementGeneration == generation, loadedResource == identity,
+        player.currentItem === candidate else { throw CancellationError() }
+    } catch {
+      if replacementGeneration == generation { cancelReplacement() }
+      throw error
+    }
+  }
+
+  private static func prepareReplacementItem(_ asset: AVAsset) async throws -> AVPlayerItem {
+    guard try await asset.load(.isPlayable) else { throw PlaybackFailure.playerItemFailed }
+    try Task.checkCancellation()
+    return AVPlayerItem(asset: asset)
+  }
+
+  private func finishReplacementPreparation(generation: UUID) {
+    guard replacementGeneration == generation, let candidate = replacementItem else { return }
+    switch candidate.status {
+    case .unknown: return
+    case .readyToPlay:
+      replacementObservation?.invalidate()
+      replacementObservation = nil
+      let continuation = replacementContinuation
+      replacementContinuation = nil
+      continuation?.resume()
+    case .failed:
+      let continuation = replacementContinuation
+      replacementContinuation = nil
+      continuation?.resume(throwing: PlaybackFailure.playerItemFailed)
+    @unknown default:
+      let continuation = replacementContinuation
+      replacementContinuation = nil
+      continuation?.resume(throwing: PlaybackFailure.playerItemFailed)
+    }
+  }
+
+  private func cancelReplacement(restoreOriginal: Bool = true) {
+    replacementGeneration = UUID()
+    replacementObservation?.invalidate()
+    replacementObservation = nil
+    let snapshot = replacementSnapshot
+    let shouldRestore = restoreOriginal && snapshot != nil
+      && player.currentItem === replacementItem && loadedResource != nil
+    replacementItem = nil
+    replacementSnapshot = nil
+    let continuation = replacementContinuation
+    replacementContinuation = nil
+    continuation?.resume(throwing: CancellationError())
+    if shouldRestore, let snapshot {
+      cancelPendingTransport()
+      removePlayerObservers()
+      cancelAspectRatioLoad()
+      isPlayerReady = false
+      let token = playbackCoordinator.startLoading()
+      player.pause()
+      player.replaceCurrentItem(with: snapshot.item)
+      durationSeconds = playableSeconds(from: snapshot.item.duration) ?? durationSeconds
+      observePlayerItemStatus(snapshot.item, token: token)
+      observePlaybackEnd(for: snapshot.item, token: token)
+      observePlayerBuffering(token: token)
+      observePlayerTime(token: token)
+      startAspectRatioLoad(for: snapshot.item.asset, token: token)
+      beginTransport(to: snapshot.time)
+      if snapshot.item.status == .readyToPlay { handlePlayerReady(token: token) }
+    }
+  }
+
   /// Revalidates access without replacing an already loaded item. Calls are deduplicated per source.
   public func revalidateAccess(
     source video: PlaybackSource,
@@ -161,12 +309,14 @@ import UIKit
     let validator: @MainActor () async throws -> AVAsset
     switch validation() {
     case .unavailable(let error):
+      cancelReplacement(restoreOriginal: false)
       transitionAccessToFailure(reason: .source(error), refreshID: refreshID,
         resource: video.identity, expectedRevalidationItem: nil)
       return
     case .validate(let operation):
       validator = operation
     }
+    cancelReplacement()
 
     let snapshot: AccessPlaybackSnapshot
     if let accessPlaybackSnapshot {
@@ -499,6 +649,7 @@ import UIKit
   }
 
   public func cleanup() {
+    cancelReplacement(restoreOriginal: false)
     currentLoadTask?.cancel()
     currentLoadTask = nil
     accessValidationTask?.cancel()
@@ -638,6 +789,13 @@ import UIKit
 
       self.pendingTransport = nil
       guard finished else {
+        if self.replacementItem === currentItem {
+          let continuation = self.replacementContinuation
+          self.replacementContinuation = nil
+          self.player.pause()
+          continuation?.resume(throwing: PlaybackFailure.playerItemFailed)
+          return
+        }
         self.playbackInteraction = .idle
         self.wantsPlayback = false
         self.updatePlaybackProgress(from: self.player.currentTime())
@@ -645,6 +803,13 @@ import UIKit
         return
       }
       self.updateTransportPresentation(to: transport.target)
+      if self.replacementItem === currentItem {
+        self.replacementItem = nil
+        self.replacementSnapshot = nil
+        let continuation = self.replacementContinuation
+        self.replacementContinuation = nil
+        continuation?.resume()
+      }
       self.reconcilePlayback()
     }
   }
@@ -663,6 +828,15 @@ import UIKit
     guard pendingTransport != nil else { return }
     pendingTransport = nil
     player.currentItem?.cancelPendingSeeks()
+    if let replacementItem, player.currentItem === replacementItem {
+      // A newer user transport intent adopts this ready representation. Its old
+      // restoring callback cannot undo adoption or overwrite the new target.
+      self.replacementItem = nil
+      replacementSnapshot = nil
+      let continuation = replacementContinuation
+      replacementContinuation = nil
+      continuation?.resume()
+    }
   }
 
   private func updateTransportPresentation(to target: CMTime) {
@@ -842,7 +1016,8 @@ import UIKit
       [weak self] item, _ in
       Task { @MainActor in
         guard let self,
-          self.playbackCoordinator.isCurrent(token)
+          self.playbackCoordinator.isCurrent(token),
+          self.player.currentItem === item
         else {
           return
         }

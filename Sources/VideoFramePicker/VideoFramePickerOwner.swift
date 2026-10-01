@@ -26,6 +26,12 @@ final class VideoFramePickerOwner {
 
   var isSliderDisabled: Bool { player == nil || duration <= 0 || isProcessingSelection }
 
+  var sourceStatus: VideoFramePickerSourceStatus {
+    if player != nil { return .ready }
+    if let failure { return .failed(failure) }
+    return .loading
+  }
+
   @ObservationIgnored private var sourceIdentity: AnyHashable?
   @ObservationIgnored private var sourceGeneration = UUID()
   @ObservationIgnored private var requestGeneration = UUID()
@@ -165,6 +171,7 @@ final class VideoFramePickerOwner {
     player.isMuted = true
     player.pause()
     self.player = player
+    isShowingPlayerPreview = true
     seekCoordinator = VideoSeekCoordinator(player: player)
     seek(to: selectedSeconds, precision: .exact)
     startExactRequest(onFailure: onFailure)
@@ -290,10 +297,6 @@ final class VideoFramePickerOwner {
     try Task.checkCancellation()
     guard try await !asset.loadTracks(withMediaType: .video).isEmpty else {
       throw VideoFramePickerFailure.source(.noVideoTrack, cause: nil)
-    }
-    try Task.checkCancellation()
-    guard try await asset.load(.isReadable) else {
-      throw VideoFramePickerFailure.source(.unreadable, cause: nil)
     }
     try Task.checkCancellation()
     return duration

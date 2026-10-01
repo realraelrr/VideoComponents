@@ -28,6 +28,13 @@ public struct VideoFrameSelection: Sendable {
   public let actualTime: CMTime
 }
 
+/// Source preparation is independent of exact frame extraction and host consumption.
+public enum VideoFramePickerSourceStatus {
+  case loading
+  case ready
+  case failed(VideoFramePickerFailure)
+}
+
 /// Neutral categories for diagnostics. The picker never displays an underlying cause.
 public enum VideoFramePickerFailure: Error {
   public enum ConfigurationReason: Equatable, Sendable {
@@ -39,7 +46,6 @@ public enum VideoFramePickerFailure: Error {
     case unavailable
     case invalidDuration
     case noVideoTrack
-    case unreadable
   }
 
   case configuration(ConfigurationReason)

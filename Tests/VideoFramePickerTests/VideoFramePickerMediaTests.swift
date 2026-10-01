@@ -5,6 +5,21 @@ import XCTest
 
 @MainActor
 final class VideoFramePickerMediaTests: XCTestCase {
+  func testRealCompositionProducesExactFrameInPausedPlayer() async throws {
+    let source = try await makeVideo(width: 128, height: 96, frameCount: 30)
+    let asset = AVMutableComposition()
+    let duration = try await source.load(.duration)
+    try await asset.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: source, at: .zero)
+    let owner = VideoFramePickerOwner()
+    defer { owner.stop() }
+    owner.start(source: VideoFramePickerSource(identity: "composition", load: { asset }),
+      initialTime: 0, maximumFrameSize: CGSize(width: 1280, height: 1280), onFailure: { _ in })
+    try await waitForPicker { owner.preview != nil || owner.failure != nil }
+    XCTAssertNil(owner.failure)
+    XCTAssertNotNil(owner.player)
+    XCTAssertNotNil(owner.preview)
+  }
+
   func testRealInitialPipelineHandlesLandscapePortraitRotationAndFrameBudget() async throws {
     let fixtures: [(Int, Int, Bool)] = [(1600, 900, false), (96, 128, false), (128, 96, true)]
     for (width, height, rotated) in fixtures {

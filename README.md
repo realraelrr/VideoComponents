@@ -20,11 +20,12 @@ The exercised toolchain is Xcode 27.0 (27A266a), Apple Swift 6.4, with iOS 27 Si
 
 Choose **File → Add Package Dependencies** in Xcode, enter
 `https://github.com/realraelrr/VideoComponents.git`, and select **Up to Next Major
-Version** from `0.2.2`. Link only the product or products your target needs.
+Version** from `0.3.0`. Link only the product or products your target needs.
 Version `0.2.0` adds the optional picker and automatic poster V2; the original
 `VideoPlayback` and `VideoProcessing` products were introduced in `0.1.0`.
 Version `0.2.1` fixes fullscreen idle chrome, zoomed pan boundaries and cancelled scrubbing.
 Version `0.2.2` fixes repeated-pinch focus, fullscreen status layering, same-source loading and rate consistency, loading presentation, layout limits, frame cancellation ordering and disabled export tracks.
+Version `0.3.0` adds cancellable same-source representation replacement with transport restoration, host-provided picker source-status overlays, and a paused preview that appears before initial exact-frame decoding completes. The picker view is now generic over its source-status content; consumers using an explicit `VideoFramePickerView` type must account for that type change.
 
 For a Swift package consumer, add the dependency and link the required products in
 `Package.swift`:
@@ -37,7 +38,7 @@ let package = Package(
   name: "MyFeature",
   platforms: [.iOS(.v17)],
   dependencies: [
-    .package(url: "https://github.com/realraelrr/VideoComponents.git", from: "0.2.2"),
+    .package(url: "https://github.com/realraelrr/VideoComponents.git", from: "0.3.0"),
   ],
   targets: [
     .target(
@@ -87,6 +88,8 @@ Pass `isFullscreenPresented` to `InlinePlaybackView` while presenting the fullsc
 
 `session.player` is a rendering surface. Do not replace its item, seek it directly, or maintain a second transport state. Configure playback through session methods. Global audio category/activation, photo access, screen orientation, haptics and recovery copy belong to the host; `onEvent` exposes playback/cleanup/hold events for host integration.
 
+For a different representation of the same media, call `try await session.replaceAsset(asset, for: source.identity)`. Asset preparation keeps the existing item usable. Native item readiness briefly pauses the same player after candidate installation; native readiness or restoring-seek failure restores the previous item. The switch uses the latest position or pending seek/scrub target, playback intent, configured rate and loop setting. A hold ends rather than becoming the new playback rate or intent. The operation waits for the restoring seek to succeed. A newer user seek can instead adopt the ready candidate, completing the replacement while its own transport continues; the obsolete restoring callback is rejected. Playback always waits for the current seek to succeed. Task cancellation restores the previous item while the operation is pending. Source replacement, cleanup and newer representation requests invalidate older results, including A → B → A reuse of an identity.
+
 Controls support scrubbing, double-tap play/pause, long-press boost, pinch zoom and panning when zoomed. The inline view accepts an outer-scroll binding; connect it to the containing scroll view's `.scrollDisabled` modifier so video gestures and scrolling do not compete. The host provides accessories, status content, style and optional localized labels.
 
 Fullscreen chrome hides after three idle seconds. Single-tap the video to show or hide it; double-tap still changes playback. Contact with the video or controls suspends the idle countdown until all fingers leave. VoiceOver keeps chrome available. Zoomed panning is limited by the actual aspect-fit video bounds: smaller axes stay centered, larger axes cover the viewport, and resizing recalculates the limits. Each pinch keeps the current source point beneath the fingers, including after an earlier pinch or pan. Status content stays below fullscreen chrome so close remains available.
@@ -123,6 +126,8 @@ struct FrameSelectionExample: View {
 ```
 
 The initial preview never invokes `onSelection`. Touching the slider without changing its value does not consume a frame. Dragging uses interactive preview seeks; release extracts the latest user position with exact tolerance, then awaits `onSelection`. Accessibility or keyboard value changes use the same exact extraction and consumption path. The slider stays disabled while the host callback is running. A consumer failure retains the exact preview and reports a neutral, localized failure.
+
+The paused player is shown as soon as the source installs, while the initial exact frame is still decoding. Inspection checks duration and the video track; `isReadable` is not an image-generator capability requirement. An optional `statusOverlay` closure receives `VideoFramePickerSourceStatus.loading`, `.ready` or `.failed(failure)` so a host can reuse its source progress and error presentation. Supplying it replaces the default source spinner and source-error text. Exact-frame and selection-processing failures retain the picker's localized feedback. The component's source loader remains the sole loading entry point.
 
 `onSelection` is an `@MainActor` async throwing callback executed in the picker's cancellable task. Keep any asynchronous preparation inside that callback. After every suspension and immediately before the final visible or persistent mutation, the host must check cancellation and confirm the destination identity is still current. Cancellation cannot roll back a host write that already happened. `VideoFrameSelection.image` is a `CGImage`; retain `requestedSeconds` and `actualTime` separately because native decoding may choose a different encoded timestamp, including at the duration endpoint.
 

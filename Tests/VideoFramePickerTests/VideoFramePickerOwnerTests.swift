@@ -4,6 +4,18 @@ import XCTest
 
 @MainActor
 final class VideoFramePickerOwnerTests: XCTestCase {
+  func testInitialPausedPlayerIsShownWhileExactFrameIsStillPending() async throws {
+    let fixture = PickerFixture()
+    defer { fixture.stop() }
+    fixture.start()
+    try await waitForPicker { fixture.frames.requests.count == 1 }
+    XCTAssertNotNil(fixture.owner.player)
+    XCTAssertNil(fixture.owner.preview)
+    XCTAssertTrue(fixture.owner.isShowingPlayerPreview)
+    XCTAssertEqual(fixture.owner.player?.rate, 0)
+    XCTAssertFalse(fixture.owner.hasPendingSelection)
+  }
+
   func testInitialPreviewNeverConsumesAndPreservesActualFrameTime() async throws {
     let fixture = PickerFixture()
     defer { fixture.stop() }
