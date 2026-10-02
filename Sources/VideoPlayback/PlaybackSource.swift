@@ -26,6 +26,8 @@ import UIKit
 public enum PlaybackFailure: Error {
   case source(any Error)
   case playerItemFailed
+  /// Host preparation failed; retry preparation without reacquiring the source.
+  case preparation(any Error)
 }
 
 @MainActor public enum PlaybackAccessValidation {
@@ -34,6 +36,7 @@ public enum PlaybackFailure: Error {
 }
 
 public enum PlaybackEvent {
+  /// Observational only. Use PlaybackPreparation to await host readiness.
   case willPlay
   case didCleanup
   case holdBegan

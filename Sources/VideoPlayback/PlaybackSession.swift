@@ -19,6 +19,12 @@ import UIKit
     let target: CMTime
   }
 
+  private struct PreparationRequest {
+    let id: UUID
+    let preparation: PlaybackPreparation
+    var isReady = false
+  }
+
   private struct AccessPlaybackSnapshot {
     let item: AVPlayerItem
     let time: CMTime
@@ -62,9 +68,13 @@ import UIKit
   private var aspectRatioTask: Task<Void, Never>?
   private var currentLoadTask: Task<Void, Never>?
   private var accessValidationTask: Task<Void, Never>?
+  private var preparationRequest: PreparationRequest?
+  private var preparationTask: Task<Void, Never>?
   private var accessPlaybackSnapshot: AccessPlaybackSnapshot?
   private var scrubSeekCoordinator: VideoSeekCoordinator?
   public var onEvent: @MainActor (PlaybackEvent) -> Void
+  /// Set before loading. Nil leaves preparation to the package consumer.
+  public var preparation: PlaybackPreparation?
   @Published public private(set) var failure: PlaybackFailure?
 
   public convenience init(onEvent: @escaping @MainActor (PlaybackEvent) -> Void = { _ in }) {
@@ -100,7 +110,8 @@ import UIKit
   }
 
   public var status: PlaybackStatus {
-    playbackCoordinator.overlay
+    if case .preparation = failure { return .unavailable }
+    return playbackCoordinator.overlay
   }
 
   public var canUsePlaybackControls: Bool {
@@ -479,6 +490,7 @@ import UIKit
     }
 
     guard forceReload || loadedResource != resource else {
+      guard failure == nil else { return }
       if autoplayWhenReady {
         wantsPlayback = true
       }
@@ -495,10 +507,17 @@ import UIKit
       return
     }
 
+    let retainedPreparationFailure: PlaybackFailure?
+    if loadedResource == resource, case .preparation = failure {
+      retainedPreparationFailure = failure
+    } else {
+      retainedPreparationFailure = nil
+    }
     cleanup()
     playbackConfig.update(playbackRate: playbackRate, isLooping: isLooping)
     loadedResource = resource
-    wantsPlayback = autoplayWhenReady
+    failure = retainedPreparationFailure
+    wantsPlayback = autoplayWhenReady && retainedPreparationFailure == nil
     let token = playbackCoordinator.startLoading()
     scheduleSlowStatusOverlay(token: token)
 
@@ -572,20 +591,39 @@ import UIKit
   }
 
   public func togglePlayback() {
-    guard hasCurrentItem else { return }
-    let shouldPause = isPlaybackRequested
+    guard hasCurrentItem, failure == nil else { return }
+    if isPlaybackRequested {
+      pausePlayback()
+      return
+    }
 
-    if playbackInteraction == .holding {
-      endHold(reconcile: false)
-    } else if playbackInteraction == .scrubbing {
+    if playbackInteraction == .scrubbing {
       finishScrubbing()
     }
 
-    wantsPlayback = !shouldPause
+    wantsPlayback = true
 
-    if wantsPlayback,
-      playbackProgress >= 1
-    {
+    if playbackProgress >= 1 {
+      beginTransport(to: .zero)
+    } else {
+      reconcilePlayback()
+    }
+  }
+
+  /// Suspends playback without discarding the current media or position.
+  public func pausePlayback() {
+    wantsPlayback = false
+    if playbackInteraction == .holding { playbackInteraction = .idle }
+    stopPlaybackDemand()
+    if playbackInteraction == .scrubbing { finishScrubbing() }
+  }
+
+  /// Explicitly retries host preparation while retaining the current item and time.
+  public func retryPlaybackPreparation() {
+    guard case .preparation = failure, hasCurrentItem else { return }
+    failure = nil
+    wantsPlayback = true
+    if playbackProgress >= 1 {
       beginTransport(to: .zero)
     } else {
       reconcilePlayback()
@@ -594,6 +632,7 @@ import UIKit
 
   public func handleScrubEditingChanged(_ isEditing: Bool) {
     guard hasCurrentItem,
+      failure == nil,
       durationSeconds > 0
     else {
       return
@@ -625,6 +664,7 @@ import UIKit
     switch state {
     case .began:
       guard isPlayerReady,
+        failure == nil,
         playbackInteraction != .holding
       else {
         return
@@ -634,7 +674,6 @@ import UIKit
       }
       playbackInteraction = .holding
       onEvent(.holdBegan)
-      onEvent(.willPlay)
       if playbackProgress >= 1 {
         beginTransport(to: .zero)
       } else {
@@ -652,13 +691,15 @@ import UIKit
   }
 
   public func cleanup() {
+    wantsPlayback = false
+    playbackInteraction = .idle
+    stopPlaybackDemand()
     cancelReplacement(restoreOriginal: false)
     currentLoadTask?.cancel()
     currentLoadTask = nil
     accessValidationTask?.cancel()
     accessValidationTask = nil
     accessPlaybackSnapshot = nil
-    playbackInteraction = .idle
     cancelSlowStatusOverlay()
     cancelPreviewImageLoad()
     cancelAspectRatioLoad()
@@ -671,7 +712,6 @@ import UIKit
     loadedResource = nil
     failure = nil
     lastAccessRefreshID = nil
-    wantsPlayback = false
     isPlayerReady = false
     currentTimeSeconds = 0
     durationSeconds = 0
@@ -679,7 +719,6 @@ import UIKit
     scrubProgress = 0
     playbackConfig = VideoPlaybackConfig()
     videoAspectRatio = nil
-    player.pause()
     player.replaceCurrentItem(with: nil)
     onEvent(.didCleanup)
   }
@@ -739,6 +778,7 @@ import UIKit
   private func endHold(reconcile: Bool) {
     guard playbackInteraction == .holding else { return }
     playbackInteraction = .idle
+    if !wantsPlayback { stopPlaybackDemand() }
     if reconcile {
       reconcilePlayback()
     }
@@ -802,7 +842,7 @@ import UIKit
         self.playbackInteraction = .idle
         self.wantsPlayback = false
         self.updatePlaybackProgress(from: self.player.currentTime())
-        self.player.pause()
+        self.stopPlaybackDemand()
         return
       }
       self.updateTransportPresentation(to: transport.target)
@@ -852,6 +892,11 @@ import UIKit
   }
 
   private func reconcilePlayback() {
+    guard isPlaybackRequested, failure == nil else {
+      stopPlaybackDemand()
+      return
+    }
+
     guard hasCurrentItem,
       isPlayerReady,
       pendingTransport == nil,
@@ -863,17 +908,56 @@ import UIKit
       return
     }
 
-    guard isPlaybackRequested else {
-      player.pause()
+    if let request = preparationRequest {
+      guard request.isReady else { return }
+    } else if let preparation {
+      startPlaybackPreparation(preparation)
       return
     }
 
+    let requestID = preparationRequest?.id
     onEvent(.willPlay)
+    // An observational callback can synchronously pause or replace the source.
+    guard isPlaybackRequested, failure == nil, isPlayerReady, hasCurrentItem,
+      pendingTransport == nil, playbackInteraction != .scrubbing,
+      preparationRequest?.id == requestID else { return }
     let rate =
       playbackInteraction == .holding
       ? playbackConfig.holdBoostedRate
       : playbackConfig.playbackRate
     player.playImmediately(atRate: rate)
+  }
+
+  private func startPlaybackPreparation(_ preparation: PlaybackPreparation) {
+    let id = UUID()
+    preparationRequest = PreparationRequest(id: id, preparation: preparation)
+    preparationTask = Task { [weak self] in
+      // Do not bind self across the host await: the session must remain releasable.
+      guard !Task.isCancelled, self?.preparationRequest?.id == id,
+        self?.isPlaybackRequested == true else { return }
+      do {
+        try await preparation.prepare(id)
+      } catch {
+        guard !Task.isCancelled, let self, preparationRequest?.id == id else { return }
+        failure = .preparation(error)
+        pausePlayback()
+        return
+      }
+      guard !Task.isCancelled, let self, preparationRequest?.id == id,
+        isPlaybackRequested else { return }
+      preparationTask = nil
+      preparationRequest?.isReady = true
+      reconcilePlayback()
+    }
+  }
+
+  private func stopPlaybackDemand() {
+    let request = preparationRequest
+    preparationRequest = nil
+    preparationTask?.cancel()
+    preparationTask = nil
+    player.pause()
+    if let request { request.preparation.release(request.id) }
   }
 
   private func scheduleSlowStatusOverlay(token: PlaybackState.GenerationToken) {
@@ -968,6 +1052,7 @@ import UIKit
     cancelSlowStatusOverlay()
     failure = reason
     playbackCoordinator.fail(token: token)
+    pausePlayback()
   }
 
   private func observePlaybackEnd(
@@ -1003,10 +1088,9 @@ import UIKit
     if playbackConfig.isLooping {
       beginTransport(to: .zero)
     } else {
-      wantsPlayback = false
-      player.pause()
       playbackProgress = 1
       currentTimeSeconds = durationSeconds
+      pausePlayback()
     }
   }
 
