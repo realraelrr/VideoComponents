@@ -7,29 +7,32 @@ public struct InlineVideoPlayerLayer: UIViewRepresentable {
   let videoGravity: AVLayerVideoGravity
   let placeholderImage: UIImage?
   let isPlayerReady: Bool
+  let sourceIdentity: AnyHashable?
 
   public init(
     player: AVPlayer?,
     videoGravity: AVLayerVideoGravity = .resizeAspect,
     placeholderImage: UIImage? = nil,
-    isPlayerReady: Bool = true
+    isPlayerReady: Bool = true,
+    sourceIdentity: AnyHashable? = nil
   ) {
     self.player = player
     self.videoGravity = videoGravity
     self.placeholderImage = placeholderImage
     self.isPlayerReady = isPlayerReady
+    self.sourceIdentity = sourceIdentity
   }
 
   public func makeUIView(context: Context) -> PlayerLayerView {
     let view = PlayerLayerView()
     view.configure(player: player, videoGravity: videoGravity,
-      placeholderImage: placeholderImage, isPlayerReady: isPlayerReady)
+      placeholderImage: placeholderImage, isPlayerReady: isPlayerReady, sourceIdentity: sourceIdentity)
     return view
   }
 
   public func updateUIView(_ view: PlayerLayerView, context: Context) {
     view.configure(player: player, videoGravity: videoGravity,
-      placeholderImage: placeholderImage, isPlayerReady: isPlayerReady)
+      placeholderImage: placeholderImage, isPlayerReady: isPlayerReady, sourceIdentity: sourceIdentity)
   }
 
   public static func dismantleUIView(_ view: PlayerLayerView, coordinator: ()) {
@@ -39,6 +42,8 @@ public struct InlineVideoPlayerLayer: UIViewRepresentable {
   public final class PlayerLayerView: UIView {
     private let placeholder = UIImageView()
     private var isPlayerReady = false
+    private var sourceIdentity: AnyHashable?
+    private var hasDisplayedVideo = false
     private var displayObservation: NSKeyValueObservation?
     private var itemObservation: NSKeyValueObservation?
     private var observationGeneration = UUID()
@@ -59,9 +64,13 @@ public struct InlineVideoPlayerLayer: UIViewRepresentable {
 
     func configure(
       player: AVPlayer?, videoGravity: AVLayerVideoGravity,
-      placeholderImage: UIImage?, isPlayerReady: Bool
+      placeholderImage: UIImage?, isPlayerReady: Bool, sourceIdentity: AnyHashable? = nil
     ) {
       let playerChanged = playerLayer.player !== player
+      if playerChanged || self.sourceIdentity != sourceIdentity {
+        hasDisplayedVideo = false
+      }
+      self.sourceIdentity = sourceIdentity
       if playerChanged { invalidateObservations() }
       playerLayer.videoGravity = videoGravity
       if playerChanged { playerLayer.player = player }
@@ -79,9 +88,10 @@ public struct InlineVideoPlayerLayer: UIViewRepresentable {
         placeholder.contentMode = videoGravity == .resizeAspectFill ? .scaleAspectFill
           : videoGravity == .resize ? .scaleToFill : .scaleAspectFit
         placeholder.frame = bounds
-        if displayObservation == nil || observedItem !== player?.currentItem {
-          observeDisplayReadiness()
-        }
+      }
+      // Remember a first display even when its saved poster arrives later.
+      if placeholderImage != nil || sourceIdentity != nil {
+        if displayObservation == nil || observedItem !== player?.currentItem { observeDisplayReadiness() }
       } else {
         invalidateObservations()
       }
@@ -92,6 +102,8 @@ public struct InlineVideoPlayerLayer: UIViewRepresentable {
       invalidateObservations()
       playerLayer.player = nil
       isPlayerReady = false
+      sourceIdentity = nil
+      hasDisplayedVideo = false
       placeholder.image = nil
       placeholder.isHidden = true
     }
@@ -126,10 +138,15 @@ public struct InlineVideoPlayerLayer: UIViewRepresentable {
     }
 
     private func updatePlaceholderVisibility() {
+      if playerLayer.player?.currentItem == nil { hasDisplayedVideo = false }
       let canDisplayVideo = isPlayerReady
         && playerLayer.player?.currentItem?.status == .readyToPlay
         && playerLayer.isReadyForDisplay
-      placeholder.isHidden = placeholder.image == nil || canDisplayVideo
+      if canDisplayVideo { hasDisplayedVideo = true }
+      // Representation replacements belong to the same source. Once video has
+      // been shown, keep its native picture rather than resurrecting the poster.
+      let didHandOffSource = sourceIdentity != nil && hasDisplayedVideo
+      placeholder.isHidden = placeholder.image == nil || canDisplayVideo || didHandOffSource
     }
 
     private func invalidateObservations() {

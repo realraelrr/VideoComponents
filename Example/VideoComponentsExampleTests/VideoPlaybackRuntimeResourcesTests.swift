@@ -418,6 +418,496 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
   private enum FixtureError: Error { case timeout(String), writerFailed }
   private var previousKeyWindow: UIWindow?
 
+  func testSharedInlineExpectedSourceChangeMasksReadyPreviousVideoUntilNewSourceReady() async throws {
+    try await assertExpectedSourceChange(.inline)
+  }
+
+  func testSharedFullscreenExpectedSourceChangeMasksReadyPreviousVideoUntilNewSourceReady() async throws {
+    try await assertExpectedSourceChange(.fullscreen)
+  }
+
+  func testSharedInlineCleanupThenHeldReloadOfSameSourceRestoresPoster() async throws {
+    try await assertCleanupThenSameSourceReload(.inline)
+  }
+
+  func testSharedFullscreenCleanupThenHeldReloadOfSameSourceRestoresPoster() async throws {
+    try await assertCleanupThenSameSourceReload(.fullscreen)
+  }
+
+  func testRawSourceIdentityNilItemResetsHandoffBeforeHeldReloadOnSamePlayer() async throws {
+    let asset = try await greenVideo()
+    let poster = image(.red)
+    let session = PlaybackSession()
+    let identity = AnyHashable(UUID())
+    let gate = PosterHandoffAssetGate(asset: asset)
+    defer { gate.release(); session.cleanup() }
+    session.load(source: PlaybackSource(identity: identity, load: { asset }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: PosterHandoffRawSessionView(
+      session: session, identity: identity, poster: poster))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let media = try await mountedMedia(in: host.view)
+    try await waitForGreen(in: media, name: "raw-identity-before-nil-item-real-green")
+    let player = session.player
+    session.cleanup()
+    XCTAssertNil(player.currentItem)
+    XCTAssertNil(session.currentSourceIdentity)
+    try await assertColor(.red, in: media, name: "raw-same-player-nil-item-resets-source-handoff-red")
+    XCTAssertTrue(media.playerLayer.player === player,
+      "Raw rendering keeps this player bound: this reset is nil-item, not nil-player")
+    session.load(source: PlaybackSource(identity: identity, load: { try await gate.load() }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    try await poll("raw same-identity reload held") { gate.started }
+    try await assertColor(.red, in: media, name: "raw-same-identity-held-reload-red")
+    XCTAssertTrue(media.playerLayer.player === player)
+    XCTAssertNil(player.currentItem)
+    gate.release()
+    try await waitForGreen(in: media, name: "raw-same-player-same-identity-reload-real-green")
+    XCTAssertTrue(session.isPlayerReady)
+    XCTAssertTrue(media.playerLayer.isReadyForDisplay)
+  }
+
+  func testRawSourceIdentityLatePosterDuringRealReplacementDoesNotCoverAlreadyShownVideo() async throws {
+    let asset = try await greenVideo()
+    let latePoster = image(.blue)
+    let session = PlaybackSession()
+    let identity = AnyHashable(UUID())
+    defer { session.cleanup() }
+    session.load(source: PlaybackSource(identity: identity, load: { asset }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: PosterHandoffRawSessionView(
+      session: session, identity: identity, poster: nil))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let media = try await mountedMedia(in: host.view)
+    try await waitForGreen(in: media, name: "raw-identity-no-poster-first-real-green", allowing: [.blue, .green])
+    let original = try XCTUnwrap(session.player.currentItem)
+    var publishedLatePoster = false
+    // Published sends before storing. Use its incoming value; never set readiness or hold native transport.
+    let readinessObservation = session.$isPlayerReady.sink { ready in
+      guard !ready, !publishedLatePoster else { return }
+      publishedLatePoster = true
+      let evidence = XCTAttachment(string: "event=late-poster-published-on-production-readiness-false; "
+        + "wallTime=\(Date().timeIntervalSince1970); monotonicTime=\(CACurrentMediaTime()); "
+        + "originalItemStillInstalled=\(session.player.currentItem === original)")
+      evidence.name = "raw-late-poster-production-phase"
+      evidence.lifetime = .keepAlways
+      self.add(evidence)
+      host.rootView = PosterHandoffRawSessionView(session: session, identity: identity, poster: latePoster)
+    }
+    defer { readinessObservation.cancel() }
+    try await assertRealReplacementKeepsVideo(session: session, media: media,
+      asset: AVURLAsset(url: asset.url), identity: identity, color: .green, name: "raw-late-blue-poster")
+    XCTAssertTrue(publishedLatePoster, "The late poster must arrive on the real production replacement transition")
+    let mountedPoster = try XCTUnwrap(media.subviews.compactMap { $0 as? UIImageView }
+      .first { $0.image === latePoster }, "The actual late poster must reach the native view")
+    XCTAssertTrue(mountedPoster.isHidden)
+  }
+
+  private func assertExpectedSourceChange(_ mode: Presentation) async throws {
+    let greenAsset = try await greenVideo()
+    let redAsset = try await solidVideo(red: 255, green: 0, blue: 0)
+    let posterA = image(.red), posterB = image(.blue)
+    let session = PlaybackSession()
+    let sourceA = PlaybackSource(identity: UUID(), load: { greenAsset })
+    let gateB = PosterHandoffAssetGate(asset: redAsset)
+    let sourceB = PlaybackSource(identity: UUID(), load: { try await gateB.load() }, thumbnail: { _ in posterB })
+    defer { gateB.release(); session.cleanup() }
+    session.load(source: sourceA, playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: sharedView(mode, session: session,
+      provider: { posterA }, sourceIdentity: sourceA.identity))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let mediaA = try await mountedMedia(in: host.view)
+    let stage = mode.rawValue + "-expected-source-A-to-B"
+    try await waitForGreen(in: mediaA, name: stage + "-A-ready-real-green")
+    let itemA = try XCTUnwrap(session.player.currentItem)
+    XCTAssertTrue(session.isPlayerReady)
+    // Host metadata changes first. The session is deliberately still ready for A.
+    host.rootView = sharedView(mode, session: session, provider: { posterB }, sourceIdentity: sourceB.identity)
+    let mediaB = try await mountedMedia(in: host.view)
+    try await assertColor(.blue, in: mediaB, name: stage + "-B-published-before-session-load-blue")
+    XCTAssertNil(mediaB.playerLayer.player, "Expected B must not bind A's ready player")
+    XCTAssertTrue(session.isCurrentSource(sourceA.identity))
+    XCTAssertEqual(session.currentSourceIdentity, sourceA.identity)
+    XCTAssertTrue(session.isPlayerReady)
+    XCTAssertTrue(session.player.currentItem === itemA, "Publishing B must not mutate the still-current A session")
+    let nativePoster = try XCTUnwrap(mediaB.subviews.compactMap { $0 as? UIImageView }
+      .first { $0.image === posterB })
+    let trace = PosterHandoffReplacementTrace(media: mediaB, poster: nativePoster,
+      session: session, identity: sourceB.identity, test: name)
+    trace.start()
+    defer { retainReplacementTrace(trace, name: stage) }
+    trace.mark("expected-B-published-session-still-A")
+    session.load(source: sourceB, playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    try await poll("source B production acquisition held") { gateB.started }
+    trace.mark("source-B-load-held")
+    try await assertColor(.blue, in: mediaB, name: stage + "-B-held-blue-no-A")
+    XCTAssertTrue(session.isCurrentSource(sourceB.identity))
+    XCTAssertEqual(session.currentSourceIdentity, sourceB.identity)
+    XCTAssertFalse(session.isPlayerReady)
+    XCTAssertNil(session.player.currentItem)
+    XCTAssertNil(mediaB.playerLayer.player)
+    gateB.release()
+    try await waitForRedVideo(in: mediaB, name: stage + "-B-ready-real-red")
+    XCTAssertTrue(session.isPlayerReady)
+    XCTAssertTrue(mediaB.playerLayer.isReadyForDisplay)
+    XCTAssertTrue(mediaB.playerLayer.player === session.player)
+    XCTAssertFalse(session.player.currentItem === itemA)
+    try await poll("B's natural blue-poster handoff witnessed by native KVO") { trace.sawInitialPosterHide }
+    trace.mark("B-warm-real-red-confirmed")
+    // Same red bytes/source B, different item. Blue is the distinguishable saved poster.
+    try await assertRealReplacementKeepsVideo(session: session, media: mediaB,
+      asset: AVURLAsset(url: redAsset.url), identity: sourceB.identity, color: .red,
+      name: stage + "-B-HQ", trace: trace)
+  }
+
+  private func assertCleanupThenSameSourceReload(_ mode: Presentation) async throws {
+    let asset = try await greenVideo()
+    let poster = image(.red)
+    let session = PlaybackSession()
+    let identity = AnyHashable(UUID())
+    let reloadGate = PosterHandoffAssetGate(asset: asset)
+    defer { reloadGate.release(); session.cleanup() }
+    session.load(source: PlaybackSource(identity: identity, load: { asset }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: sharedView(mode, session: session,
+      provider: { poster }, sourceIdentity: identity))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let media = try await mountedMedia(in: host.view)
+    let stage = mode.rawValue + "-cleanup-same-source-reload"
+    try await waitForGreen(in: media, name: stage + "-before-cleanup-real-green")
+    let original = try XCTUnwrap(session.player.currentItem)
+    session.cleanup()
+    XCTAssertNil(session.currentSourceIdentity)
+    XCTAssertNil(session.player.currentItem)
+    try await assertColor(.red, in: media, name: stage + "-cleanup-restores-red-poster")
+    XCTAssertNil(media.playerLayer.player, "Shared views must detach the cleaned-up session")
+    session.load(source: PlaybackSource(identity: identity, load: { try await reloadGate.load() }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    try await poll("same resource reload acquisition held") { reloadGate.started }
+    try await assertColor(.red, in: media, name: stage + "-held-same-resource-red-poster")
+    XCTAssertTrue(session.isCurrentSource(identity))
+    XCTAssertNil(session.player.currentItem)
+    XCTAssertNil(media.playerLayer.player)
+    reloadGate.release()
+    try await waitForGreen(in: media, name: stage + "-reloaded-same-resource-real-green")
+    XCTAssertTrue(session.isPlayerReady)
+    XCTAssertTrue(media.playerLayer.isReadyForDisplay)
+    XCTAssertTrue(media.playerLayer.player === session.player)
+    XCTAssertFalse(session.player.currentItem === original)
+  }
+
+  private func assertRealReplacementKeepsVideo(
+    session: PlaybackSession, media: NativeView, asset: AVAsset, identity: AnyHashable,
+    color: PixelColor, name: String, trace: PosterHandoffReplacementTrace? = nil
+  ) async throws {
+    let original = try XCTUnwrap(session.player.currentItem)
+    XCTAssertTrue(session.isPlayerReady)
+    XCTAssertTrue(session.isCurrentSource(identity))
+    trace?.beginReplacement(after: color.rawValue)
+    var finished = false
+    let replacement = Task {
+      defer { finished = true }
+      try await session.replaceAsset(asset, for: identity)
+    }
+    defer { replacement.cancel() }
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(8))
+    var previous: PixelColor?
+    repeat {
+      try await nextRenderFrame()
+      let frame = try await screenFrame(in: media, stage: name + "-real-replaceAsset")
+      if frame.color != previous || finished { retain(frame, name: name + "-replacement-" + frame.color.rawValue) }
+      XCTAssertEqual(frame.color, color, "Same-source video must remain visible, with no saved poster/black: \(frame.description)")
+      previous = frame.color
+    } while !finished && clock.now < deadline
+    guard finished else {
+      XCTFail("Production replaceAsset did not finish")
+      throw FixtureError.timeout(name)
+    }
+    try await replacement.value
+    trace?.mark("replaceAsset-returned")
+    let candidate = try XCTUnwrap(session.player.currentItem)
+    XCTAssertFalse(candidate === original)
+    XCTAssertTrue(session.isCurrentSource(identity))
+    try await poll("replacement item ready with real paused transport and native display") {
+      session.isPlayerReady && candidate.status == .readyToPlay && media.playerLayer.isReadyForDisplay
+        && session.player.timeControlStatus == .paused && session.player.rate == 0
+    }
+    try await assertColor(color, in: media, name: name + "-warm-ready-final-video")
+    trace?.mark("warm-ready-final-video-confirmed")
+    try await assertColor(color, in: media, name: name + "-final-video-still-visible")
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertTrue(media.playerLayer.player === session.player)
+    if let trace {
+      XCTAssertGreaterThan(trace.replacementDisplayTicks, 0)
+      XCTAssertTrue(trace.replacementItemIDs.contains(String(describing: ObjectIdentifier(candidate))))
+      XCTAssertFalse(trace.posterResurfaced, "The current source's saved poster returned during a real HQ replacement")
+    }
+  }
+
+  func testSharedInlinePlayingHQReplacementShowsAdvancingNativeGreenBrightness() async throws {
+    try await assertPlayingHQBrightnessAdvances(.inline)
+  }
+
+  func testSharedFullscreenPlayingHQReplacementShowsAdvancingNativeGreenBrightness() async throws {
+    try await assertPlayingHQBrightnessAdvances(.fullscreen)
+  }
+
+  private func assertPlayingHQBrightnessAdvances(_ mode: Presentation) async throws {
+    let initialAsset = try await greenVideo() // Constant green 255 cannot satisfy the advancing-picture oracle.
+    let hqAsset = try await solidVideo(red: 0, green: 255, blue: 0, alternatingGreenBrightness: true)
+    let poster = image(.red)
+    let session = PlaybackSession()
+    let source = PlaybackSource(identity: UUID(), load: { initialAsset })
+    defer { session.cleanup() }
+    session.load(source: source, playbackRate: 1, isLooping: true, autoplayWhenReady: true)
+    let host = UIHostingController(rootView: sharedView(mode, session: session, provider: { poster },
+      sourceIdentity: source.identity))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let media = try await mountedMedia(in: host.view)
+    let stage = mode.rawValue + "-playing-HQ-brightness"
+    try await waitForGreen(in: media, name: stage + "-constant-original-real-green")
+    try await poll("original source native playback") {
+      session.isPlayerReady && session.player.timeControlStatus == .playing && session.player.rate == 1
+    }
+    let originalFrame = try await screenFrame(in: media, stage: stage + "-constant-original-RGB-calibration")
+    retain(originalFrame, name: stage + "-constant-original-RGB-calibration")
+    XCTAssertEqual(originalFrame.color, .green)
+    let originalRGB = try sampledScreenRGB(originalFrame, in: media)
+    XCTAssertGreaterThan(originalRGB.green, 235)
+    let nativePoster = try XCTUnwrap(media.subviews.compactMap { $0 as? UIImageView }.first { $0.image === poster })
+    let trace = PosterHandoffReplacementTrace(media: media, poster: nativePoster,
+      session: session, identity: source.identity, test: name)
+    trace.start()
+    defer { retainReplacementTrace(trace, name: stage) }
+    let original = try XCTUnwrap(session.player.currentItem)
+    trace.beginReplacement()
+    var finished = false
+    let replacement = Task {
+      defer { finished = true }
+      try await session.replaceAsset(hqAsset, for: source.identity)
+    }
+    defer { replacement.cancel() }
+    let clock = ContinuousClock()
+    let replacementDeadline = clock.now.advanced(by: .seconds(8))
+    repeat {
+      try await nextRenderFrame()
+      let frame = try await screenFrame(in: media, stage: stage + "-real-replaceAsset")
+      if frame.color != .green || finished { retain(frame, name: stage + "-replacement-" + frame.color.rawValue) }
+      XCTAssertEqual(frame.color, .green, "HQ replacement must not expose poster/black: \(frame.description)")
+    } while !finished && clock.now < replacementDeadline
+    guard finished else { throw FixtureError.timeout(stage + " replacement") }
+    try await replacement.value
+    let candidate = try XCTUnwrap(session.player.currentItem)
+    XCTAssertFalse(candidate === original)
+    XCTAssertTrue(session.isCurrentSource(source.identity))
+    try await poll("HQ native playback and display ready") {
+      session.isPlayerReady && candidate.status == .readyToPlay && media.playerLayer.isReadyForDisplay
+        && session.player.timeControlStatus == .playing && session.player.rate == 1
+    }
+    trace.mark("HQ-returned-playing-brightness-observation")
+    var samples: [String] = []
+    defer {
+      let attachment = XCTAttachment(string: samples.joined(separator: "\n") + "\n")
+      attachment.name = stage + "-compositor-rgb-samples.jsonl"
+      attachment.lifetime = .keepAlways
+      add(attachment)
+    }
+    var sawLow = false, sawHigh = false, transitions = 0
+    var previousLevel: String?
+    let deadline = clock.now.advanced(by: .seconds(6))
+    while clock.now < deadline && !(sawLow && sawHigh && transitions >= 2) {
+      try await nextRenderFrame()
+      let frame = try await screenFrame(in: media, stage: stage + "-HQ-playing-RGB")
+      let rgb = try sampledScreenRGB(frame, in: media)
+      // Saved compositor PNGs and independent ROI decoding agree: input 190 -> G223,
+      // while input 250 clips to the original's G255. Keep both HQ tiers below that ceiling.
+      let level = rgb.green >= 175 && rgb.green <= 205 ? "low-input-160"
+        : rgb.green >= 213 && rgb.green <= 235 && rgb.green <= originalRGB.green - 10
+          ? "high-input-190" : "transition"
+      let facts: [String: Any] = ["wallTime": Date().timeIntervalSince1970,
+        "monotonicTime": CACurrentMediaTime(), "phase": "HQ-playing-RGB", "level": level,
+        "red": rgb.red, "green": rgb.green, "blue": rgb.blue,
+        "originalGreen": originalRGB.green, "capture": frame.description]
+      samples.append(String(decoding: try JSONSerialization.data(withJSONObject: facts, options: [.sortedKeys]), as: UTF8.self))
+      XCTAssertEqual(frame.color, .green, "Only real green HQ pixels count; poster/black fails: \(frame.description)")
+      XCTAssertTrue(session.player.currentItem === candidate, "Brightness changes must belong to the installed HQ item")
+      if frame.color != .green || level != previousLevel {
+        retain(frame, name: stage + "-RGB-" + level)
+      }
+      if frame.color == .green && level != "transition" {
+        sawLow = sawLow || level == "low-input-160"
+        sawHigh = sawHigh || level == "high-input-190"
+        if let previousLevel, level != previousLevel { transitions += 1 }
+        previousLevel = level
+      }
+    }
+    XCTAssertTrue(sawLow && sawHigh && transitions >= 2,
+      "Actual compositor ROI must cross both green bands 175...205 and 213...235 twice after HQ returns; old G255 and native time/readiness alone cannot pass")
+    trace.mark("HQ-brightness-observation-ended-low-\(sawLow)-high-\(sawHigh)-transitions-\(transitions)")
+    try await assertColor(.green, in: media, name: stage + "-warm-ready-final-green")
+    XCTAssertTrue(session.isPlaybackRequested)
+    XCTAssertFalse(trace.posterResurfaced)
+    XCTAssertGreaterThan(trace.replacementDisplayTicks, 0)
+    XCTAssertTrue(trace.replacementItemIDs.contains(String(describing: ObjectIdentifier(candidate))))
+  }
+
+  private func sampledScreenRGB(_ frame: ScreenFrame, in view: UIView) throws -> (red: Double, green: Double, blue: Double) {
+    let window = try XCTUnwrap(view.window)
+    let bounds = window.screen.coordinateSpace.bounds
+    let roi = view.bounds.insetBy(dx: view.bounds.width * 0.4, dy: view.bounds.height * 0.4)
+    let screenROI = window.convert(view.convert(roi, to: window), to: window.screen.coordinateSpace)
+    let image = try XCTUnwrap(frame.image.cgImage)
+    let sx = CGFloat(image.width) / bounds.width, sy = CGFloat(image.height) / bounds.height
+    let crop = try XCTUnwrap(image.cropping(to: CGRect(x: (screenROI.minX - bounds.minX) * sx,
+      y: (screenROI.minY - bounds.minY) * sy, width: screenROI.width * sx, height: screenROI.height * sy).integral))
+    let context = try XCTUnwrap(CGContext(data: nil, width: 12, height: 12, bitsPerComponent: 8, bytesPerRow: 48,
+      space: CGColorSpaceCreateDeviceRGB(),
+      bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue))
+    context.draw(crop, in: CGRect(x: 0, y: 0, width: 12, height: 12))
+    let bytes = try XCTUnwrap(context.data).assumingMemoryBound(to: UInt8.self)
+    var red = 0, green = 0, blue = 0
+    for pixel in 0..<144 { red += Int(bytes[pixel * 4]); green += Int(bytes[pixel * 4 + 1]); blue += Int(bytes[pixel * 4 + 2]) }
+    return (Double(red) / 144, Double(green) / 144, Double(blue) / 144)
+  }
+
+  func testSharedInlineSameSourceReplacementDoesNotReshowSavedPosterWhilePaused() async throws {
+    try await assertSameSourceReplacement(.inline, playing: false)
+  }
+
+  func testSharedInlineSameSourceReplacementDoesNotReshowSavedPosterWhilePlaying() async throws {
+    try await assertSameSourceReplacement(.inline, playing: true)
+  }
+
+  func testSharedFullscreenSameSourceReplacementDoesNotReshowSavedPosterWhilePaused() async throws {
+    try await assertSameSourceReplacement(.fullscreen, playing: false)
+  }
+
+  func testSharedFullscreenSameSourceReplacementDoesNotReshowSavedPosterWhilePlaying() async throws {
+    try await assertSameSourceReplacement(.fullscreen, playing: true)
+  }
+
+  private func assertSameSourceReplacement(_ mode: Presentation, playing: Bool) async throws {
+    let asset = try await greenVideo()
+    let posterURL = FileManager.default.temporaryDirectory.appendingPathComponent("saved-poster-\(UUID()).png")
+    addTeardownBlock { try? FileManager.default.removeItem(at: posterURL) }
+    try XCTUnwrap(image(.red).pngData()).write(to: posterURL)
+    let savedPoster = try XCTUnwrap(UIImage(contentsOfFile: posterURL.path))
+    let gate = PosterHandoffAssetGate(asset: asset)
+    let session = PlaybackSession() // Production preparation, native readiness and restoring seek.
+    defer { gate.release(); session.cleanup() }
+    let source = PlaybackSource(identity: UUID(), load: { try await gate.load() }, thumbnail: { _ in savedPoster })
+    session.load(source: source, playbackRate: 0.75, isLooping: true, autoplayWhenReady: false)
+    try await poll("same-source initial acquisition held") { gate.started }
+    let host = UIHostingController(rootView: sharedView(mode, session: session, provider: { savedPoster }))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let media = try await mountedMedia(in: host.view)
+    let nativePoster = try XCTUnwrap(media.subviews.compactMap { $0 as? UIImageView }
+      .first { $0.image === savedPoster }, "Observe the actual native saved-poster view")
+    let stage = "\(mode.rawValue)-\(playing ? "playing" : "paused")-same-source"
+    try await assertColor(.red, in: media, name: stage + "-saved-red-poster-calibration")
+    let trace = PosterHandoffReplacementTrace(media: media, poster: nativePoster,
+      session: session, identity: source.identity, test: name)
+    trace.start()
+    defer { retainReplacementTrace(trace, name: stage) }
+    gate.release()
+    try await poll("production source ready for real scrub") {
+      session.canUsePlaybackControls && session.durationSeconds > 0
+    }
+    let pausedPosition = session.durationSeconds * 0.25
+    session.handleScrubEditingChanged(true)
+    session.setScrubProgress(0.25)
+    session.handleScrubEditingChanged(false)
+    try await poll("native nonzero paused position") {
+      abs(session.player.currentTime().seconds - pausedPosition) < 0.05
+    }
+    if playing {
+      session.togglePlayback()
+      try await poll("native playback before representation replacement") {
+        session.player.timeControlStatus == .playing && abs(session.player.rate - 0.75) < 0.01
+      }
+    }
+    try await waitForGreen(in: media, name: stage + "-warm-ready-green-calibration")
+    XCTAssertTrue(session.isPlayerReady)
+    XCTAssertTrue(media.playerLayer.isReadyForDisplay)
+    XCTAssertEqual(session.isPlaybackRequested, playing)
+    try await poll("poster KVO independently calibrated by natural first handoff") { trace.sawInitialPosterHide }
+    let player = session.player
+    let originalItem = try XCTUnwrap(player.currentItem)
+    // A new AVAsset/AVPlayerItem for the same bytes and identity, not a source A-to-B change.
+    let replacementAsset = AVURLAsset(url: asset.url)
+    trace.beginReplacement()
+    var finished = false
+    let replacement = Task {
+      defer { finished = true }
+      try await session.replaceAsset(replacementAsset, for: source.identity)
+    }
+    defer { replacement.cancel() }
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(8))
+    var previous: PixelColor?
+    repeat {
+      try await nextRenderFrame()
+      let frame = try await screenFrame(in: media, stage: stage + "-real-replaceAsset")
+      if frame.color != previous || finished { retain(frame, name: stage + "-replacement-" + frame.color.rawValue) }
+      // Keep collecting after a failure so the old implementation also supplies final-green evidence.
+      XCTAssertEqual(frame.color, .green,
+        "Same-source replacement must not reshow the saved red poster or expose black: \(frame.description)")
+      previous = frame.color
+    } while !finished && clock.now < deadline
+    guard finished else {
+      XCTFail("Production replaceAsset did not finish; native facts are retained")
+      throw FixtureError.timeout(stage + " replacement")
+    }
+    try await replacement.value
+    trace.mark("replaceAsset-returned")
+    let candidate = try XCTUnwrap(player.currentItem)
+    XCTAssertFalse(candidate === originalItem, "The real production call must install a different item")
+    XCTAssertTrue(candidate.asset === replacementAsset)
+    XCTAssertTrue(session.player === player)
+    XCTAssertTrue(media.playerLayer.player === player)
+    XCTAssertTrue(session.isCurrentSource(source.identity), "Item replacement must preserve source identity")
+    try await poll("warm replacement item, display and restored native transport") {
+      session.isPlayerReady && candidate.status == .readyToPlay && media.playerLayer.isReadyForDisplay
+        && (playing ? player.timeControlStatus == .playing && abs(player.rate - 0.75) < 0.01
+          : player.timeControlStatus == .paused && player.rate == 0)
+    }
+    // Actual compositor pixels are mandatory even when every native readiness flag is true.
+    try await assertColor(.green, in: media, name: stage + "-warm-ready-final-green")
+    trace.mark("warm-ready-final-green-confirmed")
+    try await assertColor(.green, in: media, name: stage + "-warm-ready-final-green-still-visible")
+    XCTAssertEqual(session.isPlaybackRequested, playing)
+    XCTAssertEqual(session.playbackConfig.playbackRate, 0.75)
+    XCTAssertTrue(session.playbackConfig.isLooping)
+    if !playing { XCTAssertEqual(player.currentTime().seconds, pausedPosition, accuracy: 0.05) }
+    XCTAssertGreaterThan(trace.replacementDisplayTicks, 0, "Continuous native evidence must span replacement")
+    XCTAssertTrue(trace.replacementItemIDs.contains(String(describing: ObjectIdentifier(candidate))),
+      "Independent native currentItem KVO must witness the new item")
+    XCTAssertFalse(trace.posterResurfaced,
+      "The saved poster returned after calibrated green video during production replaceAsset; inspect framefacts")
+  }
+
+  private func retainReplacementTrace(_ trace: PosterHandoffReplacementTrace, name: String) {
+    trace.stop()
+    let facts = trace.lines.joined(separator: "\n") + "\n"
+    let attachment = XCTAttachment(string: facts)
+    attachment.name = name + "-framefacts.jsonl"
+    attachment.lifetime = .keepAlways
+    add(attachment)
+    if let directory = ProcessInfo.processInfo.environment["VIDEO_COMPONENTS_CAPTURE_DIRECTORY"] {
+      let url = URL(fileURLWithPath: directory, isDirectory: true)
+        .appendingPathComponent(name + "-" + UUID().uuidString + ".framefacts.jsonl")
+      do { try Data(facts.utf8).write(to: url, options: .atomic) }
+      catch { XCTFail("Cannot retain replacement facts beside compositor screenshots: \(error)") }
+    }
+  }
+
   func testScreenCaptureCalibratesRealGreenVideoAgainstRedPoster() async throws {
     let asset = try await greenVideo()
     let surface = UIView()
@@ -1020,16 +1510,16 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
 
   private func sharedView(
     _ mode: Presentation, session: PlaybackSession,
-    provider: (@MainActor () -> UIImage?)? = nil
+    provider: (@MainActor () -> UIImage?)? = nil, sourceIdentity: AnyHashable? = nil
   ) -> AnyView {
     switch mode {
     case .inline:
       AnyView(InlinePlaybackView(playbackSession: session, topTrailingAccessory: { EmptyView() },
-        placeholderImage: provider, statusOverlay: { EmptyView() })
+        placeholderImage: provider, sourceIdentity: sourceIdentity, statusOverlay: { EmptyView() })
         .frame(maxWidth: .infinity, maxHeight: .infinity).id(mode.rawValue))
     case .fullscreen:
       AnyView(FullscreenPlaybackView(playbackSession: session, onClose: {}, placeholderImage: provider,
-        trailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() })
+        sourceIdentity: sourceIdentity, trailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() })
         .environment(\.scenePhase, .active).id(mode.rawValue))
     }
   }
@@ -1292,7 +1782,9 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     try await solidVideo(red: 0, green: 255, blue: 0)
   }
 
-  private func solidVideo(red: UInt8, green: UInt8, blue: UInt8) async throws -> AVURLAsset {
+  private func solidVideo(
+    red: UInt8, green: UInt8, blue: UInt8, alternatingGreenBrightness: Bool = false
+  ) async throws -> AVURLAsset {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("poster-handoff-\(UUID()).mov")
     addTeardownBlock { try? FileManager.default.removeItem(at: url) }
     let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
@@ -1320,10 +1812,13 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
       XCTAssertEqual(CVPixelBufferLockBaseAddress(pixel, []), kCVReturnSuccess)
       let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixel)).assumingMemoryBound(to: UInt8.self)
       let stride = CVPixelBufferGetBytesPerRow(pixel)
+      // Input 190 measured G223 in saved screenshots; 250 clipped to G255. Use a lower
+      // 160 tier and the measured 190 tier, each lasting half a second across looping.
+      let frameGreen: UInt8 = alternatingGreenBrightness ? (frame / 15 % 2 == 0 ? 160 : 190) : green
       for y in 0..<height {
         for x in 0..<width {
           let offset = y * stride + x * 4
-          bytes[offset] = blue; bytes[offset + 1] = green; bytes[offset + 2] = red; bytes[offset + 3] = 255
+          bytes[offset] = blue; bytes[offset + 1] = frameGreen; bytes[offset + 2] = red; bytes[offset + 3] = 255
         }
       }
       XCTAssertEqual(CVPixelBufferUnlockBaseAddress(pixel, []), kCVReturnSuccess)
@@ -1338,6 +1833,162 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     guard writer.status == .completed else { throw writer.error ?? FixtureError.writerFailed }
     completed = true
     return AVURLAsset(url: url)
+  }
+}
+
+/// Feeds only production session readiness while keeping the raw layer's player bound through nil-item reset.
+@MainActor
+private struct PosterHandoffRawSessionView: View {
+  @ObservedObject var session: PlaybackSession
+  let identity: AnyHashable
+  let poster: UIImage?
+
+  var body: some View {
+    InlineVideoPlayerLayer(player: session.player, placeholderImage: poster,
+      isPlayerReady: session.isPlayerReady, sourceIdentity: identity)
+      .frame(width: 320, height: 240)
+      .background(.blue)
+  }
+}
+
+/// Passive native facts only. Existing protocol-v1 simctl captures remain the pixel oracle;
+/// wall/monotonic timestamps and screen-point ROI also align the main agent's continuous movie.
+@MainActor
+private final class PosterHandoffReplacementTrace: NSObject {
+  private let media: InlineVideoPlayerLayer.PlayerLayerView
+  private let poster: UIImageView
+  private let session: PlaybackSession
+  private let identity: AnyHashable
+  private let test: String
+  private var displayLink: CADisplayLink?
+  private var observations: [NSKeyValueObservation] = []
+  private var isRunning = false
+  private var isReplacing = false
+  private var phase = "initial-handoff-calibration"
+  private(set) var lines: [String] = []
+  private(set) var sawInitialPosterHide = false
+  private(set) var posterResurfaced = false
+  private(set) var replacementDisplayTicks = 0
+  private(set) var replacementItemIDs: [String] = []
+
+  init(media: InlineVideoPlayerLayer.PlayerLayerView, poster: UIImageView,
+    session: PlaybackSession, identity: AnyHashable, test: String) {
+    self.media = media; self.poster = poster; self.session = session; self.identity = identity; self.test = test
+    super.init()
+  }
+
+  func start() {
+    isRunning = true
+    observations = [
+      poster.observe(\.isHidden, options: [.new]) { [weak self] _, change in
+        Self.deliver(to: self, event: "poster-hidden-kvo", changedHidden: change.newValue)
+      },
+      media.playerLayer.observe(\.isReadyForDisplay, options: [.new]) { [weak self] _, change in
+        Self.deliver(to: self, event: "display-ready-kvo", changedReady: change.newValue)
+      },
+      session.player.observe(\.currentItem, options: [.new]) { [weak self] _, change in
+        let item = change.newValue ?? nil
+        Self.deliver(to: self, event: "current-item-kvo",
+          changedItemID: item.map { String(describing: ObjectIdentifier($0)) } ?? "nil")
+      }
+    ]
+    let link = CADisplayLink(target: self, selector: #selector(tick))
+    displayLink = link
+    link.add(to: .main, forMode: .common)
+    record("trace-start")
+  }
+
+  func beginReplacement(after color: String = "green") {
+    isReplacing = true
+    mark("replaceAsset-begin-after-compositor-" + color)
+  }
+
+  func mark(_ phase: String) {
+    self.phase = phase
+    record("phase")
+  }
+
+  func stop() {
+    record("trace-stop")
+    isRunning = false
+    displayLink?.invalidate()
+    displayLink = nil
+    observations.forEach { $0.invalidate() }
+    observations.removeAll()
+  }
+
+  @objc private func tick(_ link: CADisplayLink) {
+    if isReplacing { replacementDisplayTicks += 1 }
+    record("display-link", displayTimestamp: link.timestamp)
+  }
+
+  private nonisolated static func deliver(to trace: PosterHandoffReplacementTrace?, event: String,
+    changedHidden: Bool? = nil, changedReady: Bool? = nil, changedItemID: String? = nil) {
+    let callbackTime = Date().timeIntervalSince1970
+    let callbackOnMain = Thread.isMainThread
+    if callbackOnMain {
+      MainActor.assumeIsolated {
+        trace?.record(event, changedHidden: changedHidden, changedReady: changedReady,
+          changedItemID: changedItemID, callbackTime: callbackTime, callbackOnMain: callbackOnMain)
+      }
+    } else {
+      Task { @MainActor [weak trace] in
+        trace?.record(event, changedHidden: changedHidden, changedReady: changedReady,
+          changedItemID: changedItemID, callbackTime: callbackTime, callbackOnMain: callbackOnMain)
+      }
+    }
+  }
+
+  private func record(_ event: String, changedHidden: Bool? = nil, changedReady: Bool? = nil,
+    changedItemID: String? = nil, callbackTime: Double? = nil, callbackOnMain: Bool? = nil,
+    displayTimestamp: Double? = nil) {
+    guard isRunning else { return }
+    if !isReplacing && event == "poster-hidden-kvo" && changedHidden == true { sawInitialPosterHide = true }
+    let attached = poster.window != nil && poster.superview === media
+    let presentation = poster.layer.presentation()
+    let visible = attached && !poster.isHidden && poster.alpha > 0
+    let presented = attached && presentation?.isHidden == false && (presentation?.opacity ?? 0) > 0
+    if isReplacing {
+      // KVO catches a cover that returns and disappears entirely between display ticks/captures.
+      posterResurfaced = posterResurfaced || visible || (attached && changedHidden == false)
+      if let changedItemID { replacementItemIDs.append(changedItemID) }
+    }
+    let player = session.player
+    let item = player.currentItem
+    let seconds = player.currentTime().seconds
+    var facts: [String: Any] = [
+      "test": test, "sequence": lines.count, "event": event, "phase": phase,
+      "wallTime": Date().timeIntervalSince1970, "monotonicTime": CACurrentMediaTime(),
+      "sourceIdentity": String(describing: identity), "sourceIsCurrent": session.isCurrentSource(identity),
+      "itemID": item.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
+      "itemStatus": item.map { String(describing: $0.status) } ?? "noItem",
+      "sessionReady": session.isPlayerReady, "layerReady": media.playerLayer.isReadyForDisplay,
+      "posterAttached": attached, "posterHidden": poster.isHidden, "posterVisible": visible,
+      "posterPresented": presented, "playbackRequested": session.isPlaybackRequested,
+      "playerRate": player.rate, "timeControlStatus": String(describing: player.timeControlStatus)
+    ]
+    facts["posterPresentationHidden"] = presentation?.isHidden
+    facts["posterPresentationOpacity"] = presentation?.opacity
+    facts["timeSeconds"] = seconds.isFinite ? seconds : nil
+    facts["changedHidden"] = changedHidden
+    facts["changedReady"] = changedReady
+    facts["changedItemID"] = changedItemID
+    facts["callbackWallTime"] = callbackTime
+    facts["callbackOnMain"] = callbackOnMain
+    facts["displayTimestamp"] = displayTimestamp
+    if let window = media.window {
+      let roi = media.bounds.insetBy(dx: media.bounds.width * 0.4, dy: media.bounds.height * 0.4)
+      let screenROI = window.convert(media.convert(roi, to: window), to: window.screen.coordinateSpace)
+      func rect(_ value: CGRect) -> [String: Double] {
+        ["x": Double(value.minX), "y": Double(value.minY), "width": Double(value.width), "height": Double(value.height)]
+      }
+      facts["mediaROI"] = rect(screenROI)
+      facts["screenBounds"] = rect(window.screen.coordinateSpace.bounds)
+    }
+    do {
+      let data = try JSONSerialization.data(withJSONObject: facts, options: [.sortedKeys])
+      lines.append(String(decoding: data, as: UTF8.self))
+    } catch { XCTFail("Cannot encode continuous native replacement evidence: \(error)") }
   }
 }
 

@@ -12,6 +12,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
   let onRequestFullscreen: (() -> Void)?
   let statusOverlay: () -> StatusOverlay
   let placeholderImage: (@MainActor () -> UIImage?)?
+  let sourceIdentity: AnyHashable?
   let labels: VideoPlaybackLabels
   let style: VideoPlaybackStyle
 
@@ -29,6 +30,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
     labels: VideoPlaybackLabels = .init(),
     style: VideoPlaybackStyle = .init(),
     placeholderImage: (@MainActor () -> UIImage?)? = nil,
+    sourceIdentity: AnyHashable? = nil,
     @ViewBuilder statusOverlay: @escaping () -> StatusOverlay
   ) {
     self.playbackSession = playbackSession
@@ -42,6 +44,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
     self.style = style
     self.statusOverlay = statusOverlay
     self.placeholderImage = placeholderImage
+    self.sourceIdentity = sourceIdentity
   }
 
   public var body: some View {
@@ -126,13 +129,20 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
       player: inlineLayerPlayer,
       videoGravity: .resizeAspect,
       placeholderImage: image,
-      isPlayerReady: playbackSession.isPlayerReady
+      isPlayerReady: playbackSession.isPlayerReady,
+      sourceIdentity: displayedSourceIdentity
     )
     .background(.black)
   }
 
   private var inlineLayerPlayer: AVPlayer? {
-    playbackSession.hasCurrentItem && !isFullscreenPresented ? playbackSession.player : nil
+    guard let identity = displayedSourceIdentity, playbackSession.isCurrentSource(identity),
+      playbackSession.hasCurrentItem, !isFullscreenPresented else { return nil }
+    return playbackSession.player
+  }
+
+  private var displayedSourceIdentity: AnyHashable? {
+    sourceIdentity ?? playbackSession.currentSourceIdentity
   }
 
   private var inlinePlaybackControls: some View {

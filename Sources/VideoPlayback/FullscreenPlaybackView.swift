@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 
 public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: View>: View {
@@ -10,6 +11,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
   let trailingAccessory: () -> TrailingAccessory
   let statusOverlay: () -> StatusOverlay
   let placeholderImage: (@MainActor () -> UIImage?)?
+  let sourceIdentity: AnyHashable?
 
   @State private var isZooming = false
   @State private var isMultiTouchGestureActive = false
@@ -23,6 +25,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
     onClose: @escaping @MainActor @Sendable () -> Void,
     labels: VideoPlaybackLabels = .init(),
     placeholderImage: (@MainActor () -> UIImage?)? = nil,
+    sourceIdentity: AnyHashable? = nil,
     @ViewBuilder trailingAccessory: @escaping () -> TrailingAccessory,
     @ViewBuilder statusOverlay: @escaping () -> StatusOverlay
   ) {
@@ -33,6 +36,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
     self.trailingAccessory = trailingAccessory
     self.statusOverlay = statusOverlay
     self.placeholderImage = placeholderImage
+    self.sourceIdentity = sourceIdentity
   }
 
   public var body: some View {
@@ -88,10 +92,11 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
         }
       ) {
         InlineVideoPlayerLayer(
-          player: playbackSession.hasCurrentItem ? playbackSession.player : nil,
+          player: layerPlayer,
           videoGravity: .resizeAspect,
           placeholderImage: placeholderImageValue,
-          isPlayerReady: playbackSession.isPlayerReady
+          isPlayerReady: playbackSession.isPlayerReady,
+          sourceIdentity: displayedSourceIdentity
         )
       } overlay: { zoomContext in
         ZStack {
@@ -109,6 +114,16 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
   private var placeholderImageValue: UIImage? {
     if let placeholderImage { return placeholderImage() }
     return playbackSession.thumbnailImage
+  }
+
+  private var displayedSourceIdentity: AnyHashable? {
+    sourceIdentity ?? playbackSession.currentSourceIdentity
+  }
+
+  private var layerPlayer: AVPlayer? {
+    guard let identity = displayedSourceIdentity, playbackSession.isCurrentSource(identity),
+      playbackSession.hasCurrentItem else { return nil }
+    return playbackSession.player
   }
 
   private var fullscreenOverlay: some View {

@@ -91,6 +91,9 @@ import UIKit
     player.currentItem != nil
   }
 
+  /// The source being prepared or displayed, independent of its current representation.
+  public var currentSourceIdentity: AnyHashable? { loadedResource }
+
   var hasActivePlayerObservers: Bool {
     playbackEndObserver != nil || playerItemStatusObservation != nil
       || timeControlObservation != nil || periodicTimeObserver != nil
