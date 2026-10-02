@@ -72,7 +72,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
       }
       .frame(maxWidth: .infinity, alignment: .center)
 
-      if playbackSession.canUsePlaybackControls {
+      if playbackSession.canTogglePlayback {
         // Keep the media proposal stable while a pinch is in progress.
         let hidesControls = isInlineZooming || isInlineMultiTouchGestureActive
         inlinePlaybackControls
@@ -125,12 +125,20 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
   private var mediaLayer: some View {
     // A host provider is authoritative even when the current poster is unavailable.
     let image = if let placeholderImage { placeholderImage() } else { playbackSession.thumbnailImage }
+    let identity = displayedSourceIdentity
+    let presentationID = playbackSession.sourcePresentationID
     return InlineVideoPlayerLayer(
       player: inlineLayerPlayer,
       videoGravity: .resizeAspect,
       placeholderImage: image,
       isPlayerReady: playbackSession.isPlayerReady,
-      sourceIdentity: displayedSourceIdentity
+      sourceIdentity: identity,
+      waitsForPlayback: true,
+      hasPresentedVideo: identity == playbackSession.currentSourceIdentity && playbackSession.hasPresentedVideo,
+      onVideoPresented: { [weak playbackSession] _ in
+        guard let identity else { return }
+        playbackSession?.didPresentVideo(for: identity, sourcePresentationID: presentationID)
+      }
     )
     .background(.black)
   }

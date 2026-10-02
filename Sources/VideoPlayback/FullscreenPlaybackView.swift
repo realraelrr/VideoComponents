@@ -68,7 +68,9 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
   }
 
   private func fullscreenBody(safeAreaInsets: EdgeInsets) -> some View {
-    ZStack {
+    let identity = displayedSourceIdentity
+    let presentationID = playbackSession.sourcePresentationID
+    return ZStack {
       Color.black.ignoresSafeArea()
 
       ZoomableVideoContainer(
@@ -96,7 +98,13 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
           videoGravity: .resizeAspect,
           placeholderImage: placeholderImageValue,
           isPlayerReady: playbackSession.isPlayerReady,
-          sourceIdentity: displayedSourceIdentity
+          sourceIdentity: identity,
+          waitsForPlayback: true,
+          hasPresentedVideo: identity == playbackSession.currentSourceIdentity && playbackSession.hasPresentedVideo,
+          onVideoPresented: { [weak playbackSession] _ in
+            guard let identity else { return }
+            playbackSession?.didPresentVideo(for: identity, sourcePresentationID: presentationID)
+          }
         )
       } overlay: { zoomContext in
         ZStack {
@@ -130,7 +138,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
     VStack(spacing: 0) {
       Spacer()
 
-      if playbackSession.canUsePlaybackControls {
+      if playbackSession.canTogglePlayback {
         let showsControls = showsChrome && !isZooming && !isMultiTouchGestureActive
         fullscreenControls
           .opacity(showsControls ? 1 : 0)

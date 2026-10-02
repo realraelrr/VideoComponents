@@ -58,6 +58,7 @@ struct VideoPlaybackControls: View {
         accessibilityValue: playbackSession.playbackTimeText,
         onEditingChanged: playbackSession.handleScrubEditingChanged
       )
+      .disabled(!playbackSession.canUsePlaybackControls)
 
       if style.showsPlaybackTime {
         Text(playbackSession.playbackTimeText)

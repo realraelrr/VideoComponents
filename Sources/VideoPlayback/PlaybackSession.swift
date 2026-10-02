@@ -39,6 +39,9 @@ import UIKit
   @Published public private(set) var thumbnailImage: UIImage?
   @Published private var playbackCoordinator = PlaybackState()
   @Published public private(set) var isPlayerReady = false
+  /// A native rendering layer has displayed playback for this source.
+  /// Pauses and representation changes retain this fact; releasing the source clears it.
+  @Published public private(set) var hasPresentedVideo = false
   @Published public private(set) var currentTimeSeconds: Double = 0
   @Published public private(set) var durationSeconds: Double = 0
   @Published public private(set) var playbackConfig = VideoPlaybackConfig()
@@ -57,6 +60,8 @@ import UIKit
   private var replacementContinuation: CheckedContinuation<Void, any Error>?
   private var replacementSnapshot: AccessPlaybackSnapshot?
   private var loadedResource: AnyHashable?
+  // Separate from loading/item generations: HQ and access refresh retain this source visit.
+  private(set) var sourcePresentationID = UUID()
   private var lastAccessRefreshID: UInt64?
   private var pendingTransport: PendingTransport?
   private var playbackEndObserver: NSObjectProtocol?
@@ -116,6 +121,24 @@ import UIKit
 
   public var canUsePlaybackControls: Bool {
     hasCurrentItem && isPlayerReady && !status.allowsHitTesting
+  }
+
+  /// Play/pause intent is available while the current source is still being acquired.
+  public var canTogglePlayback: Bool {
+    loadedResource != nil && failure == nil && !playbackCoordinator.phase.isTerminal
+  }
+
+  public var isWaitingForPlayback: Bool {
+    guard isPlaybackRequested, failure == nil, playbackInteraction != .scrubbing else { return false }
+    return !hasPresentedVideo || !isPlayerReady || status != .none
+      || (preparation != nil && preparationRequest?.isReady != true)
+  }
+
+  func didPresentVideo(for identity: AnyHashable, sourcePresentationID: UUID) {
+    // The rendering layer already witnessed native playback and display readiness.
+    // A pause before delivery must not erase a picture that was actually shown.
+    guard loadedResource == identity, self.sourcePresentationID == sourcePresentationID else { return }
+    hasPresentedVideo = true
   }
 
   public var displayedProgress: Double {
@@ -591,7 +614,7 @@ import UIKit
   }
 
   public func togglePlayback() {
-    guard hasCurrentItem, failure == nil else { return }
+    guard canTogglePlayback else { return }
     if isPlaybackRequested {
       pausePlayback()
       return
@@ -710,6 +733,8 @@ import UIKit
     removePlayerObservers()
     thumbnailImage = nil
     loadedResource = nil
+    sourcePresentationID = UUID()
+    hasPresentedVideo = false
     failure = nil
     lastAccessRefreshID = nil
     isPlayerReady = false

@@ -4,6 +4,103 @@ import XCTest
 
 @MainActor
 final class PlaybackAccessTests: XCTestCase {
+  func testPlayBeforeAcquisitionCanBeCancelledAndRequestedAgain() async throws {
+    let asset = try audioAsset()
+    let loader = SuspendedAssetOperation()
+    let session = PlaybackSession()
+    defer { session.cleanup(); loader.finish(asset) }
+    session.load(source: PlaybackSource(identity: UUID(), load: loader.load),
+      playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+    try await wait { loader.started }
+    XCTAssertNil(session.player.currentItem)
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertTrue(session.canTogglePlayback)
+    XCTAssertFalse(session.isWaitingForPlayback)
+
+    session.togglePlayback()
+    XCTAssertTrue(session.isPlaybackRequested, "Play must be accepted while acquiring the source")
+    XCTAssertTrue(session.isWaitingForPlayback)
+    XCTAssertEqual(session.player.rate, 0)
+    session.togglePlayback()
+    XCTAssertFalse(session.isPlaybackRequested, "A second tap cancels the waiting playback")
+    XCTAssertFalse(session.isWaitingForPlayback)
+    session.togglePlayback()
+    XCTAssertTrue(session.isPlaybackRequested)
+    loader.finish(asset)
+    try await wait { session.isPlayerReady }
+    XCTAssertTrue(session.isPlaybackRequested)
+    XCTAssertGreaterThan(session.player.rate, 0)
+  }
+
+  func testCancelledAcquisitionPlayKeepsPreparingWithoutLateAutoplay() async throws {
+    let asset = try audioAsset()
+    let loader = SuspendedAssetOperation()
+    let session = PlaybackSession()
+    defer { session.cleanup(); loader.finish(asset) }
+    session.load(source: PlaybackSource(identity: UUID(), load: loader.load),
+      playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+    try await wait { loader.started }
+    session.togglePlayback()
+    XCTAssertTrue(session.isPlaybackRequested)
+    session.togglePlayback()
+    loader.finish(asset)
+    try await wait { session.isPlayerReady }
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertEqual(session.player.rate, 0)
+    XCTAssertNil(session.failure)
+    XCTAssertFalse(loader.cancelled, "Cancelling Play must not discard background preparation")
+  }
+
+  func testWaitingPlayCleanupRejectsLateAcquisition() async throws {
+    let asset = try audioAsset()
+    let loader = SuspendedAssetOperation()
+    let session = PlaybackSession()
+    defer { session.cleanup(); loader.finish(asset) }
+    session.load(source: PlaybackSource(identity: UUID(), load: loader.load),
+      playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+    try await wait { loader.started }
+    session.togglePlayback()
+    XCTAssertTrue(session.isPlaybackRequested)
+    session.cleanup()
+    try await wait { loader.cancelled }
+    loader.finish(asset)
+    await Task { @MainActor in }.value
+    XCTAssertNil(session.currentSourceIdentity)
+    XCTAssertNil(session.player.currentItem)
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertFalse(session.canTogglePlayback)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    XCTAssertNil(session.failure)
+  }
+
+  func testWaitingPlaySourceSwitchDropsIntentAndRejectsOldAcquisition() async throws {
+    let asset = try audioAsset()
+    let first = SuspendedAssetOperation()
+    let next = SuspendedAssetOperation()
+    let session = PlaybackSession()
+    defer { session.cleanup(); first.finish(asset); next.finish(asset) }
+    session.load(source: PlaybackSource(identity: UUID(), load: first.load),
+      playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+    try await wait { first.started }
+    session.togglePlayback()
+    XCTAssertTrue(session.isPlaybackRequested)
+    let nextIdentity = UUID()
+    session.load(source: PlaybackSource(identity: nextIdentity, load: next.load),
+      playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+    try await wait { next.started && first.cancelled }
+    first.finish(asset)
+    await Task { @MainActor in }.value
+    XCTAssertTrue(session.isCurrentSource(nextIdentity))
+    XCTAssertNil(session.player.currentItem)
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    next.finish(asset)
+    try await wait { session.isPlayerReady }
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertEqual(session.player.rate, 0)
+    XCTAssertNil(session.failure)
+  }
+
   func testAutoplayRequestAtEndWhileAccessIsPendingRestartsPlayback() async throws {
     let (session, source, asset) = try await readySession()
     let validator = SuspendedAssetOperation()

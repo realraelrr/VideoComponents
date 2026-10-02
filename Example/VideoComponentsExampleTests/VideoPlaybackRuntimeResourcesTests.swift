@@ -363,7 +363,7 @@ private final class MountedTap: UITapGestureRecognizer {
 final class VideoPlaybackPosterHandoffTests: XCTestCase {
   private typealias NativeView = InlineVideoPlayerLayer.PlayerLayerView
   private enum Presentation: String, CaseIterable { case inline, fullscreen }
-  private enum PixelColor: String { case red, green, blue, other }
+  private enum PixelColor: String { case red, green, blue, black, other }
   private struct ScreenFrame {
     let image: UIImage
     let color: PixelColor
@@ -417,6 +417,334 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
   }
   private enum FixtureError: Error { case timeout(String), writerFailed }
   private var previousKeyWindow: UIWindow?
+
+
+  func testApprovedIntentRuleBackgroundReadyRetainsSavedPoster() async throws {
+    let asset = try await greenVideo()
+    let poster = image(.red)
+    let session = PlaybackSession()
+    let identity = AnyHashable(UUID())
+    defer { session.cleanup() }
+    session.load(source: PlaybackSource(identity: identity, load: { asset }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: sharedView(.inline, session: session,
+      provider: { poster }, sourceIdentity: identity))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let media = try await mountedMedia(in: host.view)
+    try await poll("background resource/item/native layer ready without Play") {
+      session.isPlayerReady && media.playerLayer.isReadyForDisplay
+    }
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertEqual(session.player.rate, 0)
+    let evidence = XCTAttachment(string: "userPlay=false; sessionRequested=\(session.isPlaybackRequested); playerRate=\(session.player.rate); itemReady=\(session.isPlayerReady); layerReady=\(media.playerLayer.isReadyForDisplay)")
+    evidence.name = "approved-background-ready-state"
+    evidence.lifetime = .keepAlways
+    add(evidence)
+    try await assertColor(.red, in: media, name: "approved-background-ready-must-still-be-saved-red-poster")
+  }
+
+  func testApprovedIntentRuleHeldResourceOffersPlayAndAcceptsIntent() async throws {
+    let asset = try await greenVideo()
+    let poster = image(.red)
+    let session = PlaybackSession()
+    let identity = AnyHashable(UUID())
+    let gate = PosterHandoffAssetGate(asset: asset)
+    defer { gate.release(); session.cleanup() }
+    session.load(source: PlaybackSource(identity: identity, load: { try await gate.load() }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: sharedView(.inline, session: session,
+      provider: { poster }, sourceIdentity: identity))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let media = try await mountedMedia(in: host.view)
+    try await poll("resource acquisition held") { gate.started }
+    XCTAssertFalse(session.hasCurrentItem)
+    try await assertColor(.red, in: media, name: "approved-resource-held-saved-poster-and-play-entry")
+    XCTAssertTrue(session.canTogglePlayback, "Saved poster must offer the Play action while background acquisition is pending")
+    session.togglePlayback()
+    let evidence = XCTAttachment(string: "userPlay=true; hasItem=\(session.hasCurrentItem); controlsAvailable=\(session.canTogglePlayback); requested=\(session.isPlaybackRequested)")
+    evidence.name = "approved-held-resource-play-state"
+    evidence.lifetime = .keepAlways
+    add(evidence)
+    XCTAssertTrue(session.isPlaybackRequested, "A Play action before item acquisition must register pending intent")
+    try await assertColor(.red, in: media, name: "approved-resource-held-after-play-saved-poster")
+  }
+
+
+
+  func testApprovedPendingPlayCancellationAndPauseKeepTheCorrectPicture() async throws {
+    let asset = try await greenVideo()
+    let poster = image(.red)
+    let session = PlaybackSession()
+    let identity = AnyHashable(UUID())
+    let gate = PosterHandoffAssetGate(asset: asset)
+    defer { gate.release(); session.cleanup() }
+    session.load(source: PlaybackSource(identity: identity, load: { try await gate.load() }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: sharedView(.inline, session: session,
+      provider: { poster }, sourceIdentity: identity))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let media = try await mountedMedia(in: host.view)
+    try await poll("pending fixture acquisition held") { gate.started }
+    XCTAssertFalse(session.isWaitingForPlayback)
+    session.togglePlayback()
+    XCTAssertTrue(session.isWaitingForPlayback)
+    try await assertColor(.red, in: media, name: "intent-pending-play-retains-red")
+    session.togglePlayback() // The same Play/Pause control cancels pending intent.
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    try await assertColor(.red, in: media, name: "intent-pending-cancel-retains-red")
+    session.togglePlayback()
+    session.togglePlayback()
+    XCTAssertFalse(session.isPlaybackRequested, "Repeated taps cannot leave a queued Play after the final cancellation")
+    gate.release()
+    try await poll("cancelled acquisition completes in background") { session.isPlayerReady }
+    try await assertColor(.red, in: media, name: "intent-cancelled-background-ready-still-red")
+    XCTAssertEqual(session.player.rate, 0)
+    XCTAssertFalse(session.hasPresentedVideo)
+    session.togglePlayback()
+    try await waitForGreen(in: media, name: "intent-first-actual-play-green")
+    XCTAssertTrue(session.hasPresentedVideo)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    session.pausePlayback()
+    try await assertColor(.green, in: media, name: "intent-first-pause-keeps-green")
+    XCTAssertTrue(session.hasPresentedVideo)
+    session.togglePlayback()
+    try await poll("native resume playing") { session.player.timeControlStatus == .playing }
+    try await assertColor(.green, in: media, name: "intent-resume-keeps-green")
+    session.pausePlayback()
+    try await assertColor(.green, in: media, name: "intent-second-pause-keeps-green")
+  }
+
+  func testApprovedPendingPlayCleanupRejectsLateAcquisitionPicture() async throws {
+    let asset = try await greenVideo()
+    let poster = image(.red)
+    let gate = PosterHandoffAssetGate(asset: asset)
+    let session = PlaybackSession()
+    defer { gate.release(); session.cleanup() }
+    session.load(source: PlaybackSource(identity: UUID(), load: { try await gate.load() }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: sharedView(.inline, session: session, provider: { poster }))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let media = try await mountedMedia(in: host.view)
+    try await poll("cleanup acquisition held") { gate.started }
+    session.togglePlayback()
+    XCTAssertTrue(session.isWaitingForPlayback)
+    session.cleanup() // The host invokes this when the playback owner leaves.
+    gate.release()
+    for _ in 0..<3 { try await nextRenderFrame() }
+    XCTAssertNil(session.currentSourceIdentity)
+    XCTAssertNil(session.player.currentItem)
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertFalse(session.hasPresentedVideo)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    XCTAssertEqual(session.player.rate, 0)
+    try await assertColor(.red, in: media, name: "intent-leave-rejects-late-green")
+  }
+
+  func testApprovedSourceSwitchRejectsOldPendingPlayAndPoster() async throws {
+    let assetA = try await greenVideo()
+    let assetB = try await solidVideo(red: 255, green: 0, blue: 0)
+    let gateA = PosterHandoffAssetGate(asset: assetA)
+    let session = PlaybackSession()
+    let identityA = AnyHashable(UUID()), identityB = AnyHashable(UUID())
+    let posterA = image(.red), posterB = image(.blue)
+    defer { gateA.release(); session.cleanup() }
+    session.load(source: PlaybackSource(identity: identityA, load: { try await gateA.load() }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: sharedView(.inline, session: session,
+      provider: { posterA }, sourceIdentity: identityA))
+    let window = try mount(host)
+    defer { unmount(window) }
+    try await poll("source A held before pending Play") { gateA.started }
+    session.togglePlayback()
+    XCTAssertTrue(session.isWaitingForPlayback)
+    host.rootView = sharedView(.inline, session: session, provider: { posterB }, sourceIdentity: identityB)
+    session.load(source: PlaybackSource(identity: identityB, load: { assetB }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let media = try await mountedMedia(in: host.view)
+    gateA.release()
+    try await poll("B ready after obsolete A completion") { session.isPlayerReady }
+    XCTAssertEqual(session.currentSourceIdentity, identityB)
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertFalse(session.hasPresentedVideo)
+    XCTAssertEqual(session.player.rate, 0)
+    try await assertColor(.blue, in: media, name: "intent-new-source-ready-stays-blue-no-obsolete-green")
+    session.togglePlayback()
+    try await waitForRedVideo(in: media, name: "intent-new-source-user-play-real-red")
+    XCTAssertTrue(session.hasPresentedVideo)
+    session.pausePlayback()
+    try await assertColor(.red, in: media, name: "intent-new-source-pause-keeps-red-video")
+  }
+
+  func testApprovedPreparationFailureKeepsPosterUntilExplicitRetryPlays() async throws {
+    let asset = try await greenVideo()
+    let poster = image(.red)
+    let session = PlaybackSession()
+    let source = PlaybackSource(identity: UUID(), load: { asset })
+    var attempts = 0
+    let retryPreparation = PosterHandoffAssetGate(asset: asset)
+    session.preparation = PlaybackPreparation(prepare: { _ in
+      attempts += 1
+      if attempts == 1 { throw NSError(domain: "NativePreparationFixture", code: 1) }
+      _ = try await retryPreparation.load()
+    }, release: { _ in })
+    defer { retryPreparation.release(); session.cleanup() }
+    session.load(source: source, playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: sharedView(.inline, session: session, provider: { poster }))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let media = try await mountedMedia(in: host.view)
+    try await poll("audio fixture native item ready") { session.isPlayerReady }
+    let item = try XCTUnwrap(session.player.currentItem)
+    session.togglePlayback()
+    try await poll("host preparation failure explicit state") { session.failure != nil }
+    XCTAssertEqual(attempts, 1)
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertFalse(session.hasPresentedVideo)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    XCTAssertEqual(session.player.rate, 0)
+    try await assertColor(.red, in: media, name: "intent-audio-failure-retains-red-not-first-frame")
+    session.togglePlayback()
+    for _ in 0..<3 { try await nextRenderFrame() }
+    XCTAssertEqual(attempts, 1, "Ordinary Play cannot silently retry failed host preparation")
+    XCTAssertTrue(session.player.currentItem === item)
+    session.retryPlaybackPreparation() // This is the App's explicit Retry route for audio preparation failure.
+    try await poll("retry audio preparation awaiting host") { retryPreparation.started }
+    XCTAssertTrue(session.isWaitingForPlayback)
+    XCTAssertTrue(session.isPlayerReady)
+    XCTAssertTrue(media.playerLayer.isReadyForDisplay)
+    XCTAssertFalse(session.hasPresentedVideo)
+    XCTAssertEqual(session.player.rate, 0)
+    try await assertColor(.red, in: media, name: "intent-audio-retry-native-ready-but-not-playing-stays-red")
+    retryPreparation.release()
+    try await waitForGreen(in: media, name: "intent-explicit-audio-retry-actual-green")
+    XCTAssertEqual(attempts, 2)
+    XCTAssertTrue(session.player.currentItem === item, "Audio retry preserves the prepared media")
+    XCTAssertTrue(session.hasPresentedVideo)
+    session.pausePlayback()
+    try await assertColor(.green, in: media, name: "intent-audio-retry-pause-keeps-green")
+  }
+
+
+  func testApprovedNeverPlayedInlineFullscreenRoundTripKeepsSavedPoster() async throws {
+    let asset = try await greenVideo()
+    let poster = image(.red)
+    let session = PlaybackSession()
+    defer { session.cleanup() }
+    session.load(source: PlaybackSource(identity: UUID(), load: { asset }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: sharedView(.inline, session: session, provider: { poster }))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let inline = try await mountedMedia(in: host.view)
+    try await poll("never-played inline native ready") {
+      session.isPlayerReady && inline.playerLayer.isReadyForDisplay
+    }
+    try await assertColor(.red, in: inline, name: "intent-never-played-inline-ready-red")
+    host.rootView = sharedView(.fullscreen, session: session, provider: { poster })
+    let fullscreen = try await mountedMedia(in: host.view)
+    try await poll("never-played fullscreen native ready") { fullscreen.playerLayer.isReadyForDisplay }
+    try await assertColor(.red, in: fullscreen, name: "intent-never-played-fullscreen-ready-red")
+    XCTAssertFalse(session.isPlaybackRequested)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    XCTAssertFalse(session.hasPresentedVideo)
+    host.rootView = sharedView(.inline, session: session, provider: { poster })
+    let returned = try await mountedMedia(in: host.view)
+    try await poll("never-played return inline native ready") { returned.playerLayer.isReadyForDisplay }
+    try await assertColor(.red, in: returned, name: "intent-never-played-return-inline-red")
+    session.togglePlayback()
+    try await waitForGreen(in: returned, name: "intent-after-roundtrip-first-play-green")
+    XCTAssertTrue(session.hasPresentedVideo)
+  }
+
+
+  func testApprovedFastPauseBeforeDeferredHandoffStillSurvivesFullscreenTransfer() async throws {
+    let asset = try await greenVideo()
+    let poster = image(.red)
+    let session = PlaybackSession()
+    defer { session.cleanup() }
+    session.load(source: PlaybackSource(identity: UUID(), load: { asset }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: sharedView(.inline, session: session, provider: { poster }))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let inline = try await mountedMedia(in: host.view)
+    try await poll("fast-pause item and native layer ready") {
+      session.isPlayerReady && inline.playerLayer.isReadyForDisplay
+    }
+    let nativePoster = try XCTUnwrap(inline.subviews.compactMap { $0 as? UIImageView }
+      .first { $0.image === poster })
+    let observation = nativePoster.observe(\.isHidden, options: [.new]) { [weak session] _, change in
+      guard change.newValue == true, Thread.isMainThread else { return }
+      MainActor.assumeIsolated {
+        guard let session, session.isPlaybackRequested else { return }
+        // Native handoff has happened, but its deferred session publication has not.
+        session.pausePlayback()
+      }
+    }
+    defer { observation.invalidate() }
+    session.togglePlayback()
+    try await poll("native handoff followed by immediate pause and deferred publication") {
+      !session.isPlaybackRequested && session.hasPresentedVideo
+    }
+    XCTAssertEqual(session.player.rate, 0)
+    try await assertColor(.green, in: inline, name: "intent-fast-pause-before-deferred-publication-green")
+    host.rootView = sharedView(.fullscreen, session: session, provider: { poster })
+    let fullscreen = try await mountedMedia(in: host.view)
+    try await waitForGreen(in: fullscreen, name: "intent-fast-pause-fullscreen-no-red", allowing: [.green])
+    XCTAssertTrue(session.hasPresentedVideo)
+    XCTAssertFalse(session.isPlaybackRequested)
+  }
+
+
+  func testApprovedCleanupReloadOfSameIdentityRejectsOldDeferredHandoff() async throws {
+    let asset = try await greenVideo()
+    let poster = image(.red)
+    let identity = AnyHashable(UUID())
+    let reloadGate = PosterHandoffAssetGate(asset: asset)
+    let session = PlaybackSession()
+    let reloadSource = PlaybackSource(identity: identity, load: { try await reloadGate.load() })
+    defer { reloadGate.release(); session.cleanup() }
+    session.load(source: PlaybackSource(identity: identity, load: { asset }),
+      playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+    let host = UIHostingController(rootView: sharedView(.inline, session: session,
+      provider: { poster }, sourceIdentity: identity))
+    let window = try mount(host)
+    defer { unmount(window) }
+    let media = try await mountedMedia(in: host.view)
+    try await poll("old source native ready before ABA handoff") {
+      session.isPlayerReady && media.playerLayer.isReadyForDisplay
+    }
+    let nativePoster = try XCTUnwrap(media.subviews.compactMap { $0 as? UIImageView }
+      .first { $0.image === poster })
+    let observation = nativePoster.observe(\.isHidden, options: [.new]) { [weak session] _, change in
+      guard change.newValue == true, Thread.isMainThread else { return }
+      MainActor.assumeIsolated {
+        guard let session, session.isPlaybackRequested else { return }
+        // The prior visit's display report is queued but has not been published.
+        session.cleanup()
+        session.load(source: reloadSource, playbackRate: 1, isLooping: true, autoplayWhenReady: false)
+      }
+    }
+    defer { observation.invalidate() }
+    session.togglePlayback()
+    try await poll("same identity reload held after prior visit's native handoff") { reloadGate.started }
+    for _ in 0..<3 { try await nextRenderFrame() }
+    XCTAssertFalse(session.hasPresentedVideo, "A matching identity cannot adopt an old visit's queued display fact")
+    XCTAssertFalse(session.isPlaybackRequested)
+    try await assertColor(.red, in: media, name: "intent-same-identity-new-visit-rejects-old-deferred-green")
+    reloadGate.release()
+    try await poll("new visit becomes ready in background") { session.isPlayerReady }
+    try await assertColor(.red, in: media, name: "intent-same-identity-new-visit-ready-still-red")
+    observation.invalidate()
+    session.togglePlayback()
+    try await waitForGreen(in: media, name: "intent-same-identity-new-visit-user-play-green")
+    XCTAssertTrue(session.hasPresentedVideo)
+  }
 
   func testSharedInlineExpectedSourceChangeMasksReadyPreviousVideoUntilNewSourceReady() async throws {
     try await assertExpectedSourceChange(.inline)
@@ -521,7 +849,9 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     defer { unmount(window) }
     let mediaA = try await mountedMedia(in: host.view)
     let stage = mode.rawValue + "-expected-source-A-to-B"
+    session.togglePlayback()
     try await waitForGreen(in: mediaA, name: stage + "-A-ready-real-green")
+    session.pausePlayback()
     let itemA = try XCTUnwrap(session.player.currentItem)
     XCTAssertTrue(session.isPlayerReady)
     // Host metadata changes first. The session is deliberately still ready for A.
@@ -550,7 +880,11 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     XCTAssertNil(session.player.currentItem)
     XCTAssertNil(mediaB.playerLayer.player)
     gateB.release()
+    try await poll("B acquired in background before explicit Play") { session.isPlayerReady }
+    try await assertColor(.blue, in: mediaB, name: stage + "-B-ready-before-play-still-blue")
+    session.togglePlayback()
     try await waitForRedVideo(in: mediaB, name: stage + "-B-ready-real-red")
+    session.pausePlayback()
     XCTAssertTrue(session.isPlayerReady)
     XCTAssertTrue(mediaB.playerLayer.isReadyForDisplay)
     XCTAssertTrue(mediaB.playerLayer.player === session.player)
@@ -578,6 +912,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     defer { unmount(window) }
     let media = try await mountedMedia(in: host.view)
     let stage = mode.rawValue + "-cleanup-same-source-reload"
+    session.togglePlayback()
     try await waitForGreen(in: media, name: stage + "-before-cleanup-real-green")
     let original = try XCTUnwrap(session.player.currentItem)
     session.cleanup()
@@ -593,6 +928,9 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     XCTAssertNil(session.player.currentItem)
     XCTAssertNil(media.playerLayer.player)
     reloadGate.release()
+    try await poll("same source background reload ready") { session.isPlayerReady }
+    try await assertColor(.red, in: media, name: stage + "-reloaded-ready-before-play-red")
+    session.togglePlayback()
     try await waitForGreen(in: media, name: stage + "-reloaded-same-resource-real-green")
     XCTAssertTrue(session.isPlayerReady)
     XCTAssertTrue(media.playerLayer.isReadyForDisplay)
@@ -771,7 +1109,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
       bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue))
     context.draw(crop, in: CGRect(x: 0, y: 0, width: 12, height: 12))
     let bytes = try XCTUnwrap(context.data).assumingMemoryBound(to: UInt8.self)
-    var red = 0, green = 0, blue = 0
+    var red = 0, green = 0, blue = 0, black = 0
     for pixel in 0..<144 { red += Int(bytes[pixel * 4]); green += Int(bytes[pixel * 4 + 1]); blue += Int(bytes[pixel * 4 + 2]) }
     return (Double(red) / 144, Double(green) / 144, Double(blue) / 144)
   }
@@ -820,6 +1158,10 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     try await poll("production source ready for real scrub") {
       session.canUsePlaybackControls && session.durationSeconds > 0
     }
+    // Paused after actual playback differs from a source that has merely become ready.
+    session.togglePlayback()
+    try await waitForGreen(in: media, name: stage + "-first-actual-play-before-paused-HQ")
+    session.pausePlayback()
     let pausedPosition = session.durationSeconds * 0.25
     session.handleScrubEditingChanged(true)
     session.setScrubProgress(0.25)
@@ -1149,6 +1491,9 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
       XCTAssertTrue(session.thumbnailImage === poster)
       try await assertColor(.red, in: media, name: "\(mode.rawValue)-held-validation-default-red")
       validationGate.release()
+      try await poll("validated source ready without Play") { session.isPlayerReady }
+      try await assertColor(.red, in: media, name: "\(mode.rawValue)-validated-ready-before-play-red")
+      session.togglePlayback()
       try await waitForGreen(in: media, name: "\(mode.rawValue)-default-poster-to-real-green")
       XCTAssertTrue(session.isPlayerReady)
       XCTAssertTrue(media.playerLayer.isReadyForDisplay)
@@ -1183,10 +1528,16 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
       host.rootView = sharedView(mode, session: session, provider: { nil })
       let media = try await mountedMedia(in: host.view)
       media.backgroundColor = .blue
-      try await assertColor(.blue, in: media, name: "\(mode.rawValue)-authoritative-nil-positive-blue")
+      try await assertColor(.black, in: media, name: "\(mode.rawValue)-authoritative-nil-neutral-black-before-play")
       XCTAssertTrue(session.thumbnailImage === obsoletePoster, "The obsolete thumbnail still exists in the session")
       validationGate.release()
-      try await waitForGreen(in: media, name: "\(mode.rawValue)-authoritative-nil-real-green", allowing: [.blue, .green])
+      try await poll("authoritative nil source ready without user Play") {
+        session.isPlayerReady && media.playerLayer.isReadyForDisplay
+      }
+      try await assertColor(.black, in: media, name: "\(mode.rawValue)-authoritative-nil-native-ready-still-black")
+      XCTAssertFalse(session.hasPresentedVideo)
+      session.togglePlayback()
+      try await waitForGreen(in: media, name: "\(mode.rawValue)-authoritative-nil-real-green", allowing: [.black, .green])
     }
   }
 
@@ -1205,12 +1556,15 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let inline = try await mountedMedia(in: host.view)
     try await assertColor(.red, in: inline, name: "shared-inline-current-provider-red-while-preparing")
     gate.release()
+    session.togglePlayback()
     try await waitForGreen(in: inline, name: "shared-inline-before-transfer-green")
+    session.pausePlayback()
+    XCTAssertTrue(session.hasPresentedVideo)
     let item = try XCTUnwrap(session.player.currentItem)
     host.rootView = sharedView(.fullscreen, session: session, provider: { poster })
     let fullscreen = try await mountedMedia(in: host.view)
     XCTAssertFalse(fullscreen === inline, "Fullscreen owns a newly mounted native layer")
-    try await waitForGreen(in: fullscreen, name: "shared-new-fullscreen-handoff")
+    try await waitForGreen(in: fullscreen, name: "shared-new-fullscreen-handoff", allowing: [.green])
     XCTAssertNil(inline.playerLayer.player, "SwiftUI dismantle must detach the previous inline layer")
     XCTAssertTrue(fullscreen.playerLayer.player === session.player)
     XCTAssertTrue(session.player.currentItem === item)
@@ -1218,7 +1572,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let returnedInline = try await mountedMedia(in: host.view)
     XCTAssertFalse(returnedInline === inline)
     XCTAssertFalse(returnedInline === fullscreen)
-    try await waitForGreen(in: returnedInline, name: "shared-new-return-inline-handoff")
+    try await waitForGreen(in: returnedInline, name: "shared-new-return-inline-handoff", allowing: [.green])
     XCTAssertNil(fullscreen.playerLayer.player)
     XCTAssertTrue(returnedInline.playerLayer.player === session.player)
     XCTAssertTrue(session.player.currentItem === item)
@@ -1250,6 +1604,9 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
       XCTAssertEqual(sourceThumbnailRequests, 0)
       XCTAssertFalse(session.hasCurrentItem)
       gate.release()
+      try await poll("current provider's source ready before Play") { session.isPlayerReady }
+      try await assertColor(.blue, in: media, name: "\(mode.rawValue)-current-provider-ready-before-play-blue")
+      session.togglePlayback()
       try await waitForGreen(in: media, name: "\(mode.rawValue)-current-provider-to-real-green", allowing: [.blue, .green])
       try await poll("obsolete source thumbnail delivered after acquisition") { session.thumbnailImage === obsoletePoster }
     }
@@ -1651,16 +2008,17 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
       bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue))
     context.draw(crop, in: CGRect(x: 0, y: 0, width: 12, height: 12))
     let bytes = try XCTUnwrap(context.data).assumingMemoryBound(to: UInt8.self)
-    var red = 0, green = 0, blue = 0
+    var red = 0, green = 0, blue = 0, black = 0
     for pixel in 0..<144 {
       let r = bytes[pixel * 4], g = bytes[pixel * 4 + 1], b = bytes[pixel * 4 + 2]
       if r > 200 && g < 70 && b < 70 { red += 1 }
       if g > 170 && r < 80 && b < 80 { green += 1 }
       if b > 200 && r < 70 && g < 70 { blue += 1 }
+      if r < 35 && g < 35 && b < 35 { black += 1 }
     }
-    let color: PixelColor = red >= 137 ? .red : green >= 137 ? .green : blue >= 137 ? .blue : .other
+    let color: PixelColor = red >= 137 ? .red : green >= 137 ? .green : blue >= 137 ? .blue : black >= 137 ? .black : .other
     return ScreenFrame(image: normalized, color: color,
-      description: "ROI=\(screenRect); red=\(red)/144 green=\(green)/144 blue=\(blue)/144\n\(captureEvidence)")
+      description: "ROI=\(screenRect); red=\(red)/144 green=\(green)/144 blue=\(blue)/144 black=\(black)/144\n\(captureEvidence)")
   }
 
   private func nativeFacts(in view: UIView) -> NativeFacts {
