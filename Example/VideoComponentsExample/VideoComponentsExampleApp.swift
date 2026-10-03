@@ -76,7 +76,7 @@ private struct VideoComponentsDemo: View {
     VStack(alignment: .leading, spacing: 12) {
       Text("Choose a frame").font(.headline)
       VideoFramePickerView(
-        source: VideoFramePickerSource(identity: url, load: { AVURLAsset(url: url) }),
+        source: VideoFramePickerSource(identity: url, load: { .init(asset: AVURLAsset(url: url)) }),
         onSelection: { selection in
           try media.acceptSelection(selection, for: url)
         }

@@ -18,7 +18,9 @@ for name in IsolatedConsumer Metadata.log PackageTests.log ConsumerTests.log \
   ConsumerDeviceDerivedData ConsumerSimulatorBuild.log ConsumerDeviceBuild.log \
   CaptureScreens CaptureDriver.log \
   PlaybackOnlyDerivedData ProcessingOnlyDerivedData FramePickerOnlyDerivedData \
-  PlaybackOnlyBuild.log ProcessingOnlyBuild.log FramePickerOnlyBuild.log; do
+  PlaybackOnlyBuild.log ProcessingOnlyBuild.log FramePickerOnlyBuild.log \
+  ResourcesOnlyDerivedData ResourcesPlaybackOnlyDerivedData ResourcesFramesOnlyDerivedData \
+  ResourcesOnlyBuild.log ResourcesPlaybackOnlyBuild.log ResourcesFramesOnlyBuild.log; do
   if [ -e "$result_dir/$name" ]; then
     printf 'error: refusing to overwrite %s\n' "$result_dir/$name" >&2
     exit 1
@@ -50,7 +52,7 @@ print("Simulator OS build: " + runtime["buildversion"])
 } 2>&1 | tee "$result_dir/Metadata.log"
 
 # Each consumer references exactly one product from the same external package copy.
-for product in Playback Processing FramePicker; do
+for product in Playback Processing FramePicker Resources ResourcesPlayback ResourcesFrames; do
   (
     cd "$isolated/${product}OnlyConsumer"
     xcodebuild -jobs "$jobs" -scheme "${product}OnlyConsumer" \
@@ -63,8 +65,16 @@ from pathlib import Path
 import sys
 products = Path(sys.argv[1])
 product = "Video" + sys.argv[2]
-all_products = {"VideoPlayback", "VideoProcessing", "VideoFramePicker"}
-expected = all_products if product == "VideoFramePicker" else {product}
+all_products = {"VideoResources", "VideoResourcesPlayback", "VideoResourcesFrames",
+                "VideoPlayback", "VideoProcessing", "VideoFramePicker"}
+expected = {
+    "VideoPlayback": {"VideoPlayback"},
+    "VideoProcessing": {"VideoProcessing"},
+    "VideoFramePicker": {"VideoPlayback", "VideoProcessing", "VideoFramePicker"},
+    "VideoResources": {"VideoResources"},
+    "VideoResourcesPlayback": {"VideoResources", "VideoPlayback", "VideoResourcesPlayback"},
+    "VideoResourcesFrames": {"VideoResources", "VideoPlayback", "VideoProcessing", "VideoFramePicker", "VideoResourcesFrames"},
+}[product]
 for name in sorted(expected):
     if not (products / (name + ".swiftmodule")).exists():
         raise SystemExit("error: expected product was not built: " + name)

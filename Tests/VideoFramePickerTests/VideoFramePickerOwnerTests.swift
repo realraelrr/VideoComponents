@@ -106,7 +106,7 @@ final class VideoFramePickerOwnerTests: XCTestCase {
     fixture.owner.changeSeconds(2, callbacks: fixture.callbacks)
     try await waitForPicker { fixture.frames.requests.count == 2 }
     fixture.owner.start(
-      source: VideoFramePickerSource(identity: "video", load: { XCTFail("Same identity reloaded"); return fixture.asset }),
+      source: VideoFramePickerSource(identity: "video", load: { XCTFail("Same identity reloaded"); return .init(asset: fixture.asset) }),
       initialTime: 8, maximumFrameSize: CGSize(width: 64, height: 64), onFailure: { _ in }
     )
     fixture.frames.succeed(1)
@@ -223,7 +223,7 @@ final class VideoFramePickerOwnerTests: XCTestCase {
     let loader = PickerGate<AVAsset>()
     defer { fixture.stop(); loader.finish(.success(fixture.asset)) }
     fixture.owner.start(
-      source: VideoFramePickerSource(identity: "A", load: loader.run),
+      source: VideoFramePickerSource(identity: "A", load: { .init(asset: try await loader.run()) }),
       initialTime: nil, maximumFrameSize: CGSize(width: 1280, height: 1280),
       onFailure: { _ in XCTFail("Original A cannot publish") }
     )

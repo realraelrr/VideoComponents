@@ -6,6 +6,7 @@ iOS libraries for AVFoundation video and finite Photos/local-file resource acqui
 | --- | --- | --- |
 | `VideoResources` | Finite shareable acquisition, actual asset/audio-mix receipts, Photos authority and verified local-file facts | Apple frameworks only |
 | `VideoResourcesPlayback` | One session's acquisition shares and independent representation installation | `VideoResources`, `VideoPlayback` |
+| `VideoResourcesFrames` | Stateless picker loading, frame extraction and export carrying actual receipts | `VideoResources`, `VideoPlayback`, `VideoProcessing`, `VideoFramePicker` |
 | `VideoPlayback` | A playback session, inline/fullscreen SwiftUI views, zoom and transport gestures, an independent seek coordinator, localized controls | Apple frameworks only |
 | `VideoProcessing` | Frame extraction, automatic poster selection, slow MP4 export | Apple frameworks only |
 | `VideoFramePicker` | A paused SwiftUI preview and time slider that asynchronously delivers exact user-selected frames | `VideoPlayback`, `VideoProcessing` |
@@ -127,7 +128,7 @@ For a separate manual-frame preview, `VideoSeekCoordinator` borrows an independe
 
 ## Optional resource ownership (current unreleased main)
 
-`VideoResources` and `VideoResourcesPlayback`, together with the single `PlaybackLoadedMedia` API, are changes on main. Existing release tags retain their previous APIs. An app using the old raw-asset loader must adapt its load/access/replacement call sites before selecting this revision; the changes are not a transparent dependency update.
+`VideoResources`, `VideoResourcesPlayback` and `VideoResourcesFrames`, together with the single `PlaybackLoadedMedia` API for playback and picker loaders, are changes on main. Existing release tags retain their previous APIs. An app using the old raw-asset loader must adapt its playback load/access/replacement and picker load call sites before selecting this revision; the changes are not a transparent dependency update.
 
 A host retains one `VideoResources` for sources that should share acquisition. A source has a stable Photos cloud reference or a host key identifying a complete immutable file descriptor. The file verifier must inspect an already materialized local file and return the facts from that integrity check. It must not download or make account decisions. Core file checks are observational facts, not an atomic lease on future AVFoundation reads.
 
@@ -154,9 +155,40 @@ Audio preparation Retry calls the native preparation path with zero resource acq
 
 The DanceCheckin production resolver has not been migrated to these products. Its eventual cutover must replace every resource consumer together: playback, editor/frame selection, HQ/export, draft preview and save. Remove the old resolver's acquisition task/cache, owner/consumer bookkeeping, preferred/revision facts and global retry startup with that switch. Retain host resource mapping, local Store integrity/materialization, Photos authorization interactions, account isolation, audio FIFO, poster masters/thumbnail cache, cancellation at final business mutations and the actual feature-exit boundary. Do not copy the isolated HostHarness Store into production or operate two source authorities for one media identity.
 
+## Optional frame and export receipts
+
+`VideoResourcesFrames` has three stateless entry points. `pickerSource(source:identity:request:)`
+constructs a native picker source without acquiring; the mounted native Owner's actual
+loader task obtains a finite receipt. Its media validator captures that receipt, not
+`source.preferred`. Different mounted pickers withdraw only their own shares.
+
+`frame(source:request:at:maximumSize:exact:)` returns `(frame, receipt)` and
+`export(source:rate:outputDirectory:onProgress:)` returns `(url, receipt)`.
+They check cancellation and the actual receipt around processing. Export requests
+highest quality, removes its unique output if final validation fails, and transfers
+ownership only on successful return. Native completion progress is held until the
+receipt gate; host progress callbacks are followed by another gate. After transfer,
+the host owns saving or deleting the output and must recheck the same receipt plus
+its destination/token after any permission or file I/O await. Consumer failure does
+not invalidate the shared source.
+
+This adapter does not apply a Photos audio mix to the exporter's rebuilt, slowed
+composition. A valid asset/mix receipt is not evidence of rendered mix preservation.
+Automatic poster generation stays in the host's existing service: acquire highest
+with network forbidden, inspect the actual asset's local backing (including edited
+composition segments), select, promote, then validate the same receipt at the final
+business CAS. No automatic-poster wrapper skips that host policy.
+
+A stateless source factory and use-boundary validator do not immediately detach an
+idle paused preview on external permission/content revocation. The host must connect
+its authority refresh to the existing mounted owner's lifecycle. Progress and HQ
+preferred updates must not change picker identity or trigger another acquisition.
+These UI refresh and per-playback HQ progress/classification seams remain prerequisites
+for the DanceCheckin App cutover; the App has not selected this package revision.
+
 ## Manual frame selection
 
-The picker owns its paused player, seeks, frame requests and cancellation. Its source borrows an asset from the host; it never cancels loading on that asset. Ordinary `import VideoFramePicker` is sufficient:
+The picker owns its paused player, seeks, frame requests and cancellation. Its source borrows actual loaded media from the host; it never cancels loading on that asset. Ordinary `import VideoFramePicker` is sufficient:
 
 ```swift
 import AVFoundation
@@ -170,12 +202,13 @@ struct FrameSelectionExample: View {
 
   var body: some View {
     VideoFramePickerView(
-      source: VideoFramePickerSource(identity: fileURL, load: { AVURLAsset(url: fileURL) }),
+      source: VideoFramePickerSource(identity: fileURL, load: { .init(asset: AVURLAsset(url: fileURL)) }),
       initialTime: 0,
       maximumFrameSize: CGSize(width: 1280, height: 1280),
       onSelectionActivityChanged: { isSelecting = $0 },
       onSelection: { frame in
         try Task.checkCancellation()
+        try frame.validate()
         selectedFrame = frame
       }
     )
@@ -187,7 +220,7 @@ The initial preview never invokes `onSelection`. Touching the slider without cha
 
 The paused player is shown as soon as the source installs, while the initial exact frame is still decoding. Inspection checks duration and the video track; `isReadable` is not an image-generator capability requirement. An optional `statusOverlay` closure receives `VideoFramePickerSourceStatus.loading`, `.ready` or `.failed(failure)` so a host can reuse its source progress and error presentation. Supplying it replaces the default source spinner and source-error text. Exact-frame and selection-processing failures retain the picker's localized feedback. The component's source loader remains the sole loading entry point.
 
-`onSelection` is an `@MainActor` async throwing callback executed in the picker's cancellable task. Keep any asynchronous preparation inside that callback. After every suspension and immediately before the final visible or persistent mutation, the host must check cancellation and confirm the destination identity is still current. Cancellation cannot roll back a host write that already happened. `VideoFrameSelection.image` is a `CGImage`; retain `requestedSeconds` and `actualTime` separately because native decoding may choose a different encoded timestamp, including at the duration endpoint.
+`onSelection` is an `@MainActor` async throwing callback executed in the picker's cancellable task. Keep any asynchronous preparation inside that callback. After every suspension and immediately before the final visible or persistent mutation, the host must call `selection.validate()`, check cancellation and confirm the destination identity is still current. The validation retains that exact media and the weak picker scope; closing, replacing the source or starting a newer request cancels old selections. Validators are checked before and after synchronous reentry. Cancellation cannot roll back a host write that already happened. `VideoFrameSelection.image` is a `CGImage`; retain `requestedSeconds` and `actualTime` separately because native decoding may choose a different encoded timestamp, including at the duration endpoint.
 
 Source identity covers both the media and its selection destination. Change it when either changes. The loader, initial time and frame size are captured for that identity; changing just their values does not reload a mounted picker. Selection and failure callbacks are captured at each user value change, so a pending selection retains the callbacks that accepted it. Disappearance and source replacement cancel old work and reject late results, including A → B → A replacement.
 
@@ -239,7 +272,7 @@ VIDEO_COMPONENTS_SIMULATOR_ID="<allocated iPhone Simulator UUID>" \
 
 Optional variables are `VIDEO_COMPONENTS_RESULTS_DIR` (a fresh result directory outside the repository) and `VIDEO_COMPONENTS_JOBS` (default `2`). Existing results are never overwritten. Coordinate Simulator use with other test runs.
 
-The script copies the package and public example to an external directory. It builds Playback-only, Processing-only and FramePicker-only public consumers. Playback-only and Processing-only must not build the other product or the picker; FramePicker-only must build all three. It then runs the `VideoComponents-Package` aggregate test scheme, the example's runtime resource tests, and generic iOS/Simulator example builds. Product schemes are for building products; they do not provide the package test actions.
+The script copies the package and public example to an external directory. It builds six isolated public consumers and checks their exact module boundaries. Playback-only and Processing-only build only their native product; FramePicker-only composes both. Resources-only builds only the core, ResourcesPlayback-only adds native playback and its binding, and ResourcesFrames-only adds native playback/processing/picker and the frames binding without the playback binding. It then runs the `VideoComponents-Package` aggregate test scheme, the example's runtime resource tests, and generic iOS/Simulator example builds. Product schemes are for building products; they do not provide the package test actions.
 
 The consumer action also runs poster handoff tests. `verify.sh` starts a bounded `simctl` screenshot driver for the allocated Simulator, supplies its fresh capture directory to the test host, and stops it after testing. Requests, native readiness facts and PNGs remain in `CaptureScreens`; driver errors remain in `CaptureDriver.log`. Tests first calibrate real red poster and green video pixels, then cover readiness ordering, layer transfer, replacement, cleanup, missing poster and an authoritative nil provider. Missing capture evidence fails the test. Product code has no capture protocol or test timing behavior.
 

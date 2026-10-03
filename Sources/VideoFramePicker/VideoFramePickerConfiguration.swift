@@ -1,8 +1,9 @@
 import AVFoundation
 import CoreGraphics
 import SwiftUI
+import VideoPlayback
 
-/// A stable media and selection-target identity with a borrowed asset loader.
+/// A stable media and selection-target identity with a borrowed media loader.
 ///
 /// Change identity when the media or the destination for a selection changes.
 /// Updating the loader alone does not reload an already mounted session. The
@@ -10,11 +11,11 @@ import SwiftUI
 @MainActor
 public struct VideoFramePickerSource {
   let identity: AnyHashable
-  let load: @MainActor () async throws -> AVAsset
+  let load: @MainActor () async throws -> PlaybackLoadedMedia
 
   public init<ID: Hashable>(
     identity: ID,
-    load: @escaping @MainActor () async throws -> AVAsset
+    load: @escaping @MainActor () async throws -> PlaybackLoadedMedia
   ) {
     self.identity = AnyHashable(identity)
     self.load = load
@@ -26,6 +27,23 @@ public struct VideoFrameSelection: Sendable {
   public let image: CGImage
   public let requestedSeconds: Double
   public let actualTime: CMTime
+  private let validation: @MainActor @Sendable () throws -> Void
+
+  public init(
+    image: CGImage, requestedSeconds: Double, actualTime: CMTime,
+    validate: @escaping @MainActor @Sendable () throws -> Void = {}
+  ) {
+    self.image = image
+    self.requestedSeconds = requestedSeconds
+    self.actualTime = actualTime
+    validation = validate
+  }
+
+  /// Check immediately before committing output derived from this selection.
+  @MainActor
+  public func validate() throws {
+    try validation()
+  }
 }
 
 /// Source preparation is independent of exact frame extraction and host consumption.

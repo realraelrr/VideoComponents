@@ -12,7 +12,7 @@ final class VideoFramePickerMediaTests: XCTestCase {
     try await asset.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: source, at: .zero)
     let owner = VideoFramePickerOwner()
     defer { owner.stop() }
-    owner.start(source: VideoFramePickerSource(identity: "composition", load: { asset }),
+    owner.start(source: VideoFramePickerSource(identity: "composition", load: { .init(asset: asset) }),
       initialTime: 0, maximumFrameSize: CGSize(width: 1280, height: 1280), onFailure: { _ in })
     try await waitForPicker { owner.preview != nil || owner.failure != nil }
     XCTAssertNil(owner.failure)
@@ -26,7 +26,7 @@ final class VideoFramePickerMediaTests: XCTestCase {
       let asset = try await makeVideo(width: width, height: height, frameCount: 1, rotated: rotated)
       let owner = VideoFramePickerOwner()
       owner.start(
-        source: VideoFramePickerSource(identity: UUID(), load: { asset }),
+        source: VideoFramePickerSource(identity: UUID(), load: { .init(asset: asset) }),
         initialTime: 0, maximumFrameSize: CGSize(width: 1280, height: 1280), onFailure: { _ in }
       )
       try await waitForPicker { owner.preview != nil || owner.failure != nil }
@@ -53,7 +53,7 @@ final class VideoFramePickerMediaTests: XCTestCase {
     defer { owner.stop() }
     var selections: [VideoFrameSelection] = []
     owner.start(
-      source: VideoFramePickerSource(identity: "real", load: { asset }),
+      source: VideoFramePickerSource(identity: "real", load: { .init(asset: asset) }),
       initialTime: 0, maximumFrameSize: CGSize(width: 1280, height: 1280), onFailure: { _ in }
     )
     try await waitForPicker { owner.preview != nil || owner.failure != nil }
@@ -79,7 +79,7 @@ final class VideoFramePickerMediaTests: XCTestCase {
     defer { owner.stop() }
     var selection: VideoFrameSelection?
     owner.start(
-      source: VideoFramePickerSource(identity: "endpoint", load: { asset }),
+      source: VideoFramePickerSource(identity: "endpoint", load: { .init(asset: asset) }),
       initialTime: 0, maximumFrameSize: CGSize(width: 1280, height: 1280), onFailure: { _ in }
     )
     try await waitForPicker { owner.preview != nil || owner.failure != nil }
@@ -105,7 +105,7 @@ final class VideoFramePickerMediaTests: XCTestCase {
     for asset in [AVMutableComposition(), AVURLAsset(url: badURL)] as [AVAsset] {
       let owner = VideoFramePickerOwner()
       owner.start(
-        source: VideoFramePickerSource(identity: UUID(), load: { asset }),
+        source: VideoFramePickerSource(identity: UUID(), load: { .init(asset: asset) }),
         initialTime: 0, maximumFrameSize: CGSize(width: 1280, height: 1280), onFailure: { _ in }
       )
       try await waitForPicker { owner.failure != nil }

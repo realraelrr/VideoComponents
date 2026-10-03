@@ -148,7 +148,7 @@ final class VideoFramePickerBoundaryTests: XCTestCase {
     owner.start(
       source: VideoFramePickerSource(identity: UUID(), load: {
         XCTFail("Invalid configuration called the loader", file: file, line: line)
-        return AVMutableComposition()
+        return .init(asset: AVMutableComposition())
       }),
       initialTime: initialTime, maximumFrameSize: maximumSize, onFailure: { failure = $0 }
     )

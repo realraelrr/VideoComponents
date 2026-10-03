@@ -11,7 +11,7 @@ final class VideoFramePickerLifecycleTests: XCTestCase {
     weak var weakOwner = owner
     defer { loader.finish(.success(asset)) }
     owner?.start(
-      source: VideoFramePickerSource(identity: "video", load: loader.run),
+      source: VideoFramePickerSource(identity: "video", load: { .init(asset: try await loader.run()) }),
       initialTime: nil, maximumFrameSize: CGSize(width: 1280, height: 1280),
       onFailure: { _ in XCTFail("Released owner cannot publish") }
     )
@@ -30,7 +30,7 @@ final class VideoFramePickerLifecycleTests: XCTestCase {
     weak var weakOwner = owner
     defer { metadata.finish(.success(CMTime(seconds: 10, preferredTimescale: 600))) }
     owner?.start(
-      source: VideoFramePickerSource(identity: "video", load: { asset }),
+      source: VideoFramePickerSource(identity: "video", load: { .init(asset: asset) }),
       initialTime: nil, maximumFrameSize: CGSize(width: 1280, height: 1280),
       onFailure: { _ in XCTFail("Released owner cannot publish") }
     )
@@ -50,7 +50,7 @@ final class VideoFramePickerLifecycleTests: XCTestCase {
     weak var weakOwner = owner
     defer { frames.finishOutstanding() }
     owner?.start(
-      source: VideoFramePickerSource(identity: "video", load: { asset }),
+      source: VideoFramePickerSource(identity: "video", load: { .init(asset: asset) }),
       initialTime: nil, maximumFrameSize: CGSize(width: 1280, height: 1280),
       onFailure: { _ in XCTFail("Released owner cannot publish") }
     )
@@ -75,7 +75,7 @@ final class VideoFramePickerLifecycleTests: XCTestCase {
     weak var weakOwner = owner
     defer { frames.finishOutstanding(); consumer.finish(.success(())) }
     owner?.start(
-      source: VideoFramePickerSource(identity: "video", load: { asset }),
+      source: VideoFramePickerSource(identity: "video", load: { .init(asset: asset) }),
       initialTime: nil, maximumFrameSize: CGSize(width: 1280, height: 1280), onFailure: { _ in }
     )
     try await waitForPicker { frames.requests.count == 1 }
@@ -117,7 +117,7 @@ final class VideoFramePickerLifecycleTests: XCTestCase {
     defer { owner.stop(); loader.finish(.failure(PickerTestError.failed)) }
     var failureCount = 0
     owner.start(
-      source: VideoFramePickerSource(identity: "video", load: loader.run),
+      source: VideoFramePickerSource(identity: "video", load: { .init(asset: try await loader.run()) }),
       initialTime: nil, maximumFrameSize: CGSize(width: 1280, height: 1280),
       onFailure: { _ in failureCount += 1 }
     )

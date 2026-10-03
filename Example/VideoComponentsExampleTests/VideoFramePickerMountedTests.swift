@@ -196,7 +196,7 @@ private struct MountedPickerHost: View {
         source: VideoFramePickerSource(identity: "mounted") { [weak model] in
           guard let model else { throw CancellationError() }
           model.loadCount += 1
-          return model.asset
+          return .init(asset: model.asset)
         },
         onSelectionActivityChanged: { [weak model] in model?.activity.append($0) },
         onFailure: { [weak model] in model?.failures.append($0) },
@@ -217,7 +217,7 @@ final class VideoComponentStatusAndLayoutMountedTests: XCTestCase {
     let loader = PickerGate<AVAsset>()
     var failures = 0
     let host = UIHostingController(rootView: VideoFramePickerView(
-      source: VideoFramePickerSource(identity: "failed-source", load: loader.run),
+      source: VideoFramePickerSource(identity: "failed-source", load: { .init(asset: try await loader.run()) }),
       onFailure: { _ in failures += 1 }, onSelection: { _ in }
     ))
     let window = mount(host)

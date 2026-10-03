@@ -99,7 +99,7 @@ final class PickerFixture {
   func start(identity: String = "video", initialTime: Double? = nil) {
     let asset = asset
     owner.start(
-      source: VideoFramePickerSource(identity: identity, load: { asset }),
+      source: VideoFramePickerSource(identity: identity, load: { .init(asset: asset) }),
       initialTime: initialTime, maximumFrameSize: CGSize(width: 1280, height: 1280),
       onFailure: callbacks.onFailure
     )

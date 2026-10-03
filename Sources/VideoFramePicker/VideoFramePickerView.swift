@@ -5,7 +5,8 @@ import VideoPlayback
 ///
 /// Initial previewing never calls `onSelection`. During host processing the slider
 /// stays disabled. The callback runs in the picker's cancellable task: hosts must
-/// check cancellation and destination identity before committing any side effect.
+/// check cancellation, destination identity and `selection.validate()` immediately
+/// before committing output derived from a selection.
 /// Loader, initial time and frame size are snapshotted for each source identity;
 /// selection/failure callbacks are snapshotted at each user value change.
 ///

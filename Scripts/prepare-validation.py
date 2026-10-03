@@ -106,7 +106,7 @@ public enum FramePickerOnlyConsumer {
     onSelection: @escaping @MainActor (VideoFrameSelection) async throws -> Void
   ) -> some View {
     VideoFramePickerView(
-      source: VideoFramePickerSource(identity: "fixture", load: { asset }),
+      source: VideoFramePickerSource(identity: "fixture", load: { .init(asset: asset) }),
       initialTime: 0,
       maximumFrameSize: CGSize(width: 640, height: 640),
       labels: VideoFramePickerLabels(locale: Locale(identifier: "en")),
@@ -121,6 +121,57 @@ public enum FramePickerOnlyConsumer {
   }
 
   public static func labels() -> VideoFramePickerLabels { .init(locale: Locale(identifier: "zh_CN")) }
+}
+"""),
+        "ResourcesOnlyConsumer": ("VideoResources", """import VideoResources
+
+@MainActor
+public enum ResourcesOnlyConsumer {
+  public static func source(resources: VideoResources, cloudID: String) -> VideoSource {
+    resources.photosSource(serializedCloudIdentifier: cloudID)
+  }
+}
+"""),
+        "ResourcesPlaybackOnlyConsumer": ("VideoResourcesPlayback", """import VideoResources
+import VideoResourcesPlayback
+
+@MainActor
+public enum ResourcesPlaybackOnlyConsumer {
+  public static func playback(source: VideoSource) -> VideoResourcePlayback {
+    let playback = VideoResourcePlayback()
+    playback.load(source: source)
+    return playback
+  }
+}
+"""),
+        "ResourcesFramesOnlyConsumer": ("VideoResourcesFrames", """import AVFoundation
+import VideoFramePicker
+import VideoResources
+import VideoResourcesFrames
+import VideoProcessing
+
+@MainActor
+public enum ResourcesFramesOnlyConsumer {
+  public static func picker(source: VideoSource) -> VideoFramePickerSource {
+    VideoResourcesFrames.pickerSource(source: source, identity: "row-video")
+  }
+
+  public static func frame(source: VideoSource) async throws -> ExtractedVideoFrame {
+    let result = try await VideoResourcesFrames.frame(source: source, at: 0,
+      maximumSize: CGSize(width: 320, height: 320), exact: true)
+    guard result.receipt.isCurrent else { throw VideoResourceFailure.sourceChanged }
+    return result.frame
+  }
+
+  public static func export(source: VideoSource) async throws -> URL {
+    let result = try await VideoResourcesFrames.export(source: source, rate: 0.5, onProgress: { _ in })
+    // Ownership has transferred to this host; reject its own late output safely.
+    guard result.receipt.isCurrent else {
+      try? FileManager.default.removeItem(at: result.url)
+      throw VideoResourceFailure.sourceChanged
+    }
+    return result.url
+  }
 }
 """),
     }
