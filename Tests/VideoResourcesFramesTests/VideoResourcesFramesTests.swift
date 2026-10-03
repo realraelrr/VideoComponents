@@ -187,6 +187,129 @@ final class VideoResourcesFramesTests: XCTestCase {
     XCTAssertEqual(try Data(contentsOf: sentinel), Data("unrelated file".utf8))
   }
 
+  func testPickerPreparationReportsOwnProgressAndClosingOnlyReleasesItsFiniteShare() async throws {
+    let probe = FramesProgressProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "picker-progress")
+    let first = VideoFramePickerOwner()
+    let second = VideoFramePickerOwner()
+    var firstPreparation: VideoPreparation?
+    var secondPreparation: VideoPreparation?
+    var projectedPreparation: VideoPreparation?
+    var firstEnded = 0
+    var secondEnded = 0
+    let firstSource = VideoResourcesFrames.pickerSource(source: source, identity: "first-progress",
+      onPreparation: { preparation, began in
+        if began {
+          firstPreparation = preparation
+          projectedPreparation = preparation
+        } else {
+          firstEnded += 1
+          if projectedPreparation === preparation { projectedPreparation = nil }
+        }
+      })
+    let secondSource = VideoResourcesFrames.pickerSource(source: source, identity: "second-progress",
+      onPreparation: { preparation, began in
+        if began {
+          secondPreparation = preparation
+          projectedPreparation = preparation
+        } else {
+          secondEnded += 1
+          if projectedPreparation === preparation { projectedPreparation = nil }
+        }
+      })
+    XCTAssertNil(firstPreparation, "Constructing the adapter cannot start the UI operation")
+    defer { first.stop(); second.stop(); probe.finishOutstanding() }
+    start(first, source: firstSource)
+    try await waitUntil { firstPreparation != nil && probe.invocations.count == 1 }
+    start(second, source: secondSource)
+    try await waitUntil { secondPreparation != nil }
+    let firstHandle = try XCTUnwrap(firstPreparation)
+    let secondHandle = try XCTUnwrap(secondPreparation)
+    XCTAssertFalse(firstHandle === secondHandle)
+    XCTAssertNil(firstHandle.progress, "No Photos progress report means spinner, not a zero-percent ring")
+    XCTAssertNil(secondHandle.progress)
+    XCTAssertEqual(probe.invocations.count, 1, "Each picker owns a finite share of the same request")
+    let highQuality = source.prepare(.init(quality: .highest))
+    defer { highQuality.cancel() }
+    try await waitUntil { probe.invocations.count == 2 }
+    probe.invocations[0].progress(0.25)
+    probe.invocations[1].progress(0.8)
+    try await waitUntil { firstHandle.progress == 0.25 && highQuality.progress == 0.8 }
+    XCTAssertEqual(secondHandle.progress, 0.25)
+    XCTAssertEqual(projectedPreparation?.progress, 0.25,
+      "A peer HQ request must not replace this picker's reported progress")
+    XCTAssertEqual(source.state, .acquiring(0.8), "The source-global progress intentionally differs")
+    first.stop()
+    try await waitUntil { firstEnded == 1 }
+    XCTAssertTrue(projectedPreparation === secondHandle,
+      "An old mount's completion cannot clear the new mount's preparation")
+    XCTAssertEqual(secondHandle.progress, 0.25)
+    XCTAssertTrue(probe.cancelledIndices.isEmpty)
+    second.stop()
+    try await waitUntil { secondEnded == 1 && probe.cancelledIndices.contains(0) }
+    XCTAssertNil(projectedPreparation)
+    XCTAssertFalse(probe.cancelledIndices.contains(1), "Closing pickers cannot cancel the independent HQ owner")
+    XCTAssertEqual(firstEnded, 1)
+    XCTAssertEqual(secondEnded, 1)
+  }
+
+  func testClosingSynchronouslyFromPreparationStartRejectsLateMediaBeforeNativeLoad() async throws {
+    let probe = FramesProgressProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "close-from-preparation")
+    let owner = VideoFramePickerOwner()
+    var starts = 0
+    var ends = 0
+    var startedPreparation: VideoPreparation?
+    var endedPreparation: VideoPreparation?
+    defer { owner.stop(); probe.finishOutstanding() }
+    start(owner, source: VideoResourcesFrames.pickerSource(source: source, identity: "close-start",
+      onPreparation: { preparation, began in
+        if began {
+          starts += 1
+          startedPreparation = preparation
+          owner.stop()
+        } else {
+          ends += 1
+          endedPreparation = preparation
+        }
+      }))
+    try await waitUntil { ends == 1 }
+    await settle()
+    XCTAssertEqual(starts, 1)
+    XCTAssertTrue(startedPreparation === endedPreparation)
+    XCTAssertNil(owner.player)
+    XCTAssertNil(owner.preview)
+    XCTAssertNil(owner.failure, "A user close is not an error state")
+    XCTAssertTrue(probe.invocations.isEmpty,
+      "The start callback's cancellation must be rechecked before invoking native Photos")
+    XCTAssertEqual(source.state, .idle)
+  }
+
+  func testPreparationEndInvalidationCannotInstallMediaReturnedByTheLoader() async throws {
+    let asset = try await movie()
+    let resources = VideoResources(photos: PhotosVideoProvider(authority: { _ in "end-callback-source" },
+      load: { _, _, _ in .init(asset: asset) }))
+    let source = resources.photosSource(serializedCloudIdentifier: "end-invalidated")
+    let owner = VideoFramePickerOwner()
+    var starts = 0
+    var ends = 0
+    defer { owner.stop() }
+    start(owner, source: VideoResourcesFrames.pickerSource(source: source, identity: "end-invalidate",
+      onPreparation: { _, began in
+        if began { starts += 1 }
+        else { ends += 1; source.invalidate() }
+      }))
+    try await waitUntil { owner.failure != nil || owner.preview != nil }
+    XCTAssertEqual(starts, 1)
+    XCTAssertEqual(ends, 1)
+    guard case .source = owner.failure else {
+      return XCTFail("Native receipt validation must reject invalidation from the host end callback")
+    }
+    XCTAssertNil(owner.preview)
+    XCTAssertNil(owner.player?.currentItem)
+    XCTAssertNil(source.preferred)
+  }
+
   private func start(_ owner: VideoFramePickerOwner, source: VideoFramePickerSource) {
     owner.start(source: source, initialTime: 0, maximumFrameSize: CGSize(width: 64, height: 64),
       onFailure: { _ in })
@@ -316,4 +439,40 @@ private final class FramesResourceProbe {
 @MainActor
 private final class FramesExportTaskHolder {
   var task: Task<Void, any Error>?
+}
+
+@MainActor
+private final class FramesProgressProbe {
+  struct Invocation {
+    let request: VideoRequest
+    let progress: PhotosVideoProvider.Progress
+    var continuation: CheckedContinuation<VideoRepresentation, Error>?
+  }
+  private(set) var invocations: [Invocation] = []
+  private(set) var cancelledIndices: [Int] = []
+
+  func resources() -> VideoResources {
+    VideoResources(photos: PhotosVideoProvider(authority: { "visible:\($0)" },
+      load: { [self] _, request, progress in try await load(request, progress: progress) }))
+  }
+
+  func finishOutstanding() {
+    for index in invocations.indices {
+      guard let continuation = invocations[index].continuation else { continue }
+      invocations[index].continuation = nil
+      continuation.resume(throwing: CancellationError())
+    }
+  }
+
+  private func load(_ request: VideoRequest, progress: @escaping PhotosVideoProvider.Progress) async throws
+    -> VideoRepresentation {
+    let index = invocations.count
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        invocations.append(Invocation(request: request, progress: progress, continuation: continuation))
+      }
+    } onCancel: {
+      Task { @MainActor [weak self] in self?.cancelledIndices.append(index) }
+    }
+  }
 }

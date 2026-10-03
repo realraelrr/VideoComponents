@@ -103,6 +103,8 @@ private func nativePhotosFailure(_ error: Error) -> Error {
     return VideoResourceFailure.sourceUnavailable
   case .networkAccessRequired:
     return VideoResourceFailure.networkRequired
+  case .networkError:
+    return VideoResourceFailure.networkFailed
   default:
     return VideoResourceFailure.acquisitionFailed
   }
@@ -184,7 +186,7 @@ final class NativePhotosVideoRequest: @unchecked Sendable {
     } else if (info?[PHImageResultIsInCloudKey] as? NSNumber)?.boolValue == true {
       finish(.failure(VideoResourceFailure.networkRequired))
     } else {
-      finish(.failure(VideoResourceFailure.acquisitionFailed))
+      finish(.failure(VideoResourceFailure.sourceUnavailable))
     }
   }
 

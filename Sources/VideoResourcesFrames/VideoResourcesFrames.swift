@@ -8,11 +8,26 @@ import VideoResources
 @MainActor
 public enum VideoResourcesFrames {
   /// Construction does not acquire. The mounted native picker owns its loader task.
+  /// `onPreparation` receives its finite handle at start (`true`) and end (`false`);
+  /// an end callback should clear host progress only while that exact handle is current.
   public static func pickerSource<ID: Hashable>(
-    source: VideoSource, identity: ID, request: VideoRequest = .init()
+    source: VideoSource, identity: ID, request: VideoRequest = .init(),
+    onPreparation: @escaping @MainActor (VideoPreparation, Bool) -> Void = { _, _ in }
   ) -> VideoFramePickerSource {
     VideoFramePickerSource(identity: identity, onInvalidation: source.onInvalidation, load: {
-      let receipt = try await source.acquire(request)
+      try Task.checkCancellation()
+      let preparation = source.prepare(request)
+      defer {
+        preparation.cancel()
+        onPreparation(preparation, false)
+      }
+      onPreparation(preparation, true)
+      try Task.checkCancellation()
+      let receipt = try await withTaskCancellationHandler {
+        try await preparation.value()
+      } onCancel: {
+        Task { @MainActor in preparation.cancel() }
+      }
       try validate(receipt)
       return PlaybackLoadedMedia(asset: receipt.asset, audioMix: receipt.audioMix, validate: {
         guard receipt.isCurrent else { throw VideoResourceFailure.sourceChanged }

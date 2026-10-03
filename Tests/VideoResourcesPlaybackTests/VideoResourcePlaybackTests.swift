@@ -477,6 +477,166 @@ final class VideoResourcePlaybackTests: XCTestCase {
     XCTAssertNil(binding.session.failure)
   }
 
+  func testInitialAcceptedReceiptObserverCloseReleasesSourceAndMedia() async throws {
+    let probe = BindingLoaderProbe()
+    let resources = probe.resources()
+    var source: VideoSource? = resources.photosSource(serializedCloudIdentifier: "initial-receipt-close")
+    var media: AVURLAsset? = try await movie()
+    weak var weakSource = source
+    weak var weakMedia = media
+    let binding = VideoResourcePlayback()
+    defer { binding.cleanup(); probe.finishOutstanding() }
+    binding.load(source: try XCTUnwrap(source))
+    try await waitUntil { probe.invocations.count == 1 }
+    let observation = BindingReentrantObservation()
+    withObservationTracking {
+      _ = binding.installedReceipt
+    } onChange: {
+      MainActor.assumeIsolated {
+        guard !observation.fired else { return }
+        observation.fired = true
+        binding.cleanup()
+      }
+    }
+    probe.finish(0, with: .success(.init(asset: try XCTUnwrap(media))))
+    try await waitUntil { probe.returnedIndices.contains(0) }
+    await settle()
+    XCTAssertTrue(observation.fired, "Actual receipt publication must reach the public observation")
+    XCTAssertNil(binding.installedReceipt)
+    XCTAssertNil(binding.session.player.currentItem)
+    source = nil
+    media = nil
+    await settle()
+    XCTAssertNil(weakSource, "A closed binding must not restore and retain its retired receipt's source")
+    XCTAssertNil(weakMedia, "A closed binding must release the actual media after its host releases it")
+  }
+
+  func testHighQualityAcceptedReceiptObserverCloseReleasesSourceAndMedia() async throws {
+    let probe = BindingLoaderProbe()
+    let resources = probe.resources()
+    var source: VideoSource? = resources.photosSource(serializedCloudIdentifier: "HQ-receipt-close")
+    var media: AVURLAsset? = try await movie(blue: true)
+    weak var weakSource = source
+    weak var weakMedia = media
+    let binding = VideoResourcePlayback()
+    defer { binding.cleanup(); probe.finishOutstanding() }
+    try await ready(binding, source: try XCTUnwrap(source), probe: probe, asset: try await movie())
+    binding.requestHighQuality()
+    try await waitUntil { probe.invocations.count == 2 }
+    let observation = BindingReentrantObservation()
+    withObservationTracking {
+      _ = binding.highQualityAction
+    } onChange: {
+      MainActor.assumeIsolated {
+        guard !observation.fired else { return }
+        observation.fired = true
+        binding.cleanup()
+      }
+    }
+    probe.finish(1, with: .success(.init(asset: try XCTUnwrap(media))))
+    try await waitUntil { probe.returnedIndices.contains(1) && observation.fired }
+    await settle()
+    XCTAssertEqual(binding.highQualityAction, .hidden)
+    XCTAssertNil(binding.installedReceipt)
+    XCTAssertNil(binding.session.player.currentItem)
+    source = nil
+    media = nil
+    await settle()
+    XCTAssertNil(weakSource, "HQ publication after same-stack close cannot retain the retired source")
+    XCTAssertNil(weakMedia, "The discarded actual HQ media must not be held by the closed binding")
+  }
+
+  func testInitialPreparationProgressIgnoresPeerHighestQualityRequest() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "initial-owned-progress")
+    let binding = VideoResourcePlayback()
+    defer { binding.cleanup(); probe.finishOutstanding() }
+    let automatic = try await movie()
+    XCTAssertNil(binding.preparationProgress)
+    binding.load(source: source)
+    try await waitUntil { probe.invocations.count == 1 }
+    XCTAssertNil(binding.preparationProgress, "No native progress has been reported yet")
+    let observation = BindingReentrantObservation()
+    withObservationTracking {
+      _ = binding.preparationProgress
+    } onChange: {
+      MainActor.assumeIsolated { observation.fired = true }
+    }
+    probe.report(0.25, at: 0)
+    await settle()
+    XCTAssertTrue(observation.fired, "The current operation's native progress must be observable")
+    XCTAssertEqual(binding.preparationProgress, 0.25)
+
+    let peer = source.prepare(.init(quality: .highest, network: .allowed))
+    defer { peer.cancel() }
+    try await waitUntil { probe.invocations.count == 2 }
+    probe.report(0.8, at: 1)
+    await settle()
+    XCTAssertEqual(source.state, .acquiring(0.8), "The peer really changed the source-wide progress")
+    XCTAssertEqual(binding.preparationProgress, 0.25,
+      "Peer HQ progress must not become this session's initial loading feedback")
+    probe.finish(0, with: .success(.init(asset: automatic)))
+    try await waitUntil { binding.installedReceipt != nil }
+    XCTAssertNil(binding.preparationProgress)
+    XCTAssertTrue(binding.session.player.currentItem?.asset === automatic)
+  }
+
+  func testInitialPreparationProgressInvalidationRejectsLateProgressAndPlayableResult() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "initial-invalidated-progress")
+    let binding = VideoResourcePlayback()
+    defer { binding.cleanup(); probe.finishOutstanding() }
+    let lateAsset = try await movie()
+    binding.load(source: source)
+    try await waitUntil { probe.invocations.count == 1 }
+    probe.report(0.25, at: 0)
+    await settle()
+    XCTAssertEqual(binding.preparationProgress, 0.25)
+
+    source.invalidate()
+    try await waitUntil { probe.cancelledIndices.contains(0) }
+    await settle()
+    XCTAssertNil(binding.preparationProgress)
+    XCTAssertNil(binding.session.player.currentItem)
+    probe.report(0.9, at: 0)
+    probe.finish(0, with: .success(.init(asset: lateAsset)))
+    try await waitUntil { probe.returnedIndices.contains(0) }
+    await settle()
+    XCTAssertNil(binding.preparationProgress)
+    XCTAssertNil(binding.installedReceipt)
+    XCTAssertNil(binding.session.player.currentItem,
+      "A playable late native result cannot reinstall an invalidated visit")
+    XCTAssertNil(source.preferred)
+    XCTAssertEqual(probe.invocations.count, 1, "Invalidation must not automatically request again")
+  }
+
+  func testInitialPreparationPublicationObserverCloseCannotRestoreOwnedShare() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "initial-observable-close")
+    let binding = VideoResourcePlayback()
+    defer { binding.cleanup(); probe.finishOutstanding() }
+    let observation = BindingReentrantObservation()
+    withObservationTracking {
+      _ = binding.preparationProgress
+    } onChange: {
+      MainActor.assumeIsolated {
+        guard !observation.fired else { return }
+        observation.fired = true
+        binding.cleanup()
+      }
+    }
+    binding.load(source: source)
+    await settle()
+    XCTAssertTrue(observation.fired, "Initial preparation publication must notify its consumer")
+    XCTAssertNil(binding.preparationProgress)
+    XCTAssertNil(binding.installedReceipt)
+    XCTAssertNil(binding.session.player.currentItem)
+    XCTAssertEqual(probe.invocations.count, 0,
+      "Synchronous close must retract the preparation before native work enters")
+    XCTAssertNil(source.preferred)
+    XCTAssertEqual(source.state, .idle)
+  }
+
   func testHighQualityProgressBelongsToEachSharedConsumerAndIgnoresOtherRequests() async throws {
     let probe = BindingLoaderProbe()
     let source = probe.resources().photosSource(serializedCloudIdentifier: "consumer-progress")

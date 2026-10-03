@@ -84,7 +84,11 @@ public struct VideoReceipt {
 @MainActor @Observable
 public final class VideoSource {
   public enum State: Equatable { case idle, acquiring(Double), available, unavailable(VideoResourceFailure) }
-  public private(set) var state: State = .idle
+  @ObservationIgnored private var storedState: State = .idle
+  public var state: State {
+    access(keyPath: \.state)
+    return storedState
+  }
   @ObservationIgnored fileprivate let kind: Kind
   @ObservationIgnored private var epoch: UInt64 = 0
   @ObservationIgnored private var work: [VideoRequest: VideoOperation] = [:]
@@ -125,7 +129,6 @@ public final class VideoSource {
       catch {
         let operation = VideoOperation(source: self, request: request, epoch: epoch)
         let handle = VideoPreparation(source: self, operation: operation)
-        work[request] = operation
         operation.finish(.failure(error is CancellationError ? error : Self.failure(error)))
         return handle
       }
@@ -134,13 +137,10 @@ public final class VideoSource {
     let operation = VideoOperation(source: self, request: request, epoch: epoch)
     let handle = VideoPreparation(source: self, operation: operation)
     work[request] = operation
-    state = .acquiring(0)
+    publishState(.acquiring(0), epoch: operation.epoch, work: work)
     // Observation may synchronously invalidate this operation during publication.
-    guard operation.result == nil else {
-      if !work.isEmpty { state = .acquiring(0) }
-      else { state = preferred == nil ? .idle : .available }
-      return handle
-    }
+    guard operation.result == nil, operation.epoch == epoch,
+      work[request] === operation else { return handle }
     let load: () async throws -> Loaded
     switch kind {
     case .photos(let identifier, let provider):
@@ -199,13 +199,16 @@ public final class VideoSource {
   }
 
   /// Invalidates pending work and old receipts without starting new work.
-  public func invalidate() {
+  /// A known failure is visible to observers before invalidation callbacks run.
+  public func invalidate(reason: VideoResourceFailure? = nil) {
     let callbacks = Array(invalidationCallbacks)
     epoch &+= 1
+    let invalidatedEpoch = epoch
     cached = nil
     let pending = Array(work.values)
+    work.removeAll()
+    publishState(reason.map(State.unavailable) ?? .idle, epoch: invalidatedEpoch, work: work)
     for operation in pending { operation.finish(.failure(VideoResourceFailure.sourceChanged)) }
-    state = work.isEmpty ? .idle : .acquiring(0)
     for (id, callback) in callbacks {
       guard invalidationCallbacks[id] != nil else { continue }
       callback()
@@ -224,10 +227,7 @@ public final class VideoSource {
 
   fileprivate func refreshAuthority() {
     guard case .photos(let identifier, let provider) = kind else { return }
-    do { _ = try observePhotoAuthority(identifier: identifier, provider: provider) }
-    catch {
-      state = error is CancellationError ? .idle : .unavailable(Self.failure(error))
-    }
+    _ = try? observePhotoAuthority(identifier: identifier, provider: provider)
   }
 
   private func observePhotoAuthority(identifier: String, provider: PhotosVideoProvider) throws -> String {
@@ -236,15 +236,20 @@ public final class VideoSource {
       updatePhotoAuthority(current)
       return current
     } catch {
-      updatePhotoAuthority(nil)
+      updatePhotoAuthority(nil, failure: error is CancellationError ? nil : Self.failure(error))
       throw error
     }
   }
 
-  private func updatePhotoAuthority(_ current: String?) {
-    guard observedPhotoAuthority != current else { return }
+  private func updatePhotoAuthority(_ current: String?, failure: VideoResourceFailure? = nil) {
+    guard observedPhotoAuthority != current else {
+      if current == nil {
+        publishState(failure.map(State.unavailable) ?? .idle, epoch: epoch, work: work)
+      }
+      return
+    }
     observedPhotoAuthority = current
-    invalidate()
+    invalidate(reason: failure)
   }
 
   /// Photos may evict its local URL representation while its library authority stays current.
@@ -290,16 +295,42 @@ public final class VideoSource {
   fileprivate func retired(_ operation: VideoOperation, result: Result<VideoReceipt, Error>) {
     guard work[operation.request] === operation else { return }
     work.removeValue(forKey: operation.request)
-    if !work.isEmpty { state = .acquiring(0) }
-    else if preferred != nil { state = .available }
+    let retiredEpoch = epoch
+    let remainingWork = work
+    let next: State
+    if !work.isEmpty { next = .acquiring(0) }
+    else if preferred != nil { next = .available }
     else if case .failure(let error) = result, !(error is CancellationError) {
-      state = .unavailable(Self.failure(error))
-    } else { state = .idle }
+      next = .unavailable(Self.failure(error))
+    } else { next = .idle }
+    publishState(next, epoch: retiredEpoch, work: remainingWork)
   }
 
   fileprivate func progress(_ operation: VideoOperation, value: Double) {
     guard work[operation.request] === operation else { return }
-    state = .acquiring(value.isFinite ? min(1, max(0, value)) : 0)
+    publishState(.acquiring(value.isFinite ? min(1, max(0, value)) : 0),
+      epoch: operation.epoch, work: work)
+  }
+
+  /// Observation notifies before writing. A callback may start or finish another
+  /// request, so the original source facts must still hold inside the mutation.
+  @discardableResult
+  private func publishState(
+    _ next: State, epoch expectedEpoch: UInt64, work expectedWork: [VideoRequest: VideoOperation]
+  ) -> Bool {
+    let current = {
+      self.epoch == expectedEpoch && self.work.count == expectedWork.count
+        && expectedWork.allSatisfy { self.work[$0.key] === $0.value }
+    }
+    guard current() else { return false }
+    let previous = storedState
+    guard previous != next else { return true }
+    let published = withMutation(keyPath: \.state) {
+      guard current(), storedState == previous else { return false }
+      storedState = next
+      return true
+    }
+    return published && current()
   }
 
   private func receipt(_ value: Loaded) -> VideoReceipt {

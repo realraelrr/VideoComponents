@@ -16,6 +16,12 @@ public final class VideoResourcePlayback {
   }
 
   public let session: PlaybackSession
+  /// Only this owner's current initial resource operation supplies loading progress.
+  public var preparationProgress: Double? {
+    access(keyPath: \.preparationProgress)
+    return initialPreparation?.progress
+  }
+
   /// Only this owner's explicit HQ operation supplies busy state and progress.
   public var highQualityAction: HighQualityAction {
     let attempt = qualityAttempt
@@ -43,7 +49,11 @@ public final class VideoResourcePlayback {
     beginHighQuality(visit: visit, installed: installed, network: .forbidden, purpose: .local)
   }
   public private(set) var qualityFailure: (any Error)?
-  private var acceptedReceipt: VideoReceipt?
+  @ObservationIgnored private var storedAcceptedReceipt: VideoReceipt?
+  private var acceptedReceipt: VideoReceipt? {
+    access(keyPath: \.acceptedReceipt)
+    return storedAcceptedReceipt
+  }
   @ObservationIgnored private var visit: Visit?
   @ObservationIgnored private var initialPreparation: VideoPreparation?
   @ObservationIgnored private var storedQualityAttempt: QualityAttempt?
@@ -85,7 +95,7 @@ public final class VideoResourcePlayback {
     session.preparation = preparation
   }
 
-  init(session: PlaybackSession, onEvent: @escaping @MainActor (PlaybackEvent) -> Void = { _ in }) {
+  public init(session: PlaybackSession, onEvent: @escaping @MainActor (PlaybackEvent) -> Void = { _ in }) {
     self.session = session
     let originalEvent = session.onEvent
     session.onEvent = { [weak self] event in
@@ -193,7 +203,14 @@ public final class VideoResourcePlayback {
           actual.asset === receipt.asset, actual.audioMix === receipt.audioMix else {
           throw CancellationError()
         }
-        self?.acceptedReceipt = receipt
+        if let self {
+          withMutation(keyPath: \.acceptedReceipt) {
+            guard self.visit?.id == visit.id, receipt.isCurrent, self.visit?.id == visit.id,
+              let actual = native.currentLoadedMedia,
+              actual.asset === receipt.asset, actual.audioMix === receipt.audioMix else { return }
+            self.storedAcceptedReceipt = receipt
+          }
+        }
       } catch is CancellationError {
         // Closing or superseding this owner is not a resource or installation failure.
       } catch {
@@ -234,13 +251,26 @@ public final class VideoResourcePlayback {
         owner.visit = visit
         preparation = source.prepare(request)
         guard owner.visit?.id == visit.id else { preparation.cancel(); throw CancellationError() }
-        owner.initialPreparation = preparation
+        let published = owner.withMutation(keyPath: \.preparationProgress) {
+          guard owner.visit?.id == visit.id, owner.initialPreparation == nil else { return false }
+          owner.initialPreparation = preparation
+          return true
+        }
+        guard published, owner.visit?.id == visit.id, owner.initialPreparation === preparation else {
+          preparation.cancel()
+          throw CancellationError()
+        }
       } else {
         throw CancellationError()
       }
       defer {
         preparation.cancel()
-        if let owner = self, owner.visit?.id == visit.id { owner.initialPreparation = nil }
+        if let owner = self, owner.visit?.id == visit.id, owner.initialPreparation === preparation {
+          owner.withMutation(keyPath: \.preparationProgress) {
+            guard owner.visit?.id == visit.id, owner.initialPreparation === preparation else { return }
+            owner.initialPreparation = nil
+          }
+        }
       }
       let receipt = try await preparation.value()
       try Task.checkCancellation()
@@ -248,7 +278,13 @@ public final class VideoResourcePlayback {
         owner.session.isCurrentSource(AnyHashable(ObjectIdentifier(source))) else {
         throw CancellationError()
       }
-      owner.acceptedReceipt = receipt
+      let accepted = owner.withMutation(keyPath: \.acceptedReceipt) {
+        guard owner.visit?.id == visit.id, receipt.isCurrent, owner.visit?.id == visit.id,
+          owner.session.isCurrentSource(AnyHashable(ObjectIdentifier(source))) else { return false }
+        owner.storedAcceptedReceipt = receipt
+        return true
+      }
+      guard accepted, owner.visit?.id == visit.id else { throw CancellationError() }
       return Self.media(receipt)
     }, thumbnail: thumbnail)
   }
@@ -261,14 +297,25 @@ public final class VideoResourcePlayback {
 
   private func releaseVisit() {
     let initial = initialPreparation
+    let receipt = storedAcceptedReceipt
     let quality = storedQualityAttempt?.preparation
     let task = qualityTask
     visit = nil
-    initialPreparation = nil
+    if let initial {
+      withMutation(keyPath: \.preparationProgress) {
+        guard visit == nil, initialPreparation === initial else { return }
+        initialPreparation = nil
+      }
+    }
     qualityTask = nil
     lastLocalCheckRepresentation = nil
     hasRequestedHighQuality = false
-    acceptedReceipt = nil
+    if let receipt {
+      withMutation(keyPath: \.acceptedReceipt) {
+        guard visit == nil, storedAcceptedReceipt?.representationID == receipt.representationID else { return }
+        storedAcceptedReceipt = nil
+      }
+    }
     qualityFailure = nil
     localAvailability = .unknown
     withMutation(keyPath: \.qualityAttempt) { storedQualityAttempt = nil }

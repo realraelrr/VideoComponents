@@ -18,7 +18,7 @@ public struct VideoRequest: Hashable, Sendable {
 
 public enum VideoResourceFailure: Error, Equatable, Sendable {
   case photosAccessRequired, sourceUnavailable, sourceChanged
-  case fileUnavailable, fileChanged, networkRequired, acquisitionFailed
+  case fileUnavailable, fileChanged, networkRequired, networkFailed, acquisitionFailed
 }
 
 /// The native representation and its audio mix travel together.

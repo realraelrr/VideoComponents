@@ -116,6 +116,52 @@ final class NativePhotosRequestTests: XCTestCase {
     XCTAssertEqual(probe.cancelledRequests, [75])
   }
 
+  func testConfirmedPhotosNetworkFailureRemainsDistinctFromUnknownFailure() async {
+    let bridge = NativePhotosVideoRequest(request: { _, _, completion in
+      completion(nil, nil, [PHImageErrorKey: NSError(
+        domain: PHPhotosErrorDomain, code: PHPhotosError.Code.networkError.rawValue)])
+      return 78
+    }, cancelRequest: { _ in })
+    do {
+      _ = try await bridge.load(asset: PHAsset(), options: PHVideoRequestOptions())
+      XCTFail("A confirmed Photos network failure must preserve its typed reason")
+    } catch {
+      XCTAssertEqual(error as? VideoResourceFailure, .networkFailed)
+    }
+  }
+
+  func testMissingNativeRepresentationIsTypedSourceUnavailable() async {
+    let probe = NativeRequestProbe()
+    let bridge = NativePhotosVideoRequest(request: { _, _, completion in
+      probe.register(completion)
+      completion(nil, nil, nil)
+      return 79
+    }, cancelRequest: { probe.recordCancellation($0) })
+    do {
+      _ = try await bridge.load(asset: PHAsset(), options: PHVideoRequestOptions())
+      XCTFail("A missing Photos representation must remain unavailable")
+    } catch { XCTAssertEqual(error as? VideoResourceFailure, .sourceUnavailable) }
+    XCTAssertEqual(probe.cancelledRequests, [79])
+    probe.complete(asset: AVMutableComposition())
+    XCTAssertEqual(probe.cancelledRequests, [79])
+  }
+
+  func testNativeCancellationCallbackCancelsOnceAndIgnoresLateSuccess() async {
+    let probe = NativeRequestProbe()
+    let bridge = NativePhotosVideoRequest(request: { _, _, completion in
+      probe.register(completion)
+      completion(nil, nil, [PHImageCancelledKey: true])
+      return 80
+    }, cancelRequest: { probe.recordCancellation($0) })
+    do {
+      _ = try await bridge.load(asset: PHAsset(), options: PHVideoRequestOptions())
+      XCTFail("Native cancellation must not become a visible source failure")
+    } catch is CancellationError {} catch { XCTFail("Expected cancellation: \(error)") }
+    XCTAssertEqual(probe.cancelledRequests, [80])
+    probe.complete(asset: AVMutableComposition())
+    XCTAssertEqual(probe.cancelledRequests, [80])
+  }
+
   func testNativeErrorIsTypedAndDoesNotEscapeWithDiagnosticDetail() async {
     let probe = NativeRequestProbe()
     let rawError = NSError(
