@@ -9,7 +9,7 @@ final class PlaybackAccessTests: XCTestCase {
     let loader = SuspendedAssetOperation()
     let session = PlaybackSession()
     defer { session.cleanup(); loader.finish(asset) }
-    session.load(source: PlaybackSource(identity: UUID(), load: loader.load),
+    session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: try await loader.load()) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await wait { loader.started }
     XCTAssertNil(session.player.currentItem)
@@ -37,7 +37,7 @@ final class PlaybackAccessTests: XCTestCase {
     let loader = SuspendedAssetOperation()
     let session = PlaybackSession()
     defer { session.cleanup(); loader.finish(asset) }
-    session.load(source: PlaybackSource(identity: UUID(), load: loader.load),
+    session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: try await loader.load()) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await wait { loader.started }
     session.togglePlayback()
@@ -56,7 +56,7 @@ final class PlaybackAccessTests: XCTestCase {
     let loader = SuspendedAssetOperation()
     let session = PlaybackSession()
     defer { session.cleanup(); loader.finish(asset) }
-    session.load(source: PlaybackSource(identity: UUID(), load: loader.load),
+    session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: try await loader.load()) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await wait { loader.started }
     session.togglePlayback()
@@ -79,13 +79,13 @@ final class PlaybackAccessTests: XCTestCase {
     let next = SuspendedAssetOperation()
     let session = PlaybackSession()
     defer { session.cleanup(); first.finish(asset); next.finish(asset) }
-    session.load(source: PlaybackSource(identity: UUID(), load: first.load),
+    session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: try await first.load()) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await wait { first.started }
     session.togglePlayback()
     XCTAssertTrue(session.isPlaybackRequested)
     let nextIdentity = UUID()
-    session.load(source: PlaybackSource(identity: nextIdentity, load: next.load),
+    session.load(source: PlaybackSource(identity: nextIdentity, load: { PlaybackLoadedMedia(asset: try await next.load()) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await wait { next.started && first.cancelled }
     first.finish(asset)
@@ -111,7 +111,7 @@ final class PlaybackAccessTests: XCTestCase {
     session.setScrubProgress(1)
     session.handleScrubEditingChanged(false)
     try await wait { abs(session.player.currentTime().seconds - session.durationSeconds) < 0.01 }
-    session.revalidateAccess(source: source, refreshID: 1) { .validate(validator.load) }
+    session.revalidateAccess(source: source, refreshID: 1) { .validate { PlaybackLoadedMedia(asset: try await validator.load()) } }
     try await wait { validator.started }
 
     session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: true)
@@ -133,13 +133,13 @@ final class PlaybackAccessTests: XCTestCase {
       defer { session.cleanup(); loader.finish(asset) }
       let identity = UUID()
       var replacementLoads = 0
-      session.load(source: PlaybackSource(identity: identity, load: loader.load),
+      session.load(source: PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: try await loader.load()) }),
         playbackRate: 1, isLooping: false, autoplayWhenReady: initialAutoplay)
       try await wait { loader.started }
 
       session.load(source: PlaybackSource(identity: identity, load: {
         replacementLoads += 1
-        return asset
+        return PlaybackLoadedMedia(asset: asset)
       }), playbackRate: 0.5, isLooping: true, autoplayWhenReady: nextAutoplay)
       XCTAssertTrue(session.isPlaybackRequested)
       await Task.yield()
@@ -159,7 +159,7 @@ final class PlaybackAccessTests: XCTestCase {
     var sourceLoads = 0
     let source = PlaybackSource(identity: UUID(), load: {
       sourceLoads += 1
-      return asset
+      return PlaybackLoadedMedia(asset: asset)
     })
     let validator = SuspendedAssetOperation()
     let session = PlaybackSession()
@@ -172,7 +172,7 @@ final class PlaybackAccessTests: XCTestCase {
     session.handleScrubEditingChanged(false)
     try await wait { abs(session.player.currentTime().seconds - 0.4) < 0.01 }
     session.togglePlayback()
-    session.revalidateAccess(source: source, refreshID: 1) { .validate(validator.load) }
+    session.revalidateAccess(source: source, refreshID: 1) { .validate { PlaybackLoadedMedia(asset: try await validator.load()) } }
     try await wait { validator.started }
 
     session.load(source: source, playbackRate: 0.5, isLooping: true, autoplayWhenReady: false)
@@ -218,7 +218,7 @@ final class PlaybackAccessTests: XCTestCase {
     defer { session.cleanup() }
     var invalidations = 0
     for identity in ["first", "second"] {
-      let source = PlaybackSource(identity: identity, load: { asset })
+      let source = PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: asset) })
       session.load(source: source, playbackRate: 0.75, isLooping: true, autoplayWhenReady: false)
       try await wait { session.hasCurrentItem }
       for _ in 0..<2 {
@@ -240,10 +240,10 @@ final class PlaybackAccessTests: XCTestCase {
     let suspended = SuspendedAssetOperation()
     let session = PlaybackSession()
     defer { session.cleanup(); suspended.finish(asset) }
-    let source = PlaybackSource(identity: "media", load: suspended.load)
+    let source = PlaybackSource(identity: "media", load: { PlaybackLoadedMedia(asset: try await suspended.load()) })
     session.load(source: source, playbackRate: 0.75, isLooping: true, autoplayWhenReady: true)
     try await wait { suspended.started }
-    session.revalidateAccess(source: source, refreshID: 1) { .validate { asset } }
+    session.revalidateAccess(source: source, refreshID: 1) { .validate { PlaybackLoadedMedia(asset: asset) } }
     XCTAssertTrue(session.isPlaybackRequested)
     try await wait { suspended.cancelled && session.isPlayerReady }
     let item = try XCTUnwrap(session.player.currentItem)
@@ -256,14 +256,14 @@ final class PlaybackAccessTests: XCTestCase {
 
   func testRevalidationRestoresSameItemAndLatestConfiguration() async throws {
     let asset = try audioAsset()
-    let source = PlaybackSource(identity: "same", load: { asset })
+    let source = PlaybackSource(identity: "same", load: { PlaybackLoadedMedia(asset: asset) })
     let session = PlaybackSession()
     defer { session.cleanup() }
     session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await wait { session.isPlayerReady }
     let original = try XCTUnwrap(session.player.currentItem)
     let validator = SuspendedAssetOperation()
-    session.revalidateAccess(source: source, refreshID: 4) { .validate(validator.load) }
+    session.revalidateAccess(source: source, refreshID: 4) { .validate { PlaybackLoadedMedia(asset: try await validator.load()) } }
     XCTAssertFalse(session.hasCurrentItem)
     try await wait { validator.started }
     session.updatePlaybackRate(0.5)
@@ -279,7 +279,7 @@ final class PlaybackAccessTests: XCTestCase {
   func testCleanupCancelsSuspendedValidatorAndDiscardsLateSuccess() async throws {
     let (session, source, asset) = try await readySession()
     let validator = SuspendedAssetOperation()
-    session.revalidateAccess(source: source, refreshID: 1) { .validate(validator.load) }
+    session.revalidateAccess(source: source, refreshID: 1) { .validate { PlaybackLoadedMedia(asset: try await validator.load()) } }
     try await wait { validator.started }
     session.cleanup()
     try await wait { validator.cancelled }
@@ -294,9 +294,9 @@ final class PlaybackAccessTests: XCTestCase {
     let (session, source, asset) = try await readySession()
     defer { session.cleanup() }
     let validator = SuspendedAssetOperation()
-    session.revalidateAccess(source: source, refreshID: 1) { .validate(validator.load) }
+    session.revalidateAccess(source: source, refreshID: 1) { .validate { PlaybackLoadedMedia(asset: try await validator.load()) } }
     try await wait { validator.started }
-    session.load(source: PlaybackSource(identity: "replacement", load: { asset }),
+    session.load(source: PlaybackSource(identity: "replacement", load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 0.75, isLooping: false, autoplayWhenReady: false)
     try await wait { validator.cancelled && session.isPlayerReady }
     let newItem = try XCTUnwrap(session.player.currentItem)
@@ -308,13 +308,13 @@ final class PlaybackAccessTests: XCTestCase {
 
   func testSuspendedValidatorDoesNotRetainOwnerAndReceivesCancellation() async throws {
     let asset = try audioAsset()
-    let source = PlaybackSource(identity: "owner", load: { asset })
+    let source = PlaybackSource(identity: "owner", load: { PlaybackLoadedMedia(asset: asset) })
     var owner: PlaybackSession? = PlaybackSession()
     weak var weakOwner = owner
     owner?.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await wait { owner?.isPlayerReady == true }
     let validator = SuspendedAssetOperation()
-    owner?.revalidateAccess(source: source, refreshID: 1) { .validate(validator.load) }
+    owner?.revalidateAccess(source: source, refreshID: 1) { .validate { PlaybackLoadedMedia(asset: try await validator.load()) } }
     try await wait { validator.started }
     owner = nil
     try await wait { weakOwner == nil && validator.cancelled }
@@ -328,7 +328,7 @@ final class PlaybackAccessTests: XCTestCase {
     let loader = SuspendedAssetOperation()
     var owner: PlaybackSession? = PlaybackSession()
     weak var weakOwner = owner
-    owner?.load(source: PlaybackSource(identity: "owner", load: loader.load),
+    owner?.load(source: PlaybackSource(identity: "owner", load: { PlaybackLoadedMedia(asset: try await loader.load()) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: true)
     try await wait { loader.started }
     owner = nil
@@ -348,7 +348,7 @@ final class PlaybackAccessTests: XCTestCase {
     guard case .source(let error) = session.failure else { return XCTFail("Expected source failure") }
     XCTAssertTrue(error is CancellationError)
     XCTAssertFalse(session.isPlaybackRequested)
-    session.revalidateAccess(source: source, refreshID: 2) { .validate { asset } }
+    session.revalidateAccess(source: source, refreshID: 2) { .validate { PlaybackLoadedMedia(asset: asset) } }
     try await wait { session.isPlayerReady }
     XCTAssertFalse(session.isPlaybackRequested)
   }
@@ -368,7 +368,7 @@ final class PlaybackAccessTests: XCTestCase {
 
   private func readySession() async throws -> (PlaybackSession, PlaybackSource, AVAsset) {
     let asset = try audioAsset()
-    let source = PlaybackSource(identity: UUID(), load: { asset })
+    let source = PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: asset) })
     let session = PlaybackSession()
     session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await wait { session.isPlayerReady }

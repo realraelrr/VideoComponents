@@ -19,7 +19,7 @@ final class PlaybackReplacementTests: XCTestCase {
     transport.deliver(0)
     var result: Result<Void, any Error>?
     let replacement = Task {
-      do { try await session.replaceAsset(asset, for: "A"); result = .success(()) }
+      do { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A"); result = .success(()) }
       catch { result = .failure(error) }
     }
     defer { replacement.cancel() }
@@ -51,14 +51,14 @@ final class PlaybackReplacementTests: XCTestCase {
       }, transport: transport.seek)
       defer { session.cleanup() }
       let original = try XCTUnwrap(session.player.currentItem)
-      let replacement = Task { try await session.replaceAsset(asset, for: "A") }
+      let replacement = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
       defer { replacement.cancel() }
       try await waitUntil {
         waitingForSeek ? transport.finished.first == true
           : session.player.currentItem !== original && !session.isPlayerReady
       }
       let seekCount = transport.targets.count
-      session.revalidateAccess(source: PlaybackSource(identity: "A", load: { asset }), refreshID: 1) {
+      session.revalidateAccess(source: PlaybackSource(identity: "A", load: { PlaybackLoadedMedia(asset: asset) }), refreshID: 1) {
         .unavailable(ReplacementTestError.timeout)
       }
       XCTAssertEqual(transport.targets.count, seekCount, "Revoked access must not first seek the old item")
@@ -75,7 +75,7 @@ final class PlaybackReplacementTests: XCTestCase {
     let (session, asset) = try await readySession(transport: transport.seek)
     defer { session.cleanup() }
     session.togglePlayback()
-    let replacement = Task { try await session.replaceAsset(asset, for: "A") }
+    let replacement = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
     defer { replacement.cancel() }
     try await waitUntil { transport.finished.first == true }
     let candidate = session.player.currentItem
@@ -97,16 +97,16 @@ final class PlaybackReplacementTests: XCTestCase {
       let transport = ReplacementTransport()
       let (session, asset) = try await readySession(transport: transport.seek)
       defer { session.cleanup() }
-      let replacement = Task { try await session.replaceAsset(asset, for: "A") }
+      let replacement = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
       defer { replacement.cancel() }
       try await waitUntil { transport.finished.first == true }
       if cleanup {
         session.cleanup()
       } else {
-        session.load(source: PlaybackSource(identity: "B", load: { asset }),
+        session.load(source: PlaybackSource(identity: "B", load: { PlaybackLoadedMedia(asset: asset) }),
           playbackRate: 0.5, isLooping: false, autoplayWhenReady: false)
         try await waitUntil { session.isPlayerReady }
-        session.load(source: PlaybackSource(identity: "A", load: { asset }),
+        session.load(source: PlaybackSource(identity: "A", load: { PlaybackLoadedMedia(asset: asset) }),
           playbackRate: 0.75, isLooping: true, autoplayWhenReady: false)
         try await waitUntil { session.isPlayerReady }
       }
@@ -129,7 +129,7 @@ final class PlaybackReplacementTests: XCTestCase {
     defer { session.cleanup() }
     let original = session.player.currentItem
     session.togglePlayback()
-    let replacement = Task { try await session.replaceAsset(asset, for: "A") }
+    let replacement = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
     try await waitUntil { transport.finished.first == true }
     replacement.cancel()
     try await waitUntil { transport.targets.count == 2 && transport.finished[1] == true }
@@ -148,10 +148,10 @@ final class PlaybackReplacementTests: XCTestCase {
     let transport = ReplacementTransport()
     let (session, asset) = try await readySession(transport: transport.seek)
     defer { session.cleanup() }
-    let previous = Task { try await session.replaceAsset(asset, for: "A") }
+    let previous = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
     defer { previous.cancel() }
     try await waitUntil { transport.finished.first == true }
-    let replacement = Task { try await session.replaceAsset(asset, for: "A") }
+    let replacement = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
     defer { replacement.cancel() }
     try await waitUntil { transport.targets.count == 3 && transport.finished[2] == true }
     let current = session.player.currentItem
@@ -192,7 +192,7 @@ final class PlaybackReplacementTests: XCTestCase {
     let (session, asset) = try await readySession(prepare: gate.prepare, transport: transport.seek)
     defer { session.cleanup(); gate.finish(.success(AVPlayerItem(asset: asset))) }
     let oldItem = try XCTUnwrap(session.player.currentItem)
-    let replacement = Task { try await session.replaceAsset(asset, for: "A") }
+    let replacement = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
     try await waitUntil { gate.started }
     XCTAssertTrue(session.player.currentItem === oldItem)
     XCTAssertTrue(session.canUsePlaybackControls)
@@ -226,7 +226,7 @@ final class PlaybackReplacementTests: XCTestCase {
     session.setScrubProgress(0.7)
     session.handleScrubEditingChanged(false)
     try await waitUntil { transport.finished.first == true }
-    let replacement = Task { try await session.replaceAsset(asset, for: "A") }
+    let replacement = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
     defer { replacement.cancel() }
     try await waitUntil { transport.targets.count == 2 }
     XCTAssertEqual(transport.targets.last?.seconds ?? -1, 5.6, accuracy: 0.01)
@@ -245,7 +245,7 @@ final class PlaybackReplacementTests: XCTestCase {
     session.updatePlaybackRate(1.25)
     session.handleHoldGestureStateChanged(.began, allowsHoldBoost: true)
     XCTAssertEqual(session.player.rate, 2.5, accuracy: 0.01)
-    let replacement = Task { try await session.replaceAsset(asset, for: "A") }
+    let replacement = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
     defer { replacement.cancel() }
     try await waitUntil { transport.finished.last == true }
     transport.deliverLast()
@@ -291,7 +291,7 @@ final class PlaybackReplacementTests: XCTestCase {
       return AVPlayerItem(asset: asset)
     })
     defer { session.cleanup(); gate.finish(.success(AVPlayerItem(asset: asset))) }
-    let previous = Task { try await session.replaceAsset(asset, for: "A") }
+    let previous = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
     try await waitUntil { gate.started }
     session.updatePlaybackRate(0.75)
     try await boundedReplace(session, asset)
@@ -327,7 +327,7 @@ final class PlaybackReplacementTests: XCTestCase {
       let gate = ReplacementGate()
       let (session, asset) = try await readySession(prepare: gate.prepare)
       let original = session.player.currentItem
-      let replacement = Task { try await session.replaceAsset(asset, for: "A") }
+      let replacement = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
       try await waitUntil { gate.started }
       if cleanup { session.cleanup() } else { replacement.cancel() }
       gate.finish(.success(AVPlayerItem(asset: asset)))
@@ -342,12 +342,12 @@ final class PlaybackReplacementTests: XCTestCase {
     let gate = ReplacementGate()
     let (session, asset) = try await readySession(prepare: gate.prepare)
     defer { session.cleanup() }
-    let replacement = Task { try await session.replaceAsset(asset, for: "A") }
+    let replacement = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
     try await waitUntil { gate.started }
-    session.load(source: PlaybackSource(identity: "B", load: { asset }),
+    session.load(source: PlaybackSource(identity: "B", load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await waitUntil { session.isPlayerReady }
-    session.load(source: PlaybackSource(identity: "A", load: { asset }),
+    session.load(source: PlaybackSource(identity: "A", load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await waitUntil { session.isPlayerReady }
     let current = session.player.currentItem
@@ -365,7 +365,7 @@ final class PlaybackReplacementTests: XCTestCase {
     let session: PlaybackSession
     if let prepare { session = PlaybackSession(transportSeek: transport, prepareReplacement: prepare) }
     else { session = PlaybackSession(transportSeek: transport) }
-    session.load(source: PlaybackSource(identity: "A", load: { asset }),
+    session.load(source: PlaybackSource(identity: "A", load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await waitUntil { session.isPlayerReady && session.durationSeconds > 0 }
     return (session, asset)
@@ -375,7 +375,7 @@ final class PlaybackReplacementTests: XCTestCase {
     var finished = false
     let task = Task {
       defer { finished = true }
-      try await session.replaceAsset(asset, for: "A")
+      try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A")
     }
     defer { task.cancel() }
     try await waitUntil { finished }

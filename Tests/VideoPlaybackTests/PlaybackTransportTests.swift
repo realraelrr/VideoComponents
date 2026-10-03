@@ -13,7 +13,7 @@ final class PlaybackTransportTests: XCTestCase {
     defer { session.cleanup(); preparation.resumeAll() }
     let item = try XCTUnwrap(session.player.currentItem)
     let identity = try XCTUnwrap(session.currentSourceIdentity)
-    let source = PlaybackSource(identity: identity, load: { item.asset })
+    let source = PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: item.asset) })
 
     session.togglePlayback()
     XCTAssertTrue(session.isPlaybackRequested)
@@ -162,7 +162,7 @@ final class PlaybackTransportTests: XCTestCase {
         defer { session.cleanup(); preparation.resumeAll() }
         let oldItem = try XCTUnwrap(session.player.currentItem)
         let identity = try XCTUnwrap(session.currentSourceIdentity)
-        let source = PlaybackSource(identity: identity, load: { oldItem.asset })
+        let source = PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: oldItem.asset) })
         session.togglePlayback()
         try await waitUntil { preparation.preparedOwners.count == 1 }
         let oldOwner = preparation.preparedOwners[0]
@@ -293,8 +293,8 @@ final class PlaybackTransportTests: XCTestCase {
     defer { session.cleanup(); preparation.resumeAll() }
     let asset = try XCTUnwrap(session.player.currentItem?.asset)
     let identityA = try XCTUnwrap(session.currentSourceIdentity)
-    let sourceA = PlaybackSource(identity: identityA, load: { asset })
-    let sourceB = PlaybackSource(identity: UUID(), load: { asset })
+    let sourceA = PlaybackSource(identity: identityA, load: { PlaybackLoadedMedia(asset: asset) })
+    let sourceB = PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: asset) })
     session.togglePlayback()
     try await waitUntil { preparation.preparedOwners.count == 1 }
     let firstA = preparation.preparedOwners[0]
@@ -485,7 +485,7 @@ final class PlaybackTransportTests: XCTestCase {
       var replacementResult: Result<Void, any Error>?
       let replacement = Task {
         do {
-          try await session.replaceAsset(AVURLAsset(url: hqURL), for: identity)
+          try await session.replaceAsset(PlaybackLoadedMedia(asset: AVURLAsset(url: hqURL)), for: identity)
           replacementResult = .success(())
         } catch { replacementResult = .failure(error) }
       }
@@ -530,7 +530,7 @@ final class PlaybackTransportTests: XCTestCase {
     defer { session.cleanup(); preparation.resumeAll() }
     let item = try XCTUnwrap(session.player.currentItem)
     let identity = try XCTUnwrap(session.currentSourceIdentity)
-    let source = PlaybackSource(identity: identity, load: { item.asset })
+    let source = PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: item.asset) })
     session.handleScrubEditingChanged(true)
     session.setScrubProgress(0.4)
     session.handleScrubEditingChanged(false)
@@ -609,7 +609,7 @@ final class PlaybackTransportTests: XCTestCase {
     var loadCount = 0
     let source = PlaybackSource(identity: identity, load: {
       loadCount += 1
-      return original.asset
+      return PlaybackLoadedMedia(asset: original.asset)
     })
     session.togglePlayback()
     try await waitUntil { preparation.preparedOwners.count == 1 }
@@ -667,7 +667,7 @@ final class PlaybackTransportTests: XCTestCase {
       preparation.observe(session)
       defer { session.cleanup(); preparation.resumeAll() }
       let original = try XCTUnwrap(session.player.currentItem)
-      let sourceB = PlaybackSource(identity: UUID(), load: { original.asset })
+      let sourceB = PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: original.asset) })
       var callbackOwners: [UUID] = []
       preparation.onRelease = { [weak session] owner in
         callbackOwners.append(owner)
@@ -731,7 +731,7 @@ final class PlaybackTransportTests: XCTestCase {
     defer { session.cleanup(); preparation.resumeAll() }
     let item = try XCTUnwrap(session.player.currentItem)
     let identity = try XCTUnwrap(session.currentSourceIdentity)
-    let source = PlaybackSource(identity: identity, load: { item.asset })
+    let source = PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: item.asset) })
     session.handleScrubEditingChanged(true)
     session.setScrubProgress(0.4)
     session.handleScrubEditingChanged(false)
@@ -747,7 +747,7 @@ final class PlaybackTransportTests: XCTestCase {
     defer { validationContinuation?.resume(throwing: CancellationError()) }
     session.revalidateAccess(source: source, refreshID: 1) {
       .validate {
-        try await withCheckedThrowingContinuation { validationContinuation = $0 }
+        PlaybackLoadedMedia(asset: try await withCheckedThrowingContinuation { validationContinuation = $0 })
       }
     }
     try await waitUntil { validationContinuation != nil }
@@ -783,7 +783,7 @@ final class PlaybackTransportTests: XCTestCase {
     let player = try XCTUnwrap(session?.player)
     session?.preparation = preparation.hook
     preparation.observe(try XCTUnwrap(session))
-    session?.load(source: PlaybackSource(identity: UUID(), load: { AVURLAsset(url: url) }),
+    session?.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: AVURLAsset(url: url)) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     defer { session?.cleanup(); preparation.resumeAll() }
     try await waitUntil { session?.isPlayerReady == true }
@@ -835,7 +835,7 @@ final class PlaybackTransportTests: XCTestCase {
 
   func testSameSourceLoadAppliesLatestRateToPlayingAndHoldingTransport() async throws {
     let url = try temporaryPlayableAudioURL()
-    let source = PlaybackSource(identity: url, load: { AVURLAsset(url: url) })
+    let source = PlaybackSource(identity: url, load: { PlaybackLoadedMedia(asset: AVURLAsset(url: url)) })
     let session = PlaybackSession()
     defer { session.cleanup() }
     session.load(source: source, playbackRate: 1, isLooping: true, autoplayWhenReady: true)
@@ -1247,7 +1247,7 @@ final class PlaybackTransportTests: XCTestCase {
     let session = PlaybackSession(transportSeek: transportSeek)
     session.preparation = preparation
     addTeardownBlock { @MainActor in session.cleanup() }
-    session.load(source: PlaybackSource(identity: UUID(), load: { AVURLAsset(url: url) }),
+    session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: AVURLAsset(url: url)) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await waitUntil { session.isPlayerReady && session.durationSeconds > 0 }
     return session

@@ -1,14 +1,16 @@
 # VideoComponents
 
-Three iOS libraries for AVFoundation video:
+iOS libraries for AVFoundation video and finite Photos/local-file resource acquisition:
 
 | Product | Includes | Dependencies |
 | --- | --- | --- |
+| `VideoResources` | Finite shareable acquisition, actual asset/audio-mix receipts, Photos authority and verified local-file facts | Apple frameworks only |
+| `VideoResourcesPlayback` | One session's acquisition shares and independent representation installation | `VideoResources`, `VideoPlayback` |
 | `VideoPlayback` | A playback session, inline/fullscreen SwiftUI views, zoom and transport gestures, an independent seek coordinator, localized controls | Apple frameworks only |
 | `VideoProcessing` | Frame extraction, automatic poster selection, slow MP4 export | Apple frameworks only |
 | `VideoFramePicker` | A paused SwiftUI preview and time slider that asynchronously delivers exact user-selected frames | `VideoPlayback`, `VideoProcessing` |
 
-`VideoPlayback` and `VideoProcessing` remain independent: neither depends on the other or on `VideoFramePicker`. The picker composes both. All three are independent of the host app, Photos, CloudKit and application persistence. `VideoProcessing` does not import SwiftUI.
+`VideoPlayback` and `VideoProcessing` remain independent: neither depends on the other or on `VideoFramePicker`. The picker composes both. Playback, processing and picker remain independent of the host app, Photos, CloudKit and application persistence. The optional resource core uses Photos but owns no application persistence, account binding or download policy. `VideoProcessing` does not import SwiftUI.
 
 ## Platform and toolchain
 
@@ -78,11 +80,11 @@ import VideoPlayback
 @StateObject private var session = PlaybackSession()
 
 // Call from the owner's loading lifecycle, using a stable media identity.
-let source = PlaybackSource(identity: fileURL, load: { AVURLAsset(url: fileURL) })
+let source = PlaybackSource(identity: fileURL, load: { PlaybackLoadedMedia(asset: AVURLAsset(url: fileURL)) })
 session.load(source: source, playbackRate: 1, isLooping: true, autoplayWhenReady: false)
 ```
 
-The source identity must change when the underlying media changes and remain stable across view updates. The source supplies a cancellable `@MainActor` asset loader and an optional thumbnail loader. Supply the host's authorization and resource-access logic there. Access refreshes use `revalidateAccess(source:refreshID:validation:)`; its synchronous validation factory is invoked only for the current source and a new refresh ID. The session owns suspension, cancellation, stale-result rejection and restoration of its existing item. Same-identity `load` calls preserve in-flight loading or access validation and apply the latest playback configuration; autoplay requests can establish playback intent without ordinary view appearances clearing it.
+The source identity must change when the underlying media changes and remain stable across view updates. The source supplies a cancellable `@MainActor` loaded-media loader and an optional thumbnail loader. Supply the host's authorization and resource-access logic there. Access refreshes use `revalidateAccess(source:refreshID:validation:)`; its synchronous validation factory is invoked only for the current source and a new refresh ID. The session owns suspension, cancellation, stale-result rejection and restoration of its existing item. Same-identity `load` calls preserve in-flight loading or access validation and apply the latest playback configuration; autoplay requests can establish playback intent without ordinary view appearances clearing it.
 
 Pass `isFullscreenPresented` to `InlinePlaybackView` while presenting the fullscreen view. This detaches the inline rendering layer while the fullscreen view renders the same player. Closing fullscreen must not destroy the session. Call `cleanup()` when the feature actually releases its playback work, rather than on every inline view disappearance.
 
@@ -113,13 +115,42 @@ The host's `prepare` closure must synchronously register or submit the UUID rese
 
 A current preparation error publishes `PlaybackFailure.preparation(error)` and `.unavailable`, ends intent and hold, and releases the lease while retaining the source, ready item and position. Map this distinct failure to the host's concise audio recovery message. Call `retryPlaybackPreparation()` only from an explicit user retry; it prepares a new lease and resumes the retained item at its current position. Ordinary load updates, rate changes and gestures do not retry a preparation failure. Access revalidation, same-source representation replacement and even a forced same-identity source reload preserve that failure and stopped intent. Source retry remains a separate loading operation; a new source identity clears the old failure.
 
-For a different representation of the same media, call `try await session.replaceAsset(asset, for: source.identity)`. Asset preparation keeps the existing item usable. Native item readiness briefly pauses the same player after candidate installation; native readiness or restoring-seek failure restores the previous item. The switch uses the latest position or pending seek/scrub target, playback intent, configured rate and loop setting. A hold ends rather than becoming the new playback rate or intent. The operation waits for the restoring seek to succeed. A newer user seek can instead adopt the ready candidate, completing the replacement while its own transport continues; the obsolete restoring callback is rejected. Playback always waits for the current seek to succeed. Task cancellation restores the previous item while the operation is pending. Source replacement, cleanup and newer representation requests invalidate older results, including A → B → A reuse of an identity.
+For a different representation of the same media, call `try await session.replaceAsset(media, for: source.identity)`. `PlaybackLoadedMedia` carries the actual asset, optional audio mix and a synchronous throwing validity check; native validates this same result before installation and after asynchronous readiness/seek boundaries. An invalid previous result cannot be restored on rollback. Native never imports the resource core. `currentLoadedMedia` describes the actual current item; a newly obtained access result does not replace the retained snapshot's media. Asset preparation keeps the existing item usable. Native item readiness briefly pauses the same player after candidate installation; native readiness or restoring-seek failure restores the previous item. The switch uses the latest position or pending seek/scrub target, playback intent, configured rate and loop setting. A hold ends rather than becoming the new playback rate or intent. The operation waits for the restoring seek to succeed. A newer user seek can instead adopt the ready candidate, completing the replacement while its own transport continues; the obsolete restoring callback is rejected. Playback always waits for the current seek to succeed. Task cancellation restores the previous item while the operation is pending. Source replacement, cleanup and newer representation requests invalidate older results, including A → B → A reuse of an identity.
 
 Controls support scrubbing, double-tap play/pause, long-press boost, pinch zoom and panning when zoomed. The inline view accepts an outer-scroll binding; connect it to the containing scroll view's `.scrollDisabled` modifier so video gestures and scrolling do not compete. The host provides accessories, status content, style and optional localized labels.
 
 Fullscreen chrome hides after three idle seconds. Single-tap the video to show or hide it; double-tap still changes playback. Contact with the video or controls suspends the idle countdown until all fingers leave. VoiceOver keeps chrome available. Zoomed panning is limited by the actual aspect-fit video bounds: smaller axes stay centered, larger axes cover the viewport, and resizing recalculates the limits. Each pinch keeps the current source point beneath the fingers, including after an earlier pinch or pan. Status content stays below fullscreen chrome so close remains available.
 
 For a separate manual-frame preview, `VideoSeekCoordinator` borrows an independent `AVPlayer`. It must be the only seek initiator for that item while active. Call `reset()` before an external seek or item replacement; it cancels pending seeks. Do not attach a second coordinator to the playback session's player.
+
+## Optional resource ownership (current unreleased main)
+
+`VideoResources` and `VideoResourcesPlayback`, together with the single `PlaybackLoadedMedia` API, are changes on main. Existing release tags retain their previous APIs. An app using the old raw-asset loader must adapt its load/access/replacement call sites before selecting this revision; the changes are not a transparent dependency update.
+
+A host retains one `VideoResources` for sources that should share acquisition. A source has a stable Photos cloud reference or a host key identifying a complete immutable file descriptor. The file verifier must inspect an already materialized local file and return the facts from that integrity check. It must not download or make account decisions. Core file checks are observational facts, not an atomic lease on future AVFoundation reads.
+
+`source.prepare(request)` synchronously registers a cancellation share; `share()` creates another cancellation right. Cancelling one handle does not cancel another. `value()` waits for the finite result; cancelling a waiting Task alone does not withdraw a held share. Release the preparation with `cancel()` or use `source.acquire(request)` for Task-owned finite acquisition. Photos authority refresh invalidates stale receipts without automatically retrying. Cached `preferred` is a source result, never proof that a playback session installed it.
+
+```swift
+import VideoResources
+import VideoResourcesPlayback
+
+let resources = VideoResources(verifiedFile: { key in
+  try await localStore.inspectMaterializedVideo(key)
+})
+let playback = VideoResourcePlayback(preparation: hostAudioPreparation)
+playback.load(source: resources.fileSource(identity: immutableDescriptorKey))
+// Pass playback.session to the existing inline/fullscreen views.
+// Explicit owner action, not an inline rendering view's onDisappear:
+playback.requestHighQuality()
+playback.cleanup()
+```
+
+A `VideoResourcePlayback` owns the native session's event hook. Supply host observations through its initializer; do not replace `session.onEvent`. Its loader starts a source visit only when native loading actually enters. Cleanup synchronously withdraws only this owner's initial/HQ shares, before forwarding the host event. Inline/fullscreen share this owner. HQ success is installed independently in each session; one session's installation failure does not invalidate the shared result. `installedReceipt` is available only for a current, ready, matching asset/mix. Initial loading may have obtained a result before this property becomes available. `qualityFailure` is local to this session, with host-owned recovery copy and interactions. This product adds no UI, audio policy or operation-progress controller.
+
+Audio preparation Retry calls the native preparation path with zero resource acquisitions. Resource Retry explicitly accepts the host's currently selected source and creates a new finite consumption for this owner, including after native source invalidation has released the old visit; callers preserve their explicit autoplay choice through `retry(source:request:thumbnail:autoplayWhenReady:)`. Rate and loop settings remain owned by the native session. Business draft/save/export consumers use their own shares and final receipt validation; a playback owner cannot cancel their work.
+
+The DanceCheckin production resolver has not been migrated to these products. Its eventual cutover must replace every resource consumer together: playback, editor/frame selection, HQ/export, draft preview and save. Remove the old resolver's acquisition task/cache, owner/consumer bookkeeping, preferred/revision facts and global retry startup with that switch. Retain host resource mapping, local Store integrity/materialization, Photos authorization interactions, account isolation, audio FIFO, poster masters/thumbnail cache, cancellation at final business mutations and the actual feature-exit boundary. Do not copy the isolated HostHarness Store into production or operate two source authorities for one media identity.
 
 ## Manual frame selection
 

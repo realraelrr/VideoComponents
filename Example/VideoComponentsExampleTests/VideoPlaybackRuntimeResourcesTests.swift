@@ -278,7 +278,7 @@ final class VideoPlaybackMountedTests: XCTestCase {
       try file.write(from: buffer)
     }
     let session = PlaybackSession()
-    session.load(source: PlaybackSource(identity: url, load: { AVURLAsset(url: url) }),
+    session.load(source: PlaybackSource(identity: url, load: { PlaybackLoadedMedia(asset: AVURLAsset(url: url)) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     for _ in 0..<400 {
       if session.canUsePlaybackControls { return session }
@@ -425,7 +425,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let session = PlaybackSession()
     let identity = AnyHashable(UUID())
     defer { session.cleanup() }
-    session.load(source: PlaybackSource(identity: identity, load: { asset }),
+    session.load(source: PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: sharedView(.inline, session: session,
       provider: { poster }, sourceIdentity: identity))
@@ -451,7 +451,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let identity = AnyHashable(UUID())
     let gate = PosterHandoffAssetGate(asset: asset)
     defer { gate.release(); session.cleanup() }
-    session.load(source: PlaybackSource(identity: identity, load: { try await gate.load() }),
+    session.load(source: PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: try await gate.load()) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: sharedView(.inline, session: session,
       provider: { poster }, sourceIdentity: identity))
@@ -480,7 +480,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let identity = AnyHashable(UUID())
     let gate = PosterHandoffAssetGate(asset: asset)
     defer { gate.release(); session.cleanup() }
-    session.load(source: PlaybackSource(identity: identity, load: { try await gate.load() }),
+    session.load(source: PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: try await gate.load()) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: sharedView(.inline, session: session,
       provider: { poster }, sourceIdentity: identity))
@@ -524,7 +524,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let gate = PosterHandoffAssetGate(asset: asset)
     let session = PlaybackSession()
     defer { gate.release(); session.cleanup() }
-    session.load(source: PlaybackSource(identity: UUID(), load: { try await gate.load() }),
+    session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: try await gate.load()) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: sharedView(.inline, session: session, provider: { poster }))
     let window = try mount(host)
@@ -553,7 +553,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let identityA = AnyHashable(UUID()), identityB = AnyHashable(UUID())
     let posterA = image(.red), posterB = image(.blue)
     defer { gateA.release(); session.cleanup() }
-    session.load(source: PlaybackSource(identity: identityA, load: { try await gateA.load() }),
+    session.load(source: PlaybackSource(identity: identityA, load: { PlaybackLoadedMedia(asset: try await gateA.load()) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: sharedView(.inline, session: session,
       provider: { posterA }, sourceIdentity: identityA))
@@ -563,7 +563,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     session.togglePlayback()
     XCTAssertTrue(session.isWaitingForPlayback)
     host.rootView = sharedView(.inline, session: session, provider: { posterB }, sourceIdentity: identityB)
-    session.load(source: PlaybackSource(identity: identityB, load: { assetB }),
+    session.load(source: PlaybackSource(identity: identityB, load: { PlaybackLoadedMedia(asset: assetB) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let media = try await mountedMedia(in: host.view)
     gateA.release()
@@ -584,7 +584,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let asset = try await greenVideo()
     let poster = image(.red)
     let session = PlaybackSession()
-    let source = PlaybackSource(identity: UUID(), load: { asset })
+    let source = PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: asset) })
     var attempts = 0
     let retryPreparation = PosterHandoffAssetGate(asset: asset)
     session.preparation = PlaybackPreparation(prepare: { _ in
@@ -635,7 +635,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let poster = image(.red)
     let session = PlaybackSession()
     defer { session.cleanup() }
-    session.load(source: PlaybackSource(identity: UUID(), load: { asset }),
+    session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: sharedView(.inline, session: session, provider: { poster }))
     let window = try mount(host)
@@ -667,7 +667,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let poster = image(.red)
     let session = PlaybackSession()
     defer { session.cleanup() }
-    session.load(source: PlaybackSource(identity: UUID(), load: { asset }),
+    session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: sharedView(.inline, session: session, provider: { poster }))
     let window = try mount(host)
@@ -707,9 +707,9 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let identity = AnyHashable(UUID())
     let reloadGate = PosterHandoffAssetGate(asset: asset)
     let session = PlaybackSession()
-    let reloadSource = PlaybackSource(identity: identity, load: { try await reloadGate.load() })
+    let reloadSource = PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: try await reloadGate.load()) })
     defer { reloadGate.release(); session.cleanup() }
-    session.load(source: PlaybackSource(identity: identity, load: { asset }),
+    session.load(source: PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: sharedView(.inline, session: session,
       provider: { poster }, sourceIdentity: identity))
@@ -769,7 +769,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let identity = AnyHashable(UUID())
     let gate = PosterHandoffAssetGate(asset: asset)
     defer { gate.release(); session.cleanup() }
-    session.load(source: PlaybackSource(identity: identity, load: { asset }),
+    session.load(source: PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: PosterHandoffRawSessionView(
       session: session, identity: identity, poster: poster))
@@ -784,7 +784,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     try await assertColor(.red, in: media, name: "raw-same-player-nil-item-resets-source-handoff-red")
     XCTAssertTrue(media.playerLayer.player === player,
       "Raw rendering keeps this player bound: this reset is nil-item, not nil-player")
-    session.load(source: PlaybackSource(identity: identity, load: { try await gate.load() }),
+    session.load(source: PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: try await gate.load()) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     try await poll("raw same-identity reload held") { gate.started }
     try await assertColor(.red, in: media, name: "raw-same-identity-held-reload-red")
@@ -802,7 +802,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let session = PlaybackSession()
     let identity = AnyHashable(UUID())
     defer { session.cleanup() }
-    session.load(source: PlaybackSource(identity: identity, load: { asset }),
+    session.load(source: PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: PosterHandoffRawSessionView(
       session: session, identity: identity, poster: nil))
@@ -838,9 +838,9 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let redAsset = try await solidVideo(red: 255, green: 0, blue: 0)
     let posterA = image(.red), posterB = image(.blue)
     let session = PlaybackSession()
-    let sourceA = PlaybackSource(identity: UUID(), load: { greenAsset })
+    let sourceA = PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: greenAsset) })
     let gateB = PosterHandoffAssetGate(asset: redAsset)
-    let sourceB = PlaybackSource(identity: UUID(), load: { try await gateB.load() }, thumbnail: { _ in posterB })
+    let sourceB = PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: try await gateB.load()) }, thumbnail: { _ in posterB })
     defer { gateB.release(); session.cleanup() }
     session.load(source: sourceA, playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: sharedView(mode, session: session,
@@ -904,7 +904,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let identity = AnyHashable(UUID())
     let reloadGate = PosterHandoffAssetGate(asset: asset)
     defer { reloadGate.release(); session.cleanup() }
-    session.load(source: PlaybackSource(identity: identity, load: { asset }),
+    session.load(source: PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     let host = UIHostingController(rootView: sharedView(mode, session: session,
       provider: { poster }, sourceIdentity: identity))
@@ -920,7 +920,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     XCTAssertNil(session.player.currentItem)
     try await assertColor(.red, in: media, name: stage + "-cleanup-restores-red-poster")
     XCTAssertNil(media.playerLayer.player, "Shared views must detach the cleaned-up session")
-    session.load(source: PlaybackSource(identity: identity, load: { try await reloadGate.load() }),
+    session.load(source: PlaybackSource(identity: identity, load: { PlaybackLoadedMedia(asset: try await reloadGate.load()) }),
       playbackRate: 1, isLooping: true, autoplayWhenReady: false)
     try await poll("same resource reload acquisition held") { reloadGate.started }
     try await assertColor(.red, in: media, name: stage + "-held-same-resource-red-poster")
@@ -949,7 +949,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     var finished = false
     let replacement = Task {
       defer { finished = true }
-      try await session.replaceAsset(asset, for: identity)
+      try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: identity)
     }
     defer { replacement.cancel() }
     let clock = ContinuousClock()
@@ -1000,7 +1000,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let hqAsset = try await solidVideo(red: 0, green: 255, blue: 0, alternatingGreenBrightness: true)
     let poster = image(.red)
     let session = PlaybackSession()
-    let source = PlaybackSource(identity: UUID(), load: { initialAsset })
+    let source = PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: initialAsset) })
     defer { session.cleanup() }
     session.load(source: source, playbackRate: 1, isLooping: true, autoplayWhenReady: true)
     let host = UIHostingController(rootView: sharedView(mode, session: session, provider: { poster },
@@ -1028,7 +1028,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     var finished = false
     let replacement = Task {
       defer { finished = true }
-      try await session.replaceAsset(hqAsset, for: source.identity)
+      try await session.replaceAsset(PlaybackLoadedMedia(asset: hqAsset), for: source.identity)
     }
     defer { replacement.cancel() }
     let clock = ContinuousClock()
@@ -1139,7 +1139,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let gate = PosterHandoffAssetGate(asset: asset)
     let session = PlaybackSession() // Production preparation, native readiness and restoring seek.
     defer { gate.release(); session.cleanup() }
-    let source = PlaybackSource(identity: UUID(), load: { try await gate.load() }, thumbnail: { _ in savedPoster })
+    let source = PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: try await gate.load()) }, thumbnail: { _ in savedPoster })
     session.load(source: source, playbackRate: 0.75, isLooping: true, autoplayWhenReady: false)
     try await poll("same-source initial acquisition held") { gate.started }
     let host = UIHostingController(rootView: sharedView(mode, session: session, provider: { savedPoster }))
@@ -1188,7 +1188,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     var finished = false
     let replacement = Task {
       defer { finished = true }
-      try await session.replaceAsset(replacementAsset, for: source.identity)
+      try await session.replaceAsset(PlaybackLoadedMedia(asset: replacementAsset), for: source.identity)
     }
     defer { replacement.cancel() }
     let clock = ContinuousClock()
@@ -1470,7 +1470,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
       let validationGate = PosterHandoffAssetGate(asset: asset)
       let session = PlaybackSession()
       defer { gate.release(); validationGate.release(); session.cleanup() }
-      let source = PlaybackSource(identity: UUID(), load: { try await gate.load() }, thumbnail: { _ in poster })
+      let source = PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: try await gate.load()) }, thumbnail: { _ in poster })
       session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: false)
       try await poll("initial source acquisition started") { gate.started }
       XCTAssertNil(session.thumbnailImage, "The source thumbnail starts only after source acquisition returns")
@@ -1480,7 +1480,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
       }
       // Existing access revalidation retains the thumbnail while detaching the item.
       // Hold this separate operation, not the source loader that supplies the thumbnail.
-      session.revalidateAccess(source: source, refreshID: 1) { .validate { try await validationGate.load() } }
+      session.revalidateAccess(source: source, refreshID: 1) { .validate { PlaybackLoadedMedia(asset: try await validationGate.load()) } }
       try await poll("access validation held with retained source thumbnail") { validationGate.started }
       let host = UIHostingController(rootView: sharedView(mode, session: session))
       let window = try mount(host)
@@ -1509,14 +1509,14 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
       let validationGate = PosterHandoffAssetGate(asset: asset)
       let session = PlaybackSession()
       defer { gate.release(); validationGate.release(); session.cleanup() }
-      let source = PlaybackSource(identity: UUID(), load: { try await gate.load() }, thumbnail: { _ in obsoletePoster })
+      let source = PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: try await gate.load()) }, thumbnail: { _ in obsoletePoster })
       session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: false)
       try await poll("initial source acquisition started") { gate.started }
       gate.release()
       try await poll("obsolete session thumbnail available after acquisition") {
         session.thumbnailImage === obsoletePoster && session.isPlayerReady
       }
-      session.revalidateAccess(source: source, refreshID: 1) { .validate { try await validationGate.load() } }
+      session.revalidateAccess(source: source, refreshID: 1) { .validate { PlaybackLoadedMedia(asset: try await validationGate.load()) } }
       try await poll("access validation held with obsolete session thumbnail") { validationGate.started }
       let host = UIHostingController(rootView: sharedView(mode, session: session))
       let window = try mount(host)
@@ -1547,7 +1547,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     let gate = PosterHandoffAssetGate(asset: asset)
     let session = PlaybackSession()
     defer { gate.release(); session.cleanup() }
-    session.load(source: PlaybackSource(identity: UUID(), load: { try await gate.load() }),
+    session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: try await gate.load()) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     try await poll("held shared source") { gate.started }
     let host = UIHostingController(rootView: sharedView(.inline, session: session, provider: { poster }))
@@ -1587,7 +1587,7 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
       let session = PlaybackSession()
       var sourceThumbnailRequests = 0
       defer { gate.release(); session.cleanup() }
-      session.load(source: PlaybackSource(identity: UUID(), load: { try await gate.load() },
+      session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: try await gate.load()) },
         thumbnail: { _ in sourceThumbnailRequests += 1; return obsoletePoster }),
         playbackRate: 1, isLooping: false, autoplayWhenReady: false)
       try await poll("held initial source acquisition") { gate.started }

@@ -63,7 +63,7 @@ import VideoPlayback
 public enum PlaybackOnlyConsumer {
   public static func session(for asset: AVAsset) -> PlaybackSession {
     let session = PlaybackSession()
-    session.load(source: PlaybackSource(identity: "fixture", load: { asset }),
+    session.load(source: PlaybackSource(identity: "fixture", load: { PlaybackLoadedMedia(asset: asset) }),
       playbackRate: 1, isLooping: false, autoplayWhenReady: false)
     return session
   }

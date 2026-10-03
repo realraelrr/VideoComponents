@@ -27,6 +27,7 @@ import UIKit
 
   private struct AccessPlaybackSnapshot {
     let item: AVPlayerItem
+    let media: PlaybackLoadedMedia
     let time: CMTime
   }
 
@@ -35,6 +36,9 @@ import UIKit
   /// Render only. The session exclusively owns item replacement, seeks and transport.
   /// Use a separate player with VideoSeekCoordinator for independent previews.
   public let player = AVPlayer()
+  /// The result belonging to the actual current native item. A candidate may
+  /// be installed while still awaiting readiness or its restoring seek.
+  public private(set) var currentLoadedMedia: PlaybackLoadedMedia?
 
   @Published public private(set) var thumbnailImage: UIImage?
   @Published private var playbackCoordinator = PlaybackState()
@@ -200,22 +204,28 @@ import UIKit
   /// during asset preparation. Native item readiness briefly pauses transport after
   /// installation; failure restores the previous item. Completion waits for the
   /// restoring seek, unless a newer user seek adopts the ready candidate first.
-  public func replaceAsset(_ asset: AVAsset, for identity: AnyHashable) async throws {
+  public func replaceAsset(_ media: PlaybackLoadedMedia, for identity: AnyHashable) async throws {
     guard loadedResource == identity else { throw CancellationError() }
     cancelReplacement()
     guard isPlayerReady, let original = player.currentItem,
+      let originalMedia = currentLoadedMedia,
       accessPlaybackSnapshot == nil else { throw CancellationError() }
     let generation = replacementGeneration
     do {
       try Task.checkCancellation()
-      let candidate = try await prepareReplacement(asset)
-      try Task.checkCancellation()
+      try media.validate()
       guard replacementGeneration == generation, loadedResource == identity,
         player.currentItem === original else { throw CancellationError() }
+      let candidate = try await prepareReplacement(media.asset)
+      try Task.checkCancellation()
+      try media.validate()
+      guard replacementGeneration == generation, loadedResource == identity,
+        player.currentItem === original else { throw CancellationError() }
+      candidate.audioMix = media.audioMix
 
       let interruptedTarget = endInteractionForAccessRefresh()
       let time = pendingTransport?.target ?? interruptedTarget ?? player.currentTime()
-      replacementSnapshot = AccessPlaybackSnapshot(item: original, time: time)
+      replacementSnapshot = AccessPlaybackSnapshot(item: original, media: originalMedia, time: time)
       cancelPendingTransport()
       scrubSeekCoordinator?.reset()
       scrubSeekCoordinator = nil
@@ -235,6 +245,7 @@ import UIKit
             [weak self] _, _ in
             Task { @MainActor in self?.finishReplacementPreparation(generation: generation) }
           }
+          currentLoadedMedia = media
           player.replaceCurrentItem(with: candidate)
         }
       } onCancel: {
@@ -244,6 +255,7 @@ import UIKit
         }
       }
       try Task.checkCancellation()
+      try media.validate()
       guard replacementGeneration == generation, loadedResource == identity,
         player.currentItem === candidate, replacementItem === candidate,
         candidate.status == .readyToPlay else { throw CancellationError() }
@@ -255,7 +267,7 @@ import UIKit
       observePlaybackEnd(for: candidate, token: token)
       observePlayerBuffering(token: token)
       observePlayerTime(token: token)
-      startAspectRatioLoad(for: asset, token: token)
+      startAspectRatioLoad(for: media.asset, token: token)
       try await withTaskCancellationHandler {
         try await withCheckedThrowingContinuation { continuation in
           replacementContinuation = continuation
@@ -269,10 +281,16 @@ import UIKit
         }
       }
       try Task.checkCancellation()
+      try media.validate()
       guard replacementGeneration == generation, loadedResource == identity,
         player.currentItem === candidate else { throw CancellationError() }
+      replacementItem = nil
+      replacementSnapshot = nil
     } catch {
-      if replacementGeneration == generation { cancelReplacement() }
+      if replacementGeneration == generation {
+        cancelReplacement()
+        if player.currentItem != nil { _ = validateCurrentMedia() }
+      }
       throw error
     }
   }
@@ -288,6 +306,7 @@ import UIKit
     switch candidate.status {
     case .unknown: return
     case .readyToPlay:
+      guard validateCurrentMedia(), replacementGeneration == generation else { return }
       replacementObservation?.invalidate()
       replacementObservation = nil
       let continuation = replacementContinuation
@@ -306,6 +325,9 @@ import UIKit
 
   private func cancelReplacement(restoreOriginal: Bool = true) {
     replacementGeneration = UUID()
+    let generation = replacementGeneration
+    let resource = loadedResource
+    let currentItem = player.currentItem
     replacementObservation?.invalidate()
     replacementObservation = nil
     let snapshot = replacementSnapshot
@@ -317,12 +339,22 @@ import UIKit
     replacementContinuation = nil
     continuation?.resume(throwing: CancellationError())
     if shouldRestore, let snapshot {
+      do { try snapshot.media.validate() }
+      catch {
+        guard replacementGeneration == generation, loadedResource == resource,
+          player.currentItem === currentItem else { return }
+        invalidateCurrentMedia(error)
+        return
+      }
+      guard replacementGeneration == generation, loadedResource == resource,
+        player.currentItem === currentItem else { return }
       cancelPendingTransport()
       removePlayerObservers()
       cancelAspectRatioLoad()
       isPlayerReady = false
       let token = playbackCoordinator.startLoading()
       player.pause()
+      currentLoadedMedia = snapshot.media
       player.replaceCurrentItem(with: snapshot.item)
       durationSeconds = playableSeconds(from: snapshot.item.duration) ?? durationSeconds
       observePlayerItemStatus(snapshot.item, token: token)
@@ -343,7 +375,7 @@ import UIKit
   ) {
     guard loadedResource == video.identity, lastAccessRefreshID != refreshID else { return }
     lastAccessRefreshID = refreshID
-    let validator: @MainActor () async throws -> AVAsset
+    let validator: @MainActor () async throws -> PlaybackLoadedMedia
     switch validation() {
     case .unavailable(let error):
       cancelReplacement(restoreOriginal: false)
@@ -358,11 +390,12 @@ import UIKit
     let snapshot: AccessPlaybackSnapshot
     if let accessPlaybackSnapshot {
       snapshot = accessPlaybackSnapshot
-    } else if let currentItem = player.currentItem {
+    } else if let currentItem = player.currentItem, let currentLoadedMedia {
       let interruptedScrubTarget = endInteractionForAccessRefresh()
       let currentTime = pendingTransport?.target ?? interruptedScrubTarget ?? player.currentTime()
       snapshot = AccessPlaybackSnapshot(
         item: currentItem,
+        media: currentLoadedMedia,
         time: currentTime.seconds.isFinite && currentTime.seconds >= 0 ? currentTime : .zero
       )
       cancelPendingTransport()
@@ -373,6 +406,7 @@ import UIKit
       scrubSeekCoordinator = nil
       cancelPreviewImageLoad()
       cancelAspectRatioLoad()
+      self.currentLoadedMedia = nil
       player.replaceCurrentItem(with: nil)
       accessPlaybackSnapshot = snapshot
     } else {
@@ -393,10 +427,11 @@ import UIKit
     accessValidationTask?.cancel()
     let resource = video.identity
     accessValidationTask = Task { [weak self] in
-      let asset: AVAsset
       do {
         try Task.checkCancellation()
-        asset = try await validator()
+        // Completing a fresh acquisition cannot grant authority to this
+        // snapshot's different result. Restore only its own media below.
+        _ = try await validator()
         try Task.checkCancellation()
       } catch {
         guard !Task.isCancelled, let self else { return }
@@ -413,7 +448,6 @@ import UIKit
         snapshot,
         refreshID: refreshID,
         source: video,
-        asset: asset,
         token: token
       )
     }
@@ -451,7 +485,6 @@ import UIKit
     _ snapshot: AccessPlaybackSnapshot,
     refreshID: UInt64,
     source video: PlaybackSource,
-    asset: AVAsset,
     token: PlaybackState.GenerationToken
   ) {
     guard lastAccessRefreshID == refreshID,
@@ -463,6 +496,18 @@ import UIKit
     else {
       return
     }
+
+    do { try snapshot.media.validate() }
+    catch {
+      transitionAccessToFailure(
+        reason: .source(error), refreshID: refreshID, resource: video.identity,
+        expectedRevalidationItem: snapshot.item
+      )
+      return
+    }
+    guard lastAccessRefreshID == refreshID, loadedResource == video.identity,
+      playbackCoordinator.isCurrent(token), player.currentItem == nil,
+      accessPlaybackSnapshot?.item === snapshot.item else { return }
 
     guard snapshot.item.status != .failed else {
       transitionAccessToFailure(
@@ -480,8 +525,9 @@ import UIKit
       startPreviewImageLoad(for: video, token: token)
     }
     if videoAspectRatio == nil {
-      startAspectRatioLoad(for: asset, token: token)
+      startAspectRatioLoad(for: snapshot.media.asset, token: token)
     }
+    currentLoadedMedia = snapshot.media
     player.replaceCurrentItem(with: snapshot.item)
     observePlayerItemStatus(snapshot.item, token: token)
     observePlaybackEnd(for: snapshot.item, token: token)
@@ -519,7 +565,7 @@ import UIKit
       }
       if autoplayWhenReady, playbackProgress >= 1 {
         if let snapshot = accessPlaybackSnapshot {
-          accessPlaybackSnapshot = AccessPlaybackSnapshot(item: snapshot.item, time: .zero)
+          accessPlaybackSnapshot = AccessPlaybackSnapshot(item: snapshot.item, media: snapshot.media, time: .zero)
           updateTransportPresentation(to: .zero)
         } else {
           beginTransport(to: .zero)
@@ -552,10 +598,10 @@ import UIKit
         }
       }
 
-      let asset: AVAsset
+      let media: PlaybackLoadedMedia
       do {
         try Task.checkCancellation()
-        asset = try await assetLoader()
+        media = try await assetLoader()
         try Task.checkCancellation()
       } catch {
         guard let self else { return }
@@ -568,12 +614,12 @@ import UIKit
       }
 
       guard let self else { return }
-      continueLoading(asset: asset, source: video, token: token)
+      continueLoading(media: media, source: video, token: token)
     }
   }
 
   private func continueLoading(
-    asset: AVAsset,
+    media: PlaybackLoadedMedia,
     source video: PlaybackSource,
     token: PlaybackState.GenerationToken
   ) {
@@ -582,11 +628,16 @@ import UIKit
       return
     }
     guard playbackCoordinator.isCurrent(token) else { return }
+    do { try media.validate() }
+    catch { failPlayback(reason: .source(error), token: token); return }
+    guard playbackCoordinator.isCurrent(token) else { return }
 
     startPreviewImageLoad(for: video, token: token)
-    startAspectRatioLoad(for: asset, token: token)
+    startAspectRatioLoad(for: media.asset, token: token)
     playbackCoordinator.transition(to: .loadingPlayerItem, token: token)
-    let playerItem = AVPlayerItem(asset: asset)
+    let playerItem = AVPlayerItem(asset: media.asset)
+    playerItem.audioMix = media.audioMix
+    currentLoadedMedia = media
     player.replaceCurrentItem(with: playerItem)
     observePlayerItemStatus(playerItem, token: token)
     observePlaybackEnd(for: playerItem, token: token)
@@ -744,6 +795,7 @@ import UIKit
     scrubProgress = 0
     playbackConfig = VideoPlaybackConfig()
     videoAspectRatio = nil
+    currentLoadedMedia = nil
     player.replaceCurrentItem(with: nil)
     onEvent(.didCleanup)
   }
@@ -757,6 +809,7 @@ import UIKit
     guard playbackCoordinator.isCurrent(token),
       !isPlayerReady
     else { return }
+    guard validateCurrentMedia(), playbackCoordinator.isCurrent(token) else { return }
 
     isPlayerReady = true
     if pendingTransport == nil {
@@ -855,6 +908,8 @@ import UIKit
         return
       }
 
+      guard self.validateCurrentMedia(), self.player.currentItem === currentItem,
+        self.pendingTransport?.token == token else { return }
       self.pendingTransport = nil
       guard finished else {
         if self.replacementItem === currentItem {
@@ -872,8 +927,6 @@ import UIKit
       }
       self.updateTransportPresentation(to: transport.target)
       if self.replacementItem === currentItem {
-        self.replacementItem = nil
-        self.replacementSnapshot = nil
         let continuation = self.replacementContinuation
         self.replacementContinuation = nil
         continuation?.resume()
@@ -942,7 +995,8 @@ import UIKit
 
     let requestID = preparationRequest?.id
     onEvent(.willPlay)
-    // An observational callback can synchronously pause or replace the source.
+    guard validateCurrentMedia() else { return }
+    // The event or media validator can synchronously pause or replace the source.
     guard isPlaybackRequested, failure == nil, isPlayerReady, hasCurrentItem,
       pendingTransport == nil, playbackInteraction != .scrubbing,
       preparationRequest?.id == requestID else { return }
@@ -951,6 +1005,41 @@ import UIKit
       ? playbackConfig.holdBoostedRate
       : playbackConfig.playbackRate
     player.playImmediately(atRate: rate)
+  }
+
+  /// Validation never acquires another resource or retries host preparation.
+  private func validateCurrentMedia() -> Bool {
+    guard let item = player.currentItem, let media = currentLoadedMedia else { return false }
+    do { try media.validate() }
+    catch {
+      guard player.currentItem === item else { return false }
+      if replacementItem === item {
+        // A candidate can lose its backing file while the old result remains
+        // valid. Let the replacement's catch validate and restore that result.
+        if let continuation = replacementContinuation {
+          replacementContinuation = nil
+          player.pause()
+          continuation.resume(throwing: error)
+        } else {
+          cancelReplacement()
+        }
+      } else {
+        invalidateCurrentMedia(error)
+      }
+      return false
+    }
+    return player.currentItem === item
+  }
+
+  private func invalidateCurrentMedia(_ error: any Error) {
+    let resource = loadedResource
+    let config = playbackConfig
+    cleanup()
+    guard let resource else { return }
+    playbackConfig = config
+    loadedResource = resource
+    let token = playbackCoordinator.startLoading()
+    failPlayback(reason: .source(error), token: token)
   }
 
   private func startPlaybackPreparation(_ preparation: PlaybackPreparation) {

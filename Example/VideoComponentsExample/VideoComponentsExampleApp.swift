@@ -204,7 +204,7 @@ private final class DemoMedia: ObservableObject {
   }
 
   private func load(_ url: URL) {
-    let source = PlaybackSource(identity: url, load: { AVURLAsset(url: url) })
+    let source = PlaybackSource(identity: url, load: { PlaybackLoadedMedia(asset: AVURLAsset(url: url)) })
     session.load(source: source, playbackRate: 1, isLooping: true, autoplayWhenReady: false)
   }
 
