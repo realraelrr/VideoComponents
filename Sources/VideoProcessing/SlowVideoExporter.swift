@@ -15,13 +15,15 @@ public enum SlowVideoExportError: Error {
 @MainActor
 public enum SlowVideoExporter {
   /// Exports an MP4 at a finite rate in 0.25...1.0, preserving track orientation
-  /// and audio timing. The existing local output directory receives a unique file.
+  /// and audio timing. The actual source audio mix follows rebuilt audio track IDs
+  /// and the scaled volume timeline. The existing local output directory receives a unique file.
   ///
   /// Only success transfers file ownership to the caller, which must save or
   /// delete it. Cancellation and failure remove only this operation's output.
   /// Progress 1 is emitted only after successful native completion.
   public static func exportSlowedVideo(
     asset: AVAsset,
+    audioMix: AVAudioMix? = nil,
     rate: Double,
     outputDirectory: URL = FileManager.default.temporaryDirectory,
     onProgress: @escaping @MainActor (Double) -> Void
@@ -30,9 +32,9 @@ public enum SlowVideoExporter {
     guard rate.isFinite, (0.25...1).contains(rate) else {
       throw SlowVideoExportError.invalidRate
     }
-    let composition: AVMutableComposition
+    let slowed: (composition: AVMutableComposition, audioMix: AVAudioMix?)
     do {
-      composition = try await slowedComposition(from: asset, rate: rate)
+      slowed = try await slowedComposition(from: asset, audioMix: audioMix, rate: rate)
     } catch {
       try Task.checkCancellation()
       if let failure = error as? SlowVideoExportError { throw failure }
@@ -41,7 +43,7 @@ public enum SlowVideoExporter {
     try Task.checkCancellation()
     let outputURL = try outputURL(in: outputDirectory)
     guard let exportSession = AVAssetExportSession(
-      asset: composition,
+      asset: slowed.composition,
       presetName: AVAssetExportPresetHighestQuality
     ) else {
       throw SlowVideoExportError.exportUnavailable
@@ -50,14 +52,16 @@ public enum SlowVideoExporter {
     exportSession.outputFileType = .mp4
     exportSession.shouldOptimizeForNetworkUse = true
     exportSession.audioTimePitchAlgorithm = .spectral
+    exportSession.audioMix = slowed.audioMix
     return try await SlowVideoExportRunner(session: exportSession, outputURL: outputURL)
       .export(onProgress: onProgress)
   }
 
   private static func slowedComposition(
     from asset: AVAsset,
+    audioMix: AVAudioMix?,
     rate: Double
-  ) async throws -> AVMutableComposition {
+  ) async throws -> (composition: AVMutableComposition, audioMix: AVAudioMix?) {
     let duration = try await asset.load(.duration)
     guard duration.seconds.isFinite,
           duration.seconds > 0 else {
@@ -92,6 +96,7 @@ public enum SlowVideoExporter {
     }
 
     let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+    var rebuiltAudioTracks: [CMPersistentTrackID: AVMutableCompositionTrack] = [:]
     for sourceTrack in audioTracks {
       guard try await sourceTrack.load(.isEnabled) else { continue }
       guard let compositionTrack = composition.addMutableTrack(
@@ -109,13 +114,64 @@ public enum SlowVideoExporter {
         sourceTimeRange,
         toDuration: scaledDuration
       )
+      rebuiltAudioTracks[sourceTrack.trackID] = compositionTrack
     }
 
     guard insertedTrack else {
       throw SlowVideoExportError.noVideoTrack
     }
 
-    return composition
+    return (composition, try scaledAudioMix(audioMix, tracks: rebuiltAudioTracks, rate: rate))
+  }
+
+  private static func scaledAudioMix(
+    _ original: AVAudioMix?,
+    tracks: [CMPersistentTrackID: AVMutableCompositionTrack],
+    rate: Double
+  ) throws -> AVAudioMix? {
+    guard let original else { return nil }
+    let mix = AVMutableAudioMix()
+    var parameters: [AVAudioMixInputParameters] = []
+    for input in original.inputParameters {
+      try Task.checkCancellation()
+      let target: AVMutableAudioMixInputParameters
+      if input.trackID == kCMPersistentTrackID_Invalid {
+        // Preserve the source input ID and its native meaning; mapped inputs use the rebuilt track.
+        target = AVMutableAudioMixInputParameters()
+        target.trackID = input.trackID
+      } else if let track = tracks[input.trackID] {
+        target = AVMutableAudioMixInputParameters(track: track)
+      } else {
+        // Disabled source audio tracks were deliberately not inserted.
+        continue
+      }
+      target.audioTimePitchAlgorithm = input.audioTimePitchAlgorithm
+      target.audioTapProcessor = input.audioTapProcessor
+      var cursor = CMTime.zero
+      var startVolume: Float = 0
+      var endVolume: Float = 0
+      var range = CMTimeRange.invalid
+      while input.getVolumeRamp(for: cursor, startVolume: &startVolume,
+        endVolume: &endVolume, timeRange: &range) {
+        try Task.checkCancellation()
+        let start = CMTimeMultiplyByFloat64(range.start, multiplier: 1 / rate)
+        if range.duration.isNumeric, range.duration > .zero, startVolume != endVolume {
+          target.setVolumeRamp(fromStartVolume: startVolume, toEndVolume: endVolume,
+            timeRange: CMTimeRange(start: start,
+              duration: CMTimeMultiplyByFloat64(range.duration, multiplier: 1 / rate)))
+        } else {
+          target.setVolume(startVolume, at: start)
+        }
+        let end = CMTimeRangeGetEnd(range)
+        // The last constant uses an infinite range; getVolumeRamp otherwise supplies
+        // either the current effective range or the next explicitly configured range.
+        guard end.isNumeric, end > cursor else { break }
+        cursor = end
+      }
+      parameters.append(target)
+    }
+    mix.inputParameters = parameters
+    return mix
   }
 
   private static func outputURL(in directory: URL) throws -> URL {

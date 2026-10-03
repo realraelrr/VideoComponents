@@ -11,7 +11,7 @@ public enum VideoResourcesFrames {
   public static func pickerSource<ID: Hashable>(
     source: VideoSource, identity: ID, request: VideoRequest = .init()
   ) -> VideoFramePickerSource {
-    VideoFramePickerSource(identity: identity, load: {
+    VideoFramePickerSource(identity: identity, onInvalidation: source.onInvalidation, load: {
       let receipt = try await source.acquire(request)
       try validate(receipt)
       return PlaybackLoadedMedia(asset: receipt.asset, audioMix: receipt.audioMix, validate: {
@@ -42,7 +42,7 @@ public enum VideoResourcesFrames {
     let receipt = try await source.acquire(.init(quality: .highest, network: .allowed))
     try validate(receipt)
     let url = try await SlowVideoExporter.exportSlowedVideo(
-      asset: receipt.asset, rate: rate, outputDirectory: outputDirectory, onProgress: { progress in
+      asset: receipt.asset, audioMix: receipt.audioMix, rate: rate, outputDirectory: outputDirectory, onProgress: { progress in
         // Native completion is followed by this adapter's actual-receipt gate.
         if progress < 1, !Task.isCancelled, receipt.isCurrent { onProgress(progress) }
       })

@@ -8,13 +8,59 @@ import VideoResources
 /// Keep this owner across inline/fullscreen moves; clean it up when playback actually closes.
 @MainActor @Observable
 public final class VideoResourcePlayback {
+  public enum HighQualityAction: Equatable {
+    case hidden, available, loading(Double?)
+  }
+  public enum LocalHighQualityAvailability: Equatable {
+    case unknown, requiresNetwork
+  }
+
   public let session: PlaybackSession
+  /// Only this owner's explicit HQ operation supplies busy state and progress.
+  public var highQualityAction: HighQualityAction {
+    let attempt = qualityAttempt
+    guard let visit, let acceptedReceipt, acceptedReceipt.isCurrent,
+      session.isCurrentSource(AnyHashable(ObjectIdentifier(visit.source))) else { return .hidden }
+    if let attempt, attempt.purpose == .explicit { return .loading(attempt.preparation.progress) }
+    guard let installed = installedReceipt, installed.evidence.quality != .highest else { return .hidden }
+    return localHighQualityAvailability == .requiresNetwork || hasRequestedHighQuality ? .available : .hidden
+  }
+
+  public var localHighQualityAvailability: LocalHighQualityAvailability {
+    let availability = localAvailability
+    guard let installed = installedReceipt, installed.evidence.quality != .highest,
+      lastLocalCheckRepresentation == installed.representationID else { return .unknown }
+    return availability
+  }
+
+  /// One forbidden-network check for each usable representation; failures never retry themselves.
+  /// Call from the host's existing readiness observation. Verified files are already highest quality.
+  public func checkLocalHighQuality() {
+    guard let visit, let installed = installedReceipt, installed.evidence.quality != .highest,
+      lastLocalCheckRepresentation != installed.representationID, !hasRequestedHighQuality,
+      qualityTask == nil, storedQualityAttempt == nil else { return }
+    lastLocalCheckRepresentation = installed.representationID
+    beginHighQuality(visit: visit, installed: installed, network: .forbidden, purpose: .local)
+  }
   public private(set) var qualityFailure: (any Error)?
   private var acceptedReceipt: VideoReceipt?
   @ObservationIgnored private var visit: Visit?
   @ObservationIgnored private var initialPreparation: VideoPreparation?
-  @ObservationIgnored private var qualityPreparation: VideoPreparation?
+  @ObservationIgnored private var storedQualityAttempt: QualityAttempt?
+  private var qualityAttempt: QualityAttempt? {
+    access(keyPath: \.qualityAttempt)
+    return storedQualityAttempt
+  }
   @ObservationIgnored private var qualityTask: Task<Void, Never>?
+  @ObservationIgnored private var lastLocalCheckRepresentation: VideoRepresentationID?
+  @ObservationIgnored private var hasRequestedHighQuality = false
+  private var localAvailability = LocalHighQualityAvailability.unknown
+
+  private enum QualityPurpose: Equatable { case local, explicit }
+  private struct QualityAttempt {
+    let preparation: VideoPreparation
+    let purpose: QualityPurpose
+  }
 
   private struct Visit {
     let id: UUID
@@ -92,23 +138,47 @@ public final class VideoResourcePlayback {
   /// Candidate installation and failure belong solely to this playback session.
   public func requestHighQuality(network: VideoRequest.Network = .allowed) {
     guard let visit, let installed = installedReceipt,
-      installed.evidence.quality != .highest, qualityTask == nil else { return }
+      installed.evidence.quality != .highest, qualityTask == nil, storedQualityAttempt == nil else { return }
+    hasRequestedHighQuality = true
     qualityFailure = nil
+    guard self.visit?.id == visit.id else { return }
+    beginHighQuality(visit: visit, installed: installed, network: network, purpose: .explicit)
+  }
+
+  private func beginHighQuality(
+    visit: Visit, installed: VideoReceipt, network: VideoRequest.Network, purpose: QualityPurpose
+  ) {
     let preparation = visit.source.prepare(.init(quality: .highest, network: network))
-    guard self.visit?.id == visit.id, qualityTask == nil else { preparation.cancel(); return }
-    qualityPreparation = preparation
+    guard self.visit?.id == visit.id, qualityTask == nil, storedQualityAttempt == nil else {
+      preparation.cancel()
+      return
+    }
+    // Observation's willSet callback runs before the write. A synchronous close must
+    // not put the retired preparation back into this owner after cleanup returned.
+    let published = withMutation(keyPath: \.qualityAttempt) {
+      guard self.visit?.id == visit.id, qualityTask == nil, storedQualityAttempt == nil else { return false }
+      storedQualityAttempt = QualityAttempt(preparation: preparation, purpose: purpose)
+      return true
+    }
+    guard published, self.visit?.id == visit.id,
+      storedQualityAttempt?.preparation === preparation else { preparation.cancel(); return }
     let native = session
     qualityTask = Task { [weak self] in
+      var obtainedReceipt = false
       defer {
         preparation.cancel()
-        if let self, self.visit?.id == visit.id, qualityPreparation === preparation {
-          qualityPreparation = nil
+        if let self, self.visit?.id == visit.id, storedQualityAttempt?.preparation === preparation {
           qualityTask = nil
+          withMutation(keyPath: \.qualityAttempt) {
+            guard self.visit?.id == visit.id, self.storedQualityAttempt?.preparation === preparation else { return }
+            self.storedQualityAttempt = nil
+          }
         }
       }
       do {
         try Task.checkCancellation()
         let receipt = try await preparation.value()
+        obtainedReceipt = true
         try Task.checkCancellation()
         guard self?.visit?.id == visit.id, receipt.isCurrent,
           native.isCurrentSource(AnyHashable(ObjectIdentifier(visit.source))) else {
@@ -127,7 +197,22 @@ public final class VideoResourcePlayback {
       } catch is CancellationError {
         // Closing or superseding this owner is not a resource or installation failure.
       } catch {
-        if let self, self.visit?.id == visit.id, installed.isCurrent { qualityFailure = error }
+        guard let self, self.visit?.id == visit.id, installed.isCurrent,
+          self.visit?.id == visit.id else { return }
+        switch purpose {
+        case .explicit:
+          withMutation(keyPath: \.qualityFailure) {
+            guard self.visit?.id == visit.id else { return }
+            _qualityFailure = error
+          }
+        case .local:
+          let availability: LocalHighQualityAvailability =
+            !obtainedReceipt && (error as? VideoResourceFailure) == .networkRequired ? .requiresNetwork : .unknown
+          withMutation(keyPath: \.localAvailability) {
+            guard self.visit?.id == visit.id else { return }
+            _localAvailability = availability
+          }
+        }
       }
     }
   }
@@ -175,14 +260,20 @@ public final class VideoResourcePlayback {
   }
 
   private func releaseVisit() {
+    let initial = initialPreparation
+    let quality = storedQualityAttempt?.preparation
+    let task = qualityTask
     visit = nil
+    initialPreparation = nil
+    qualityTask = nil
+    lastLocalCheckRepresentation = nil
+    hasRequestedHighQuality = false
     acceptedReceipt = nil
     qualityFailure = nil
-    initialPreparation?.cancel()
-    initialPreparation = nil
-    qualityPreparation?.cancel()
-    qualityPreparation = nil
-    qualityTask?.cancel()
-    qualityTask = nil
+    localAvailability = .unknown
+    withMutation(keyPath: \.qualityAttempt) { storedQualityAttempt = nil }
+    initial?.cancel()
+    quality?.cancel()
+    task?.cancel()
   }
 }

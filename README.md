@@ -151,6 +151,8 @@ playback.cleanup()
 
 A `VideoResourcePlayback` owns the native session's event hook. Supply host observations through its initializer; do not replace `session.onEvent`. Its loader starts a source visit only when native loading actually enters. Cleanup synchronously withdraws only this owner's initial/HQ shares, before forwarding the host event. Inline/fullscreen share this owner. HQ success is installed independently in each session; one session's installation failure does not invalidate the shared result. `installedReceipt` is available only for a current, ready, matching asset/mix. Initial loading may have obtained a result before this property becomes available. `qualityFailure` is local to this session, with host-owned recovery copy and interactions. This product adds no UI, audio policy or operation-progress controller.
 
+Observe `highQualityAction` for this owner’s `hidden`, `available`, or `loading(progress)` projection. Progress comes from its own finite preparation, including a shared acquisition, rather than another request’s source status. From the host’s existing ready-item observation, call `checkLocalHighQuality()` for one forbidden-network check per installed representation. Only a confirmed acquisition-stage `networkRequired` sets `localHighQualityAvailability` to `requiresNetwork`; unknown local failures keep usable media and do not offer a network action. An explicit request or native installation failure keeps only this owner’s retry intent. Verified local files already have highest-quality evidence.
+
 Audio preparation Retry calls the native preparation path with zero resource acquisitions. Resource Retry explicitly accepts the host's currently selected source and creates a new finite consumption for this owner, including after native source invalidation has released the old visit; callers preserve their explicit autoplay choice through `retry(source:request:thumbnail:autoplayWhenReady:)`. Rate and loop settings remain owned by the native session. Business draft/save/export consumers use their own shares and final receipt validation; a playback owner cannot cancel their work.
 
 The DanceCheckin production resolver has not been migrated to these products. Its eventual cutover must replace every resource consumer together: playback, editor/frame selection, HQ/export, draft preview and save. Remove the old resolver's acquisition task/cache, owner/consumer bookkeeping, preferred/revision facts and global retry startup with that switch. Retain host resource mapping, local Store integrity/materialization, Photos authorization interactions, account isolation, audio FIFO, poster masters/thumbnail cache, cancellation at final business mutations and the actual feature-exit boundary. Do not copy the isolated HostHarness Store into production or operate two source authorities for one media identity.
@@ -162,6 +164,8 @@ constructs a native picker source without acquiring; the mounted native Owner's 
 loader task obtains a finite receipt. Its media validator captures that receipt, not
 `source.preferred`. Different mounted pickers withdraw only their own shares.
 
+The picker registers `source.onInvalidation` after its first validated load. A source authority change synchronously detaches its paused item, cancels work, and invalidates escaped selections. Same-authority refresh, download progress and a better preferred representation preserve the mounted actual item. Closing releases the subscription; restored access waits for an explicit new picker identity. Independent native hosts may supply the optional `VideoFramePickerSource.onInvalidation` registration factory and cancellation closure.
+
 `frame(source:request:at:maximumSize:exact:)` returns `(frame, receipt)` and
 `export(source:rate:outputDirectory:onProgress:)` returns `(url, receipt)`.
 They check cancellation and the actual receipt around processing. Export requests
@@ -172,8 +176,16 @@ the host owns saving or deleting the output and must recheck the same receipt pl
 its destination/token after any permission or file I/O await. Consumer failure does
 not invalidate the shared source.
 
-This adapter does not apply a Photos audio mix to the exporter's rebuilt, slowed
-composition. A valid asset/mix receipt is not evidence of rendered mix preservation.
+Export passes the actual receipt's audio mix together with its asset. The native
+exporter associates each audio input with its rebuilt track, scales volume event
+and ramp times by `1 / rate`, and keeps the original mix unchanged. Real MP4/PCM
+regressions cover track gains, scaled volume ramps and a constant muting audio tap.
+Per-input pitch algorithms and taps are retained. A per-input `varispeed` override
+is verified by decoded 220 Hz output from a 440 Hz source at rate 0.5; the spectral
+control retains 440 Hz. These synthetic tests do not prove
+that an arbitrary time-aware or stateful tap remains semantically equivalent after
+retiming, or replace edited Photos media and physical-device acceptance. A valid
+receipt alone does not prove the exported sound.
 Automatic poster generation stays in the host's existing service: acquire highest
 with network forbidden, inspect the actual asset's local backing (including edited
 composition segments), select, promote, then validate the same receipt at the final

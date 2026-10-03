@@ -90,6 +90,7 @@ public final class VideoSource {
   @ObservationIgnored private var work: [VideoRequest: VideoOperation] = [:]
   @ObservationIgnored private var cached: Loaded?
   @ObservationIgnored private var observedPhotoAuthority: String?
+  @ObservationIgnored private var invalidationCallbacks: [UUID: @MainActor () -> Void] = [:]
 
   fileprivate enum Kind {
     case photos(String, PhotosVideoProvider)
@@ -186,13 +187,29 @@ public final class VideoSource {
     }
   }
 
+  /// Observes future source invalidations. Registration does not replay prior changes
+  /// or acquire media; the returned closure releases this observation only.
+  /// Register after accepting a receipt to observe subsequent source changes.
+  public func onInvalidation(
+    _ callback: @escaping @MainActor () -> Void
+  ) -> @MainActor () -> Void {
+    let id = UUID()
+    invalidationCallbacks[id] = callback
+    return { [weak self] in self?.invalidationCallbacks.removeValue(forKey: id) }
+  }
+
   /// Invalidates pending work and old receipts without starting new work.
   public func invalidate() {
+    let callbacks = Array(invalidationCallbacks)
     epoch &+= 1
     cached = nil
     let pending = Array(work.values)
     for operation in pending { operation.finish(.failure(VideoResourceFailure.sourceChanged)) }
     state = work.isEmpty ? .idle : .acquiring(0)
+    for (id, callback) in callbacks {
+      guard invalidationCallbacks[id] != nil else { continue }
+      callback()
+    }
   }
 
   fileprivate func isCurrent(epoch: UInt64, fact: Fact) -> Bool {
@@ -310,6 +327,9 @@ public final class VideoPreparation {
   }
   isolated deinit { operation.release(shareID) }
 
+  /// Progress reported by this finite acquisition, independently of other source requests.
+  public var progress: Double? { cancelled ? nil : operation.progress }
+
   public func share() -> VideoPreparation {
     VideoPreparation(source: source, operation: operation, cancelled: cancelled)
   }
@@ -325,19 +345,20 @@ public final class VideoPreparation {
   }
 }
 
-@MainActor
+@MainActor @Observable
 fileprivate final class VideoOperation {
-  weak var source: VideoSource?
+  @ObservationIgnored weak var source: VideoSource?
   let request: VideoRequest
   let epoch: UInt64
-  private(set) var result: Result<VideoReceipt, Error>?
-  private var shares: Set<UUID> = []
-  private var task: Task<Void, Never>?
+  private(set) var progress: Double?
+  @ObservationIgnored private(set) var result: Result<VideoReceipt, Error>?
+  @ObservationIgnored private var shares: Set<UUID> = []
+  @ObservationIgnored private var task: Task<Void, Never>?
   private struct Waiter {
     let share: UUID
     let continuation: CheckedContinuation<VideoReceipt, Error>
   }
-  private var waiters: [UUID: Waiter] = [:]
+  @ObservationIgnored private var waiters: [UUID: Waiter] = [:]
 
   init(source: VideoSource, request: VideoRequest, epoch: UInt64) {
     self.source = source
@@ -364,6 +385,9 @@ fileprivate final class VideoOperation {
     }
   }
   func report(_ progress: Double) {
+    guard result == nil else { return }
+    if progress.isFinite { self.progress = min(1, max(0, progress)) }
+    // Publishing progress may synchronously withdraw the last consumer.
     guard result == nil else { return }
     source?.progress(self, value: progress)
   }

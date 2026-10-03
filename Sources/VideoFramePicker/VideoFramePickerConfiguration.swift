@@ -8,16 +8,24 @@ import VideoPlayback
 /// Change identity when the media or the destination for a selection changes.
 /// Updating the loader alone does not reload an already mounted session. The
 /// picker never calls `cancelLoading()` on the asset supplied by the host.
+///
+/// `onInvalidation` registers after a validated load and returns its cancellation
+/// resource. A signal retires that mount; use a new identity for explicit retry.
 @MainActor
 public struct VideoFramePickerSource {
   let identity: AnyHashable
+  let onInvalidation:
+    (@MainActor (@escaping @MainActor () -> Void) -> (@MainActor () -> Void))?
   let load: @MainActor () async throws -> PlaybackLoadedMedia
 
   public init<ID: Hashable>(
     identity: ID,
+    onInvalidation:
+      (@MainActor (@escaping @MainActor () -> Void) -> (@MainActor () -> Void))? = nil,
     load: @escaping @MainActor () async throws -> PlaybackLoadedMedia
   ) {
     self.identity = AnyHashable(identity)
+    self.onInvalidation = onInvalidation
     self.load = load
   }
 }

@@ -38,7 +38,11 @@ final class VideoFramePickerOwner {
     access(keyPath: \.isProcessingSelection)
     return storedProcessingSelection
   }
-  private(set) var failure: VideoFramePickerFailure?
+  @ObservationIgnored private var storedFailure: VideoFramePickerFailure?
+  var failure: VideoFramePickerFailure? {
+    access(keyPath: \.failure)
+    return storedFailure
+  }
 
   var isSliderDisabled: Bool { player == nil || duration <= 0 || isProcessingSelection }
 
@@ -52,6 +56,7 @@ final class VideoFramePickerOwner {
   @ObservationIgnored private var sourceGeneration = UUID()
   @ObservationIgnored private var requestGeneration = UUID()
   @ObservationIgnored private var loadedMedia: PlaybackLoadedMedia?
+  @ObservationIgnored private var cancelInvalidation: (@MainActor () -> Void)?
   @ObservationIgnored private var maximumFrameSize = CGSize(width: 1280, height: 1280)
   @ObservationIgnored private var seekCoordinator: VideoSeekCoordinator?
   @ObservationIgnored private var pendingCallbacks: VideoFramePickerCallbacks?
@@ -76,6 +81,7 @@ final class VideoFramePickerOwner {
     player?.pause()
     seekCoordinator?.reset()
     player?.replaceCurrentItem(with: nil)
+    cancelInvalidation?()
   }
 
   func start(
@@ -93,13 +99,15 @@ final class VideoFramePickerOwner {
     } catch {
       let failure = error as? VideoFramePickerFailure
         ?? .source(.unavailable, cause: error)
-      self.failure = failure
-      guard isCurrent(source: generation) else { return }
+      guard mutateCurrent(\.failure, source: generation, {
+        storedFailure = failure
+      }) else { return }
       onFailure(failure)
       return
     }
 
     let load = source.load
+    let onInvalidation = source.onInvalidation
     let inspectAsset = inspectAsset
     loadTask = Task { @MainActor [weak self] in
       do {
@@ -107,6 +115,10 @@ final class VideoFramePickerOwner {
         let media = try await load()
         try Task.checkCancellation()
         try self?.validateCurrent(media, source: generation)
+        guard self?.isCurrent(source: generation) == true else { return }
+        if let onInvalidation {
+          try self?.subscribeToInvalidation(onInvalidation, media: media, generation: generation)
+        }
         guard self?.isCurrent(source: generation) == true else { return }
         let duration = try await inspectAsset(media.asset)
         try Task.checkCancellation()
@@ -134,12 +146,16 @@ final class VideoFramePickerOwner {
     invalidateExactRequest()
     let retiredPlayer = player
     let retiredSeek = seekCoordinator
+    let cancelInvalidation = cancelInvalidation
+    self.cancelInvalidation = nil
     seekCoordinator = nil
     loadedMedia = nil
     pendingCallbacks = nil
     retiredPlayer?.pause()
     retiredSeek?.reset()
     retiredPlayer?.replaceCurrentItem(with: nil)
+    cancelInvalidation?()
+    guard isCurrent(source: generation) else { return false }
     guard mutateCurrent(\.player, source: generation, { storedPlayer = nil }) else { return false }
     guard mutateCurrent(\.hasPendingSelection, source: generation, {
       storedPendingSelection = false
@@ -156,8 +172,29 @@ final class VideoFramePickerOwner {
     selectedSeconds = 0
     guard isCurrent(source: generation) else { return false }
     guard mutateCurrent(\.preview, source: generation, { storedPreview = nil }) else { return false }
-    failure = nil
-    return isCurrent(source: generation)
+    return mutateCurrent(\.failure, source: generation, { storedFailure = nil })
+  }
+
+  private func subscribeToInvalidation(
+    _ subscribe: @MainActor (@escaping @MainActor () -> Void) -> (@MainActor () -> Void),
+    media: PlaybackLoadedMedia, generation: UUID
+  ) throws {
+    guard isCurrent(source: generation) else { throw CancellationError() }
+    let cancel = subscribe { [weak self] in self?.sourceInvalidated(generation: generation) }
+    guard isCurrent(source: generation) else {
+      cancel()
+      throw CancellationError()
+    }
+    cancelInvalidation = cancel
+    try validateCurrent(media, source: generation)
+  }
+
+  private func sourceInvalidated(generation: UUID) {
+    guard isCurrent(source: generation), stop() else { return }
+    let stoppedGeneration = sourceGeneration
+    _ = mutateCurrent(\.failure, source: stoppedGeneration, {
+      storedFailure = .source(.unavailable, cause: nil)
+    })
   }
 
   func beginScrubbing() {
@@ -257,8 +294,9 @@ final class VideoFramePickerOwner {
       let failure = VideoFramePickerFailure.source(.unavailable, cause: error)
       guard stop() else { return false }
       let stoppedGeneration = sourceGeneration
-      self.failure = failure
-      guard isCurrent(source: stoppedGeneration) else { return false }
+      guard mutateCurrent(\.failure, source: stoppedGeneration, {
+        storedFailure = failure
+      }) else { return false }
       onFailure?(failure)
       return false
     }
@@ -331,8 +369,9 @@ final class VideoFramePickerOwner {
     try frame.validate()
     isShowingPlayerPreview = false
     guard isCurrent(source: source, request: generation) else { return false }
-    failure = nil
-    guard isCurrent(source: source, request: generation) else { return false }
+    guard mutateCurrent(\.failure, source: source, request: generation, {
+      storedFailure = nil
+    }) else { return false }
     guard mutateCurrent(\.isProcessingSelection, source: source, request: generation, {
       storedProcessingSelection = consuming
     }) else { return false }
@@ -370,8 +409,9 @@ final class VideoFramePickerOwner {
     // A previous exact image is still useful when the current request fails.
     isShowingPlayerPreview = preview == nil
     guard isCurrent(source: source, request: generation) else { return }
-    self.failure = failure
-    guard isCurrent(source: source, request: generation) else { return }
+    guard mutateCurrent(\.failure, source: source, request: generation, {
+      storedFailure = failure
+    }) else { return }
     onFailure(failure)
   }
 
@@ -381,9 +421,14 @@ final class VideoFramePickerOwner {
     let source = sourceGeneration
     loadTask = nil
     loadedMedia = nil
-    let failure = error as? VideoFramePickerFailure ?? .source(.unavailable, cause: error)
-    self.failure = failure
+    let cancelInvalidation = cancelInvalidation
+    self.cancelInvalidation = nil
+    cancelInvalidation?()
     guard isCurrent(source: source) else { return }
+    let failure = error as? VideoFramePickerFailure ?? .source(.unavailable, cause: error)
+    guard mutateCurrent(\.failure, source: source, {
+      storedFailure = failure
+    }) else { return }
     onFailure(failure)
   }
 

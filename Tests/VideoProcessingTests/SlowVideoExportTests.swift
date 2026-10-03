@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import MediaToolbox
 import XCTest
 
 @testable import VideoProcessing
@@ -197,6 +198,246 @@ final class SlowVideoExportIntegrationTests: XCTestCase {
     XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
   }
 
+  func testActualMixSuppressesExportedAudioAfterTrackRemapping() async throws {
+    let fixture = try await mixedAudioFixture()
+    let source = fixture.asset
+    XCTAssertEqual(fixture.audioTrackIDs, [271], "Fixture IDs must differ from newly created composition IDs")
+    let parameters = AVMutableAudioMixInputParameters()
+    parameters.trackID = try XCTUnwrap(fixture.audioTrackIDs.first)
+    parameters.setVolume(0, at: .zero)
+    let mix = AVMutableAudioMix()
+    mix.inputParameters = [parameters]
+    let directory = try outputDirectory()
+    let untreated = try await SlowVideoExporter.exportSlowedVideo(
+      asset: source, rate: 0.5, outputDirectory: directory, onProgress: { _ in })
+    let muted = try await SlowVideoExporter.exportSlowedVideo(
+      asset: source, audioMix: mix, rate: 0.5, outputDirectory: directory, onProgress: { _ in })
+    let untreatedRMS = try await audioRMS(untreated, from: 0.3, to: 3.7)
+    let mutedRMS = try await audioRMS(muted, from: 0.3, to: 3.7)
+    XCTAssertGreaterThan(untreatedRMS, 0.2, "The fixture must contain audible decoded samples")
+    print("MIX_OUTPUT constant baseline=\(untreatedRMS) muted=\(mutedRMS)")
+    XCTAssertLessThan(mutedRMS / untreatedRMS, 0.01,
+      "Actual export must apply the source mix to the new composition audio track")
+    XCTAssertEqual(parameters.trackID, 271, "The borrowed source mix must remain unchanged")
+  }
+
+  func testVolumeRampsFollowScaledTimelineAndHoldTheirLastValue() async throws {
+    let fixture = try await mixedAudioFixture()
+    let source = fixture.asset
+    let parameters = AVMutableAudioMixInputParameters()
+    parameters.trackID = try XCTUnwrap(fixture.audioTrackIDs.first)
+    parameters.setVolume(1, at: .zero)
+    parameters.setVolumeRamp(fromStartVolume: 1, toEndVolume: 0,
+      timeRange: CMTimeRange(start: CMTime(seconds: 0.5, preferredTimescale: 600),
+        duration: CMTime(seconds: 0.5, preferredTimescale: 600)))
+    parameters.setVolume(0.5, at: CMTime(seconds: 1.5, preferredTimescale: 600))
+    for query in [0.0, 0.5, 1.0, 1.5, 1.5001, 2.0] {
+      var from: Float = 0
+      var to: Float = 0
+      var range = CMTimeRange.invalid
+      let found = parameters.getVolumeRamp(for: CMTime(seconds: query, preferredTimescale: 60_000),
+        startVolume: &from, endVolume: &to, timeRange: &range)
+      print("MIX_PARAMETER query=\(query) found=\(found) range=\(range.start.seconds),\(range.duration.seconds) volumes=\(from),\(to)")
+    }
+    let mix = AVMutableAudioMix()
+    mix.inputParameters = [parameters]
+    let directory = try outputDirectory()
+    for rate in [0.5, 1.0] {
+      let untreated = try await SlowVideoExporter.exportSlowedVideo(
+        asset: source, rate: rate, outputDirectory: directory, onProgress: { _ in })
+      let mixed = try await SlowVideoExporter.exportSlowedVideo(
+        asset: source, audioMix: mix, rate: rate, outputDirectory: directory, onProgress: { _ in })
+      var ratios: [Double] = []
+      // The windows use source times; each expected audible state must move by 1/rate.
+      for window in [(0.15, 0.35), (0.7, 0.8), (1.15, 1.35), (1.65, 1.85)] {
+        let baseline = try await audioRMS(untreated, from: window.0 / rate, to: window.1 / rate)
+        let processed = try await audioRMS(mixed, from: window.0 / rate, to: window.1 / rate)
+        XCTAssertGreaterThan(baseline, 0.2)
+        ratios.append(processed / baseline)
+      }
+      print("MIX_OUTPUT ramp rate=\(rate) ratios=\(ratios)")
+      XCTAssertEqual(ratios[0], 1, accuracy: 0.08)
+      XCTAssertEqual(ratios[1], 0.5, accuracy: 0.12)
+      XCTAssertLessThan(ratios[2], 0.01)
+      XCTAssertEqual(ratios[3], 0.5, accuracy: 0.08)
+    }
+  }
+
+  func testDifferentTrackGainsAreAppliedToTheirCorrespondingRebuiltTracks() async throws {
+    let fixture = try await mixedAudioFixture(twoAudioTracks: true)
+    let source = fixture.asset
+    XCTAssertEqual(fixture.audioTrackIDs, [271, 919])
+    let loud = AVMutableAudioMixInputParameters()
+    loud.trackID = try XCTUnwrap(fixture.audioTrackIDs.first)
+    loud.setVolume(0, at: .zero)
+    let quiet = AVMutableAudioMixInputParameters()
+    quiet.trackID = try XCTUnwrap(fixture.audioTrackIDs.last)
+    quiet.setVolume(0.5, at: .zero)
+    let mix = AVMutableAudioMix()
+    // Ordering differs deliberately from source track ordering.
+    mix.inputParameters = [quiet, loud]
+    let directory = try outputDirectory()
+    for rate in [0.5, 1.0] {
+      let untreated = try await SlowVideoExporter.exportSlowedVideo(
+        asset: source, rate: rate, outputDirectory: directory, onProgress: { _ in })
+      let mixed = try await SlowVideoExporter.exportSlowedVideo(
+        asset: source, audioMix: mix, rate: rate, outputDirectory: directory, onProgress: { _ in })
+      let untreatedRMS = try await audioRMS(untreated, from: 0.15 / rate, to: 1.85 / rate)
+      let mixedRMS = try await audioRMS(mixed, from: 0.15 / rate, to: 1.85 / rate)
+      XCTAssertGreaterThan(untreatedRMS, 0.4)
+      let ratio = mixedRMS / untreatedRMS
+      print("MIX_OUTPUT two_tracks rate=\(rate) ratio=\(ratio)")
+      // Two phase-aligned source tones have amplitudes 0.5 + 0.25; the target is 0 + 0.125.
+      XCTAssertEqual(ratio, 1.0 / 6, accuracy: 0.025,
+        "Association must use original track IDs, rather than parameter or track order")
+    }
+  }
+
+  func testAudioTapAffectsActualNativeAndSlowedExportSamples() async throws {
+    let fixture = try await mixedAudioFixture()
+    let source = fixture.asset
+    let parameters = AVMutableAudioMixInputParameters()
+    parameters.trackID = try XCTUnwrap(fixture.audioTrackIDs.first)
+    var callbacks = MTAudioProcessingTapCallbacks(
+      version: kMTAudioProcessingTapCallbacksVersion_0, clientInfo: nil,
+      init: nil, finalize: nil, prepare: nil, unprepare: nil,
+      process: { tap, frames, _, buffers, framesOut, flagsOut in
+        let status = MTAudioProcessingTapGetSourceAudio(tap, frames, buffers, flagsOut, nil, framesOut)
+        guard status == noErr else { framesOut.pointee = 0; return }
+        for buffer in UnsafeMutableAudioBufferListPointer(buffers) {
+          if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+        }
+      })
+    var retainedTap: MTAudioProcessingTap?
+    XCTAssertEqual(MTAudioProcessingTapCreate(kCFAllocatorDefault, &callbacks,
+      kMTAudioProcessingTapCreationFlag_PostEffects, &retainedTap), noErr)
+    parameters.audioTapProcessor = try XCTUnwrap(retainedTap)
+    let mix = AVMutableAudioMix()
+    mix.inputParameters = [parameters]
+    let directory = try outputDirectory()
+    let controlURL = directory.appendingPathComponent("native-tap-control.mp4")
+    let session = try XCTUnwrap(AVAssetExportSession(asset: source, presetName: AVAssetExportPresetHighestQuality))
+    session.audioMix = mix
+    session.outputURL = controlURL
+    session.outputFileType = .mp4
+    _ = try await SlowVideoExportRunner(session: session, outputURL: controlURL).export { _ in }
+    let controlRMS = try await audioRMS(controlURL, from: 0.15, to: 1.85)
+    let slowed = try await SlowVideoExporter.exportSlowedVideo(
+      asset: source, audioMix: mix, rate: 0.5, outputDirectory: directory, onProgress: { _ in })
+    let slowedRMS = try await audioRMS(slowed, from: 0.3, to: 3.7)
+    print("MIX_OUTPUT tap native=\(controlRMS) slowed=\(slowedRMS)")
+    XCTAssertLessThan(controlRMS, 0.003,
+      "A native export control must prove that this tap has an actual sample effect")
+    XCTAssertLessThan(slowedRMS, 0.003,
+      "The mapped slowed mix must retain the actual tap processing effect")
+  }
+
+  func testInputPitchAlgorithmAffectsActualSlowedExportSamples() async throws {
+    let fixture = try await mixedAudioFixture()
+    let input = AVMutableAudioMixInputParameters()
+    input.trackID = try XCTUnwrap(fixture.audioTrackIDs.first)
+    input.audioTimePitchAlgorithm = .varispeed
+    let mix = AVMutableAudioMix()
+    mix.inputParameters = [input]
+    let directory = try outputDirectory()
+    let baseline = try await SlowVideoExporter.exportSlowedVideo(
+      asset: fixture.asset, rate: 0.5, outputDirectory: directory, onProgress: { _ in })
+    let mixed = try await SlowVideoExporter.exportSlowedVideo(
+      asset: fixture.asset, audioMix: mix, rate: 0.5, outputDirectory: directory, onProgress: { _ in })
+    // Decode PCM, project a source-time-stable interior window onto sin/cos at each frequency.
+    let baselineAmplitude = try await frequencyAmplitudes(baseline, frequencies: [440, 220])
+    let mixedAmplitude = try await frequencyAmplitudes(mixed, frequencies: [440, 220])
+    print("MIX_OUTPUT pitch baseline=\(baselineAmplitude) varispeed=\(mixedAmplitude)")
+    XCTAssertGreaterThan(baselineAmplitude[0], 0.1)
+    XCTAssertGreaterThan(baselineAmplitude[0], baselineAmplitude[1] * 20)
+    XCTAssertGreaterThan(mixedAmplitude[1], 0.1)
+    XCTAssertGreaterThan(mixedAmplitude[1], mixedAmplitude[0] * 20)
+  }
+
+  private func mixedAudioFixture(twoAudioTracks: Bool = false) async throws
+    -> (asset: AVComposition, audioTrackIDs: [CMPersistentTrackID]) {
+    let videoAsset = try await videoFixture()
+    let audioAsset = AVURLAsset(url: try audioFixture())
+    let videos = try await videoAsset.loadTracks(withMediaType: .video)
+    let audios = try await audioAsset.loadTracks(withMediaType: .audio)
+    let sourceVideo = try XCTUnwrap(videos.first)
+    let sourceAudio = try XCTUnwrap(audios.first)
+    let composition = AVMutableComposition()
+    let video = try XCTUnwrap(composition.addMutableTrack(withMediaType: .video, preferredTrackID: 73))
+    try video.insertTimeRange(CMTimeRange(start: .zero, duration: CMTime(seconds: 2, preferredTimescale: 600)),
+      of: sourceVideo, at: .zero)
+    video.preferredTransform = try await sourceVideo.load(.preferredTransform)
+    let audio = try XCTUnwrap(composition.addMutableTrack(withMediaType: .audio, preferredTrackID: 271))
+    var audioTrackIDs = [audio.trackID]
+    let second = CMTime(seconds: 1, preferredTimescale: 600)
+    let audioRange = CMTimeRange(start: .zero, duration: second)
+    try audio.insertTimeRange(audioRange, of: sourceAudio, at: .zero)
+    try audio.insertTimeRange(audioRange, of: sourceAudio, at: second)
+    if twoAudioTracks {
+      let quietAsset = AVURLAsset(url: try audioFixture(amplitude: 0.25))
+      let quietTracks = try await quietAsset.loadTracks(withMediaType: .audio)
+      let quietSource = try XCTUnwrap(quietTracks.first)
+      let quiet = try XCTUnwrap(composition.addMutableTrack(withMediaType: .audio, preferredTrackID: 919))
+      audioTrackIDs.append(quiet.trackID)
+      try quiet.insertTimeRange(audioRange, of: quietSource, at: .zero)
+      try quiet.insertTimeRange(audioRange, of: quietSource, at: second)
+    }
+    // Freeze the assembled fixture before asynchronous inspection or export borrows it.
+    return (try XCTUnwrap(composition.copy() as? AVComposition), audioTrackIDs)
+  }
+
+  private func audioRMS(_ url: URL, from start: Double, to end: Double) async throws -> Double {
+    let values = try await decodedAudio(url).filter { $0.time >= start && $0.time < end }
+    XCTAssertGreaterThan(values.count, 100, "The window must measure real PCM samples")
+    let sum = values.reduce(0.0) { $0 + $1.value * $1.value }
+    return sqrt(sum / Double(max(values.count, 1)))
+  }
+
+  private func frequencyAmplitudes(_ url: URL, frequencies: [Double]) async throws -> [Double] {
+    let values = try await decodedAudio(url).filter { (0.3..<3.7).contains($0.time) }
+    XCTAssertGreaterThan(values.count, 1_000)
+    return frequencies.map { frequency in
+      var real = 0.0
+      var imaginary = 0.0
+      for sample in values {
+        let phase = 2 * Double.pi * frequency * sample.time
+        real += sample.value * cos(phase)
+        imaginary += sample.value * sin(phase)
+      }
+      return hypot(real, imaginary) / Double(max(values.count, 1))
+    }
+  }
+
+  private func decodedAudio(_ url: URL) async throws -> [(time: Double, value: Double)] {
+    let asset = AVURLAsset(url: url)
+    let tracks = try await asset.loadTracks(withMediaType: .audio)
+    XCTAssertEqual(tracks.count, 1, "The result must have an actual decodable audio track")
+    let reader = try AVAssetReader(asset: asset)
+    let output = AVAssetReaderTrackOutput(track: try XCTUnwrap(tracks.first), outputSettings: [
+      AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMIsFloatKey: true,
+      AVLinearPCMBitDepthKey: 32, AVLinearPCMIsNonInterleaved: false,
+      AVSampleRateKey: 44_100, AVNumberOfChannelsKey: 1
+    ])
+    reader.add(output)
+    XCTAssertTrue(reader.startReading())
+    var samples: [(time: Double, value: Double)] = []
+    while let sample = output.copyNextSampleBuffer() {
+      guard let block = CMSampleBufferGetDataBuffer(sample) else { continue }
+      let length = CMBlockBufferGetDataLength(block)
+      var values = [Float](repeating: 0, count: length / MemoryLayout<Float>.size)
+      let status = values.withUnsafeMutableBytes {
+        CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!)
+      }
+      XCTAssertEqual(status, kCMBlockBufferNoErr)
+      let seconds = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+      for (index, value) in values.enumerated() {
+        samples.append((seconds + Double(index) / 44_100, Double(value)))
+      }
+    }
+    XCTAssertEqual(reader.status, .completed)
+    return samples
+  }
+
   private func videoFixture() async throws -> AVURLAsset {
     let url = try fixtureURL(extension: "mov")
     let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
@@ -228,12 +469,12 @@ final class SlowVideoExportIntegrationTests: XCTestCase {
     return AVURLAsset(url: url)
   }
 
-  private func audioFixture() throws -> URL {
+  private func audioFixture(amplitude: Float = 0.5) throws -> URL {
     let url = try fixtureURL(extension: "caf")
     let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1))
     let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 44_100))
     buffer.frameLength = 44_100
-    for index in 0..<44_100 { buffer.floatChannelData?[0][index] = Float(sin(Double(index) * 2 * .pi * 440 / 44_100)) * 0.5 }
+    for index in 0..<44_100 { buffer.floatChannelData?[0][index] = Float(sin(Double(index) * 2 * .pi * 440 / 44_100)) * amplitude }
     let file = try AVAudioFile(forWriting: url, settings: format.settings)
     try file.write(from: buffer)
     return url

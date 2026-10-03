@@ -477,6 +477,226 @@ final class VideoResourcePlaybackTests: XCTestCase {
     XCTAssertNil(binding.session.failure)
   }
 
+  func testHighQualityProgressBelongsToEachSharedConsumerAndIgnoresOtherRequests() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "consumer-progress")
+    let first = VideoResourcePlayback()
+    let second = VideoResourcePlayback()
+    defer { first.cleanup(); second.cleanup(); probe.finishOutstanding() }
+    let automatic = try await movie()
+    let highest = try await movie(blue: true)
+    first.load(source: source)
+    second.load(source: source)
+    try await waitUntil { probe.invocations.count == 1 }
+    probe.finish(0, with: .success(.init(asset: automatic)))
+    try await waitUntil { first.installedReceipt != nil && second.installedReceipt != nil }
+
+    first.requestHighQuality()
+    second.requestHighQuality()
+    try await waitUntil { probe.invocations.count == 2 }
+    probe.report(0.25, at: 1)
+    await settle()
+    XCTAssertEqual(first.highQualityAction, .loading(0.25))
+    XCTAssertEqual(second.highQualityAction, .loading(0.25))
+
+    let unrelated = source.prepare(.init(quality: .highest, network: .forbidden))
+    defer { unrelated.cancel() }
+    try await waitUntil { probe.invocations.count == 3 }
+    probe.report(0.9, at: 2)
+    await settle()
+    XCTAssertEqual(first.highQualityAction, .loading(0.25),
+      "Another request's progress must not become this consumer's HQ progress")
+    XCTAssertEqual(second.highQualityAction, .loading(0.25))
+
+    first.cleanup()
+    XCTAssertEqual(first.highQualityAction, .hidden)
+    XCTAssertTrue(probe.cancelledIndices.isEmpty)
+    probe.report(0.6, at: 1)
+    await settle()
+    XCTAssertEqual(second.highQualityAction, .loading(0.6))
+    probe.finish(1, with: .success(.init(asset: highest)))
+    try await waitUntil { second.installedReceipt?.evidence.quality == .highest }
+    XCTAssertEqual(first.highQualityAction, .hidden)
+    XCTAssertEqual(second.highQualityAction, .hidden)
+  }
+
+  func testHighQualityPublicationObserverCloseNeverRestoresOwnedShare() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "observable-HQ-close")
+    let binding = VideoResourcePlayback()
+    defer { binding.cleanup(); probe.finishOutstanding() }
+    let automatic = try await movie()
+    try await ready(binding, source: source, probe: probe, asset: automatic)
+    let original = try XCTUnwrap(binding.installedReceipt)
+    let observation = BindingReentrantObservation()
+    withObservationTracking {
+      _ = binding.highQualityAction
+    } onChange: {
+      MainActor.assumeIsolated {
+        guard !observation.fired else { return }
+        observation.fired = true
+        binding.cleanup()
+      }
+    }
+
+    binding.requestHighQuality()
+    await settle()
+
+    XCTAssertTrue(observation.fired, "Starting HQ must publish this consumer's observable action")
+    XCTAssertEqual(binding.highQualityAction, .hidden)
+    XCTAssertNil(binding.installedReceipt)
+    XCTAssertNil(binding.session.player.currentItem)
+    XCTAssertEqual(probe.invocations.count, 1,
+      "Synchronous close during action publication must withdraw the share before native entry")
+    XCTAssertEqual(source.preferred?.representationID, original.representationID)
+  }
+
+  func testHighQualityLocalProbeOnlyConfirmedNetworkRequirementOffersExplicitRequest() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "local-needs-network")
+    let binding = VideoResourcePlayback()
+    defer { binding.cleanup(); probe.finishOutstanding() }
+    let automatic = try await movie()
+    let highest = try await movie(blue: true)
+    try await ready(binding, source: source, probe: probe, asset: automatic)
+    let original = try XCTUnwrap(binding.installedReceipt)
+    binding.checkLocalHighQuality()
+    binding.checkLocalHighQuality()
+    await settle()
+    guard probe.invocations.count == 2 else {
+      return XCTFail("The usable automatic representation requires one finite local HQ check")
+    }
+    XCTAssertEqual(probe.invocations[1].request, .init(quality: .highest, network: .forbidden))
+    XCTAssertEqual(binding.highQualityAction, .hidden, "A passive local check is not an explicit HQ spinner")
+    probe.finish(1, with: .failure(VideoResourceFailure.networkRequired))
+    try await waitUntil { binding.localHighQualityAvailability == .requiresNetwork }
+    XCTAssertEqual(binding.highQualityAction, .available)
+    XCTAssertNil(binding.qualityFailure)
+    XCTAssertEqual(binding.installedReceipt?.representationID, original.representationID)
+    binding.checkLocalHighQuality()
+    await settle()
+    XCTAssertEqual(probe.invocations.count, 2, "The same representation's failed check never retries automatically")
+
+    binding.requestHighQuality()
+    try await waitUntil { probe.invocations.count == 3 }
+    XCTAssertEqual(probe.invocations[2].request, .init(quality: .highest, network: .allowed))
+    XCTAssertEqual(binding.highQualityAction, .loading(nil))
+    probe.finish(2, with: .success(.init(asset: highest)))
+    try await waitUntil { binding.installedReceipt?.evidence.quality == .highest }
+    XCTAssertEqual(binding.highQualityAction, .hidden)
+  }
+
+  func testHighQualityUnknownLocalFailuresKeepUsableMediaAndDoNotOfferNetworkControl() async throws {
+    let automatic = try await movie()
+    for reason in [VideoResourceFailure.acquisitionFailed, .sourceUnavailable] {
+      let probe = BindingLoaderProbe()
+      let source = probe.resources().photosSource(serializedCloudIdentifier: "unknown-local")
+      let binding = VideoResourcePlayback()
+      defer { binding.cleanup(); probe.finishOutstanding() }
+      try await ready(binding, source: source, probe: probe, asset: automatic)
+      let original = try XCTUnwrap(binding.installedReceipt)
+      binding.checkLocalHighQuality()
+      await settle()
+      guard probe.invocations.count == 2 else {
+        return XCTFail("The fixture must exercise the actual forbidden-network HQ request")
+      }
+      probe.finish(1, with: .failure(reason))
+      try await waitUntil { probe.returnedIndices.contains(1) }
+      await settle()
+      XCTAssertEqual(binding.localHighQualityAvailability, .unknown)
+      XCTAssertEqual(binding.highQualityAction, .hidden)
+      XCTAssertNil(binding.qualityFailure, "An unknown local check is not an explicit quality failure")
+      XCTAssertEqual(binding.installedReceipt?.representationID, original.representationID)
+      XCTAssertTrue(binding.session.isPlayerReady)
+      binding.checkLocalHighQuality()
+      await settle()
+      XCTAssertEqual(probe.invocations.count, 2)
+    }
+  }
+
+  func testHighQualityLocalCheckWaitsForUsableMediaAndSkipsVerifiedFiles() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "probe-after-ready")
+    let binding = VideoResourcePlayback()
+    defer { binding.cleanup(); probe.finishOutstanding() }
+    let automatic = try await movie()
+    let highest = try await movie(blue: true)
+    binding.load(source: source)
+    binding.checkLocalHighQuality()
+    try await waitUntil { probe.invocations.count == 1 }
+    XCTAssertEqual(probe.invocations.count, 1, "No HQ check runs before the initial item is usable")
+    probe.finish(0, with: .success(.init(asset: automatic)))
+    try await waitUntil { binding.installedReceipt != nil }
+    binding.checkLocalHighQuality()
+    await settle()
+    guard probe.invocations.count == 2 else {
+      return XCTFail("A usable Photos automatic item can start its local classification")
+    }
+    probe.finish(1, with: .success(.init(asset: highest)))
+    try await waitUntil { binding.installedReceipt?.evidence.quality == .highest }
+    XCTAssertTrue(binding.session.player.currentItem?.asset === highest)
+    XCTAssertEqual(binding.highQualityAction, .hidden)
+    XCTAssertNil(binding.qualityFailure)
+
+    let file = VerifiedVideoFile(url: automatic.url,
+      fingerprint: try VideoFileFingerprint.capture(at: automatic.url))
+    var verifications = 0
+    var photosCalls = 0
+    let resources = VideoResources(photos: PhotosVideoProvider(authority: { _ in "unused" },
+      load: { _, _, _ in photosCalls += 1; throw VideoResourceFailure.sourceUnavailable }),
+      verifiedFile: { _ in verifications += 1; return file })
+    let local = VideoResourcePlayback()
+    defer { local.cleanup() }
+    local.load(source: resources.fileSource(identity: "full-verified-descriptor"))
+    try await waitUntil { local.installedReceipt != nil }
+    local.checkLocalHighQuality()
+    local.requestHighQuality()
+    await settle()
+    XCTAssertEqual(verifications, 1)
+    XCTAssertEqual(photosCalls, 0)
+    XCTAssertEqual(local.highQualityAction, .hidden)
+  }
+
+  func testHighQualityInstallationFailureRetainsOnlyOwnExplicitRetryDespiteSharedHQ() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "independent-HQ-action")
+    var installations = 0
+    let native = PlaybackSession(transportSeek: PlaybackSession.seekTransport,
+      prepareReplacement: { asset in
+        installations += 1
+        if installations == 1 { throw BindingTestError.installationDenied }
+        return AVPlayerItem(asset: asset)
+      })
+    let failing = VideoResourcePlayback(session: native)
+    let succeeding = VideoResourcePlayback()
+    defer { failing.cleanup(); succeeding.cleanup(); probe.finishOutstanding() }
+    let automatic = try await movie()
+    let highest = try await movie(blue: true)
+    failing.load(source: source)
+    succeeding.load(source: source)
+    try await waitUntil { probe.invocations.count == 1 }
+    probe.finish(0, with: .success(.init(asset: automatic)))
+    try await waitUntil { failing.installedReceipt != nil && succeeding.installedReceipt != nil }
+    let original = try XCTUnwrap(failing.installedReceipt)
+    failing.requestHighQuality()
+    succeeding.requestHighQuality()
+    try await waitUntil { probe.invocations.count == 2 }
+    probe.finish(1, with: .success(.init(asset: highest)))
+    try await waitUntil { failing.qualityFailure != nil && succeeding.installedReceipt?.evidence.quality == .highest }
+    await settle()
+    XCTAssertEqual(failing.installedReceipt?.representationID, original.representationID)
+    XCTAssertEqual(failing.highQualityAction, .available,
+      "A peer's shared HQ receipt does not erase this session's explicit installation retry")
+    XCTAssertEqual(succeeding.highQualityAction, .hidden)
+    XCTAssertEqual(installations, 1, "Shared source publication must not automatically retry a failed installation")
+    failing.requestHighQuality()
+    try await waitUntil { failing.installedReceipt?.evidence.quality == .highest }
+    XCTAssertEqual(installations, 2)
+    XCTAssertEqual(probe.invocations.count, 2, "Explicit native retry can install the acquired shared HQ receipt")
+    XCTAssertEqual(failing.highQualityAction, .hidden)
+    XCTAssertNil(failing.qualityFailure)
+  }
+
   private func reenterHighQualityOnce(_ binding: VideoResourcePlayback,
     source: VideoSource) -> BindingReentrantObservation {
     let observation = BindingReentrantObservation()
@@ -569,6 +789,7 @@ private final class BindingLoaderProbe {
   struct Invocation {
     let identifier: String
     let request: VideoRequest
+    let progress: PhotosVideoProvider.Progress
     var continuation: CheckedContinuation<VideoRepresentation, Error>?
   }
   private(set) var invocations: [Invocation] = []
@@ -577,7 +798,8 @@ private final class BindingLoaderProbe {
 
   func resources() -> VideoResources {
     VideoResources(photos: PhotosVideoProvider(authority: { "visible:\($0)" },
-      load: { [self] identifier, request, _ in try await load(identifier, request: request) }))
+      load: { [self] identifier, request, progress in
+        try await load(identifier, request: request, progress: progress) }))
   }
 
   func finish(_ index: Int, with result: Result<VideoRepresentation, Error>,
@@ -598,12 +820,15 @@ private final class BindingLoaderProbe {
     }
   }
 
-  private func load(_ identifier: String, request: VideoRequest) async throws -> VideoRepresentation {
+  func report(_ value: Double, at index: Int) { invocations[index].progress(value) }
+
+  private func load(_ identifier: String, request: VideoRequest,
+    progress: @escaping PhotosVideoProvider.Progress) async throws -> VideoRepresentation {
     let index = invocations.count
     defer { returnedIndices.insert(index) }
     return try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { continuation in
-        invocations.append(.init(identifier: identifier, request: request, continuation: continuation))
+        invocations.append(.init(identifier: identifier, request: request, progress: progress, continuation: continuation))
       }
     } onCancel: {
       Task { @MainActor [weak self] in self?.cancelledIndices.append(index) }
