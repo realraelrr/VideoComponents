@@ -21,8 +21,10 @@ The exercised toolchain is Xcode 27.0 (27A266a), Apple Swift 6.4, with iOS 27 Si
 ## Installation
 
 Choose **File → Add Package Dependencies** in Xcode, enter
-`https://github.com/realraelrr/VideoComponents.git`, and select **Up to Next Major
-Version** from `0.3.0`. Link only the product or products your target needs.
+`https://github.com/realraelrr/VideoComponents.git`, and select **Branch** `main`
+for the current unreleased APIs shown below. Link only the products your target needs.
+Released `0.3.0` retains the previous raw-asset playback API; use that tag's README
+when consuming the release. The new resources products have no release tag yet.
 Version `0.2.0` adds the optional picker and automatic poster V2; the original
 `VideoPlayback` and `VideoProcessing` products were introduced in `0.1.0`.
 Version `0.2.1` fixes fullscreen idle chrome, zoomed pan boundaries and cancelled scrubbing.
@@ -40,7 +42,7 @@ let package = Package(
   name: "MyFeature",
   platforms: [.iOS(.v17)],
   dependencies: [
-    .package(url: "https://github.com/realraelrr/VideoComponents.git", from: "0.3.0"),
+    .package(url: "https://github.com/realraelrr/VideoComponents.git", branch: "main"),
   ],
   targets: [
     .target(
