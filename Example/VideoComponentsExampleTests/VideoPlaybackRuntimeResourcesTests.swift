@@ -2460,6 +2460,55 @@ extension VideoPlaybackRuntimeResourcesTests {
 }
 
 extension VideoPlaybackMountedTests {
+  func testFullscreenHighQualityAndRateStayAtTopRightBesideTheAccessory() async throws {
+    try await requireNativeControlAccessibilityRuntime()
+    for (width, typeSize) in [(CGFloat(390), DynamicTypeSize.large), (320, .accessibility3)] {
+      let session = try await readySession()
+      session.updatePlaybackRate(1.5)
+      let labels = VideoPlaybackLabels(locale: Locale(identifier: "en"))
+      let host = UIHostingController(rootView: FullscreenPlaybackView(
+        playbackSession: session, onClose: {}, labels: labels,
+        highQualityControl: .available {},
+        trailingAccessory: {
+          Button {} label: {
+            Image(systemName: "square.and.arrow.up").frame(width: 44, height: 44)
+          }.accessibilityLabel("Fixture export")
+        }, statusOverlay: { EmptyView() }
+      ).environment(\.scenePhase, .active).environment(\.dynamicTypeSize, typeSize))
+      let window = try mountHighQualityHost(host, size: CGSize(width: width, height: 700))
+      defer { window.isHidden = true; window.rootViewController = nil; session.cleanup() }
+      try await Task.sleep(for: .milliseconds(100))
+      let bounds = UIAccessibility.convertToScreenCoordinates(host.view.bounds, in: host.view)
+      let elements = fullscreenAccessibilityElements(in: host.view)
+      let rate = try XCTUnwrap(elements.first { $0.accessibilityLabel == session.playbackRateIndicatorText })
+      let hq = try XCTUnwrap(highQualityButton(in: host.view, label: labels.highQualityAccessibility))
+      let accessory = try XCTUnwrap(highQualityButton(in: host.view, label: "Fixture export"))
+      let close = try XCTUnwrap(highQualityButton(in: host.view, label: labels.close))
+      let play = try XCTUnwrap(highQualityButton(in: host.view, label: labels.play))
+      for element in [rate, hq, accessory] {
+        XCTAssertTrue(bounds.contains(element.accessibilityFrame), "Top controls must fit at \(width)pt \(typeSize)")
+        XCTAssertLessThan(element.accessibilityFrame.maxY, bounds.minY + 100,
+          "HQ and rate must stay at the top with the original accessory")
+      }
+      XCTAssertLessThanOrEqual(rate.accessibilityFrame.height, hq.accessibilityFrame.height + 12,
+        "The rate badge must keep its numeric value on one line at large text sizes")
+      XCTAssertGreaterThan(rate.accessibilityFrame.minX, close.accessibilityFrame.maxX)
+      XCTAssertLessThanOrEqual(rate.accessibilityFrame.maxX, hq.accessibilityFrame.minX)
+      XCTAssertLessThanOrEqual(hq.accessibilityFrame.maxX, accessory.accessibilityFrame.minX)
+      XCTAssertGreaterThan(hq.accessibilityFrame.midX, bounds.midX)
+      XCTAssertGreaterThan(play.accessibilityFrame.minY, bounds.midY, "Play must remain in the bottom console")
+      XCTAssertGreaterThanOrEqual(hq.accessibilityFrame.width, 44)
+      XCTAssertGreaterThanOrEqual(hq.accessibilityFrame.height, 44)
+      let image = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
+        host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true)
+      }
+      let attachment = XCTAttachment(image: image)
+      attachment.name = "Top right controls \(Int(width))pt \(typeSize)"
+      attachment.lifetime = .keepAlways
+      add(attachment)
+    }
+  }
+
   func testFullscreenHighQualityUsesChromeIdleAndSingleTapVisibility() async throws {
     try await requireNativeControlAccessibilityRuntime()
     let session = try await readySession()
@@ -2622,9 +2671,7 @@ extension VideoPlaybackMountedTests {
       let window = try mountHighQualityHost(host, size: CGSize(width: 390, height: 700))
       defer { window.isHidden = true; window.rootViewController = nil }
       try await Task.sleep(for: .milliseconds(100))
-      let region = CGRect(x: 0, y: host.view.bounds.height - 120,
-        width: host.view.bounds.width, height: 120)
-      assertFullscreenPlaybackControls(in: host.view, session: session, labels: labels, region: region, visible: false)
+      assertFullscreenPlaybackControls(in: host.view, session: session, labels: labels, region: nil, visible: false)
       let close = try XCTUnwrap(highQualityButton(in: host.view, label: labels.close))
       XCTAssertTrue(close.accessibilityActivate())
       XCTAssertEqual(closes, 1)
@@ -2745,7 +2792,7 @@ extension VideoPlaybackMountedTests {
     in view: UIView, name: String
   ) throws -> (navigation: Int, playback: Int) {
     // The fixture has black media, no status overlay and no trailing accessory.
-    // Exclude only the close/reset area, so old top-right HQ remains detectable.
+    // Exclude only the two navigation targets; detect rate/HQ ink at the top right too.
     view.layoutIfNeeded()
     let format = UIGraphicsImageRendererFormat()
     format.scale = 1
@@ -2769,7 +2816,7 @@ extension VideoPlaybackMountedTests {
       for x in 0..<cgImage.width {
         let offset = (y * cgImage.width + x) * 4
         guard bytes[offset] > 200 && bytes[offset + 1] > 200 && bytes[offset + 2] > 200 else { continue }
-        if x < 160 && y < 120 { navigation += 1 }
+        if x < 112 && y < 120 { navigation += 1 }
         else { playback += 1 }
       }
     }
@@ -2781,7 +2828,7 @@ extension VideoPlaybackMountedTests {
   }
 
   private func assertFullscreenPlaybackControls(
-    in root: UIView, session: PlaybackSession, labels: VideoPlaybackLabels, region: CGRect, visible: Bool,
+    in root: UIView, session: PlaybackSession, labels: VideoPlaybackLabels, region: CGRect?, visible: Bool,
     file: StaticString = #filePath, line: UInt = #line
   ) {
     let elements = fullscreenAccessibilityElements(in: root)
@@ -2791,8 +2838,10 @@ extension VideoPlaybackMountedTests {
       XCTAssertEqual(elements.contains { $0.accessibilityLabel == label }, visible,
         "The actual fullscreen control \(label) must share the group's visibility", file: file, line: line)
     }
-    XCTAssertEqual(hasHighQualityPixels(in: root, region: region), visible,
-      "HQ must share both rendered and accessibility visibility", file: file, line: line)
+    if let region {
+      XCTAssertEqual(hasHighQualityPixels(in: root, region: region), visible,
+        "HQ must share both rendered and accessibility visibility", file: file, line: line)
+    }
     if visible {
       let bounds = UIAccessibility.convertToScreenCoordinates(root.bounds, in: root)
       for label in [labels.play, labels.progress, labels.highQualityAccessibility] {
@@ -3039,8 +3088,7 @@ extension VideoPlaybackMountedTests {
   private func routingRenderedTargets(
     in root: UIView, name: String
   ) throws -> (hq: CGRect, play: CGRect, progress: CGRect) {
-    // This uses only the production fixture's fixed 16+12 horizontal padding,
-    // 20+10 bottom padding, 44-point play frame and 8-point row spacing.
+    // Use the top-right HQ target and the bottom console's fixed padding.
     // Actual HQ/play ink and the progress track are then found in the render.
     // Glyph/track bounds are coordinates, never proof of a 44-point hit target.
     XCTAssertEqual(root.bounds.origin, .zero)
@@ -3084,8 +3132,8 @@ extension VideoPlaybackMountedTests {
 
     let playY = root.bounds.maxY - 20 - 10 - 44
     let play = try whiteBounds(in: CGRect(x: 28, y: playY, width: 44, height: 44))
-    let hq = try whiteBounds(in: CGRect(x: root.bounds.maxX - 128,
-      y: playY - 8 - 132, width: 100, height: 132))
+    let hq = try whiteBounds(in: CGRect(x: root.bounds.maxX - 56,
+      y: 12, width: 44, height: 84))
 
     // Find the longest continuous neutral run starting beside the play button.
     // This selects the real gray/white progress track, stops at the time-label

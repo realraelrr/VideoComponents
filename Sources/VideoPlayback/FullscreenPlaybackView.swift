@@ -142,11 +142,10 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
       Spacer()
 
       if playbackSession.canTogglePlayback {
-        let showsControls = showsChrome && !isZooming && !isMultiTouchGestureActive
         fullscreenControls
-          .opacity(showsControls ? 1 : 0)
-          .allowsHitTesting(showsControls)
-          .accessibilityHidden(!showsControls)
+          .opacity(showsPlaybackControls ? 1 : 0)
+          .allowsHitTesting(showsPlaybackControls)
+          .accessibilityHidden(!showsPlaybackControls)
           .padding(.horizontal, 16)
           .padding(.bottom, 20)
       }
@@ -176,6 +175,19 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
         )
       },
       trailingAction: {
+        if showsPlaybackControls {
+          HStack(spacing: 8) {
+            if let playbackRateText = playbackSession.playbackRateIndicatorText {
+              VideoPlaybackRateBadge(text: playbackRateText)
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
+            }
+            if let highQualityControl {
+              VideoHighQualityButton(control: highQualityControl, labels: labels)
+            }
+          }
+        }
+
         trailingAccessory()
       }
     )
@@ -185,30 +197,13 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
   }
 
   private var fullscreenControls: some View {
-    let playbackRateText = playbackSession.playbackRateIndicatorText
-    return VStack(spacing: 8) {
-      if highQualityControl != nil || playbackRateText != nil {
-        HStack(spacing: 12) {
-          if let playbackRateText {
-            VideoPlaybackRateBadge(text: playbackRateText)
-          }
-
-          Spacer(minLength: 0)
-
-          if let highQualityControl {
-            VideoHighQualityButton(control: highQualityControl, labels: labels)
-          }
-        }
-      }
-
-      VideoPlaybackControls(
-        playbackSession: playbackSession,
-        style: .fullscreen,
-        labels: labels,
-        tint: .white,
-        fullscreenAction: nil
-      )
-    }
+    VideoPlaybackControls(
+      playbackSession: playbackSession,
+      style: .fullscreen,
+      labels: labels,
+      tint: .white,
+      fullscreenAction: nil
+    )
     .buttonStyle(.plain)
     .foregroundStyle(.white)
     .padding(.horizontal, 12)
@@ -230,6 +225,10 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
 
   private var showsChrome: Bool {
     isChromeVisible || isVoiceOverEnabled || !playbackSession.canUsePlaybackControls
+  }
+
+  private var showsPlaybackControls: Bool {
+    playbackSession.canTogglePlayback && showsChrome && !isZooming && !isMultiTouchGestureActive
   }
 
   private var autoHideRequestID: UUID? {
