@@ -4,3 +4,5 @@
 "video.progress" = "Playback progress";
 "video.reset_zoom" = "Reset zoom";
 "video.close" = "Close";
+"video.high_quality" = "HQ";
+"video.high_quality.accessibility" = "High-quality playback";

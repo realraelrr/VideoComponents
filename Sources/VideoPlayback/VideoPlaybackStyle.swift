@@ -7,6 +7,8 @@ public struct VideoPlaybackLabels {
   public var progress: String
   public var resetZoom: String
   public var close: String
+  public var highQuality: String
+  public var highQualityAccessibility: String
 
   public init(locale: Locale? = nil) {
     let localization = locale.flatMap {
@@ -24,6 +26,8 @@ public struct VideoPlaybackLabels {
     progress = text("progress")
     resetZoom = text("reset_zoom")
     close = text("close")
+    highQuality = text("high_quality")
+    highQualityAccessibility = text("high_quality.accessibility")
   }
 }
 

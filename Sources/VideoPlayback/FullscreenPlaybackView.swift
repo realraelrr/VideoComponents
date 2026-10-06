@@ -8,6 +8,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
   let allowsHoldBoost: Bool
   let onClose: @MainActor @Sendable () -> Void
   let labels: VideoPlaybackLabels
+  let highQualityControl: VideoHighQualityControl?
   let trailingAccessory: () -> TrailingAccessory
   let statusOverlay: () -> StatusOverlay
   let placeholderImage: (@MainActor () -> UIImage?)?
@@ -26,6 +27,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
     labels: VideoPlaybackLabels = .init(),
     placeholderImage: (@MainActor () -> UIImage?)? = nil,
     sourceIdentity: AnyHashable? = nil,
+    highQualityControl: VideoHighQualityControl? = nil,
     @ViewBuilder trailingAccessory: @escaping () -> TrailingAccessory,
     @ViewBuilder statusOverlay: @escaping () -> StatusOverlay
   ) {
@@ -33,6 +35,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
     self.allowsHoldBoost = allowsHoldBoost
     self.onClose = onClose
     self.labels = labels
+    self.highQualityControl = highQualityControl
     self.trailingAccessory = trailingAccessory
     self.statusOverlay = statusOverlay
     self.placeholderImage = placeholderImage
@@ -173,6 +176,9 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
         )
       },
       trailingAction: {
+        if let highQualityControl {
+          VideoHighQualityButton(control: highQualityControl, labels: labels)
+        }
         trailingAccessory()
       }
     )

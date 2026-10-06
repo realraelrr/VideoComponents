@@ -4,3 +4,5 @@
 "video.progress" = "再生の進行状況";
 "video.reset_zoom" = "ズームをリセット";
 "video.close" = "閉じる";
+"video.high_quality" = "高画質";
+"video.high_quality.accessibility" = "高画質で再生";

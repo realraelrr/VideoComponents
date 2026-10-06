@@ -4,3 +4,5 @@
 "video.progress" = "재생 진행률";
 "video.reset_zoom" = "줌 재설정";
 "video.close" = "닫기";
+"video.high_quality" = "고화질";
+"video.high_quality.accessibility" = "고화질 재생";

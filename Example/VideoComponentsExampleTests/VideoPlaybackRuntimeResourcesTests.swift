@@ -2441,3 +2441,237 @@ private final class PosterHandoffDisplayTick: NSObject {
     continuation = nil
   }
 }
+
+extension VideoPlaybackRuntimeResourcesTests {
+  func testHighQualityLabelsResolveFromThePlaybackPackage() {
+    for (locale, title, accessibility) in [
+      ("en", "HQ", "High-quality playback"),
+      ("es", "HD", "Reproducción de alta calidad"),
+      ("ja", "高画質", "高画質で再生"),
+      ("ko", "고화질", "고화질 재생"),
+      ("zh-Hans", "高清", "高清播放"),
+      ("zh-Hant", "高畫質", "高畫質播放")
+    ] {
+      let labels = VideoPlaybackLabels(locale: Locale(identifier: locale))
+      XCTAssertEqual(labels.highQuality, title)
+      XCTAssertEqual(labels.highQualityAccessibility, accessibility)
+    }
+  }
+}
+
+extension VideoPlaybackMountedTests {
+  func testFullscreenHighQualityUsesChromeIdleAndSingleTapVisibility() async throws {
+    try await requireNativeControlAccessibilityRuntime()
+    let session = try await readySession()
+    var requests = 0
+    let labels = VideoPlaybackLabels(locale: Locale(identifier: "en"))
+    let host = UIHostingController(rootView: FullscreenPlaybackView(
+      playbackSession: session, onClose: {}, labels: labels,
+      highQualityControl: .available { requests += 1 },
+      trailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() }
+    ).environment(\.scenePhase, .active))
+    let window = try mountHighQualityHost(host, size: CGSize(width: 390, height: 700))
+    defer { window.isHidden = true; window.rootViewController = nil; session.cleanup() }
+    try await Task.sleep(for: .milliseconds(100))
+    XCTAssertTrue(hasHighQualityPixels(in: host.view))
+    let button = try XCTUnwrap(highQualityButton(in: host.view, label: labels.highQualityAccessibility))
+    XCTAssertTrue(button.accessibilityActivate())
+    XCTAssertEqual(requests, 1)
+    try await Task.sleep(for: .milliseconds(3_400))
+    XCTAssertFalse(hasHighQualityPixels(in: host.view), "HQ must disappear with the existing chrome timeout")
+
+    let surface = try XCTUnwrap(findGestureSurface(host.view))
+    let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
+    let tap = MountedTap()
+    surface.addGestureRecognizer(tap)
+    coordinator.handleSingleTap(tap)
+    try await Task.sleep(for: .milliseconds(50))
+    XCTAssertTrue(hasHighQualityPixels(in: host.view))
+    let restored = try XCTUnwrap(highQualityButton(in: host.view, label: labels.highQualityAccessibility))
+    XCTAssertTrue(restored.accessibilityActivate())
+    XCTAssertEqual(requests, 2)
+    XCTAssertFalse(session.isPlaybackRequested, "Showing or requesting HQ must not change playback intent")
+  }
+
+  func testOptionalFullscreenHighQualityLoadingAndVoiceOverPresentation() async throws {
+    try await requireNativeControlAccessibilityRuntime()
+    let session = try await readySession()
+    defer { session.cleanup() }
+    let labels = VideoPlaybackLabels(locale: Locale(identifier: "en"))
+    for (control, expectedValue) in [
+      (nil, nil),
+      (VideoHighQualityControl.loading(nil), ""),
+      (VideoHighQualityControl.loading(0.42), 0.42.formatted(.percent.precision(.fractionLength(0))))
+    ] as [(VideoHighQualityControl?, String?)] {
+      let host = UIHostingController(rootView: FullscreenPlaybackView(
+        playbackSession: session, onClose: {}, labels: labels, highQualityControl: control,
+        trailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() }
+      ).environment(\.scenePhase, .active))
+      let window = try mountHighQualityHost(host, size: CGSize(width: 390, height: 700))
+      defer { window.isHidden = true; window.rootViewController = nil }
+      try await Task.sleep(for: .milliseconds(100))
+      guard let expectedValue else {
+        XCTAssertNil(highQualityButton(in: host.view, label: labels.highQualityAccessibility))
+        XCTAssertFalse(hasHighQualityPixels(in: host.view))
+        continue
+      }
+      let loading = try XCTUnwrap(highQualityButton(in: host.view, label: labels.highQualityAccessibility))
+      XCTAssertTrue(loading.accessibilityTraits.contains(.notEnabled))
+      XCTAssertEqual(loading.accessibilityValue, expectedValue)
+      XCTAssertGreaterThanOrEqual(loading.accessibilityFrame.width, 44)
+      XCTAssertGreaterThanOrEqual(loading.accessibilityFrame.height, 44)
+      try await Task.sleep(for: .milliseconds(3_400))
+      XCTAssertFalse(hasHighQualityPixels(in: host.view), "Busy HQ follows the existing chrome timeout")
+    }
+  }
+
+  private func mountHighQualityHost<V: View>(_ host: UIHostingController<V>, size: CGSize) throws -> UIWindow {
+    let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+    let window = UIWindow(windowScene: scene)
+    window.frame = CGRect(origin: .zero, size: size)
+    window.rootViewController = host
+    host.safeAreaRegions = []
+    window.makeKeyAndVisible()
+    host.view.frame = window.bounds
+    host.view.layoutIfNeeded()
+    return window
+  }
+
+  private func highQualityButton(in root: UIView, label: String) -> NSObject? {
+    var visited: Set<ObjectIdentifier> = []
+    var button: NSObject?
+    func collect(_ object: NSObject) {
+      guard button == nil, visited.insert(ObjectIdentifier(object)).inserted else { return }
+      if object.isAccessibilityElement, object.accessibilityTraits.contains(.button), object.accessibilityLabel == label {
+        button = object
+        return
+      }
+      (object.accessibilityElements as? [NSObject] ?? []).forEach(collect)
+      (object.automationElements as? [NSObject] ?? []).forEach(collect)
+      let count = object.accessibilityElementCount()
+      if count > 0 && count < 500 {
+        for index in 0..<count {
+          if let child = object.accessibilityElement(at: index) as? NSObject { collect(child) }
+        }
+      }
+      if let view = object as? UIView { view.subviews.forEach(collect) }
+    }
+    if let window = root.window { collect(window) }
+    collect(root)
+    return button
+  }
+
+  private func hasHighQualityPixels(in view: UIView) -> Bool {
+    view.layoutIfNeeded()
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { _ in
+      XCTAssertTrue(view.drawHierarchy(in: view.bounds, afterScreenUpdates: true))
+    }
+    let region = CGRect(x: view.bounds.width - 80, y: 0, width: 80, height: 120)
+    guard let crop = image.cgImage?.cropping(to: region),
+      let context = CGContext(data: nil, width: crop.width, height: crop.height,
+        bitsPerComponent: 8, bytesPerRow: crop.width * 4,
+        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+      let data = context.data else {
+      XCTFail("The fullscreen HQ region must be readable")
+      return false
+    }
+    context.draw(crop, in: CGRect(x: 0, y: 0, width: crop.width, height: crop.height))
+    let bytes = data.assumingMemoryBound(to: UInt8.self)
+    return (0..<(crop.width * crop.height)).contains { pixel in
+      let offset = pixel * 4
+      return bytes[offset] > 200 && bytes[offset + 1] > 200 && bytes[offset + 2] > 200
+    }
+  }
+}
+
+@MainActor
+private func requireNativeControlAccessibilityRuntime() async throws {
+  let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+  let previousKeyWindow = scene.keyWindow
+  let controller = UIViewController()
+  controller.view.backgroundColor = .systemBackground
+  let nativeTitle = "UIKit accessibility probe"
+  let native = UIButton(type: .system)
+  native.setTitle(nativeTitle, for: .normal)
+  native.frame = CGRect(x: 40, y: 80, width: 260, height: 44)
+  controller.view.addSubview(native)
+
+  let swiftUITitle = "SwiftUI accessibility probe"
+  let hosted = UIHostingController(rootView: Button(swiftUITitle) {})
+  controller.addChild(hosted)
+  controller.view.addSubview(hosted.view)
+  hosted.didMove(toParent: controller)
+  hosted.view.frame = CGRect(x: 40, y: 180, width: 260, height: 44)
+
+  let window = UIWindow(windowScene: scene)
+  window.rootViewController = controller
+  window.makeKeyAndVisible()
+  defer {
+    window.isHidden = true
+    window.rootViewController = nil
+    previousKeyWindow?.makeKey()
+  }
+  try await Task.sleep(for: .milliseconds(450))
+  controller.view.layoutIfNeeded()
+  var visited: Set<ObjectIdentifier> = []
+  var nodeDetails: [String] = []
+  var swiftUIProvidesSemantics = false
+  var hasAnyMetadata = false
+  func collect(_ object: NSObject) {
+    guard visited.insert(ObjectIdentifier(object)).inserted else { return }
+    let automation = object.automationElements as? [NSObject] ?? []
+    let assistive = object.accessibilityElements as? [NSObject] ?? []
+    let count = object.accessibilityElementCount()
+    if object.isAccessibilityElement || object.accessibilityLabel != nil
+      || !object.accessibilityTraits.isEmpty || !automation.isEmpty || !assistive.isEmpty || count != 0 {
+      hasAnyMetadata = true
+    }
+    nodeDetails.append("\(type(of: object)): element=\(object.isAccessibilityElement), label=\(object.accessibilityLabel ?? "nil"), automation=\(automation.count), assistive=\(assistive.count), indexed=\(count)")
+    if object.isAccessibilityElement, object.accessibilityLabel == swiftUITitle {
+      swiftUIProvidesSemantics = true
+    }
+    automation.forEach(collect)
+    assistive.forEach(collect)
+    if count > 0 && count < 500 {
+      for index in 0..<count {
+        if let child = object.accessibilityElement(at: index) as? NSObject { collect(child) }
+      }
+    }
+    if let view = object as? UIView { view.subviews.forEach(collect) }
+  }
+  collect(window)
+  collect(hosted.view)
+  let isMounted = window.isKeyWindow && !window.isHidden
+    && native.window === window && hosted.view.window === window
+  let providesExpectedSemantics = native.isAccessibilityElement
+    && native.accessibilityLabel == nativeTitle && swiftUIProvidesSemantics
+  if !isMounted || !providesExpectedSemantics {
+    XCTContext.runActivity(named: "Independent native-control accessibility preflight") { activity in
+      let diagnostic = XCTAttachment(string:
+        "No accessibility properties were assigned to either standard control. keyWindow=\(window.isKeyWindow), nativeMounted=\(native.window === window), SwiftUIMounted=\(hosted.view.window === window), nativeTitle=\(native.currentTitle ?? "nil"), nativeTraits=\(native.accessibilityTraits.rawValue), VoiceOver=\(UIAccessibility.isVoiceOverRunning)\n" + nodeDetails.prefix(60).joined(separator: "\n"))
+      diagnostic.name = "Independent UIKit and SwiftUI accessibility runtime preflight"
+      diagnostic.lifetime = .keepAlways
+      activity.add(diagnostic)
+      let image = UIGraphicsImageRenderer(bounds: controller.view.bounds).image { _ in
+        controller.view.drawHierarchy(in: controller.view.bounds, afterScreenUpdates: true)
+      }
+      let screenshot = XCTAttachment(image: image)
+      screenshot.name = "Independent system controls with no product views"
+      screenshot.lifetime = .keepAlways
+      activity.add(screenshot)
+    }
+  }
+  guard isMounted else {
+    XCTFail("The independent native-control accessibility preflight did not mount correctly")
+    throw CocoaError(.coderInvalidValue)
+  }
+  if !hasAnyMetadata {
+    throw XCTSkip("The test host's public accessibility runtime is unavailable: independently mounted system UIButton and SwiftUI Button both provide no natural element, label, traits, automation, assistive, or indexed metadata. No product accessibility assertions ran; see the preflight diagnostic.")
+  }
+  guard providesExpectedSemantics else {
+    XCTFail("Independent standard controls returned partial accessibility metadata; this is not the verified wholly unavailable-runtime condition")
+    throw CocoaError(.coderInvalidValue)
+  }
+}

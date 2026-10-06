@@ -4,3 +4,5 @@
 "video.progress" = "播放進度";
 "video.reset_zoom" = "重置縮放";
 "video.close" = "關閉";
+"video.high_quality" = "高畫質";
+"video.high_quality.accessibility" = "高畫質播放";

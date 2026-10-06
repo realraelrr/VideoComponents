@@ -4,3 +4,5 @@
 "video.progress" = "Progreso de reproducción";
 "video.reset_zoom" = "Restablecer zoom";
 "video.close" = "Cerrar";
+"video.high_quality" = "HD";
+"video.high_quality.accessibility" = "Reproducción de alta calidad";
