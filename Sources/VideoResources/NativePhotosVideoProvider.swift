@@ -56,6 +56,11 @@ private final class NativePhotosSource {
   }
 
   private func visibleAsset(for serializedCloudIdentifier: String) throws -> PHAsset {
+    #if DEBUG
+    let traceID = UUID()
+    traceVideoPreparation("photos.resolve.begin", id: traceID)
+    defer { traceVideoPreparation("photos.resolve.end", id: traceID) }
+    #endif
     let authorization = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     guard authorization == .authorized || authorization == .limited else {
       throw VideoResourceFailure.photosAccessRequired
@@ -67,6 +72,10 @@ private final class NativePhotosSource {
     if let cached = localIdentifiers[serializedCloudIdentifier] {
       localIdentifier = cached
     } else {
+      #if DEBUG
+      traceVideoPreparation("photos.mapping.begin", id: traceID)
+      defer { traceVideoPreparation("photos.mapping.end", id: traceID) }
+      #endif
       let cloudIdentifier = PHCloudIdentifier(stringValue: serializedCloudIdentifier)
       guard let mapping = PHPhotoLibrary.shared()
         .localIdentifierMappings(for: [cloudIdentifier])[cloudIdentifier]
@@ -121,6 +130,9 @@ final class NativePhotosVideoRequest: @unchecked Sendable {
     case finished(cancelNative: Bool)
   }
 
+  #if DEBUG
+  private let preparationTraceID = UUID()
+  #endif
   private let lock = NSLock()
   private let request: Request
   private let cancelRequest: (PHImageRequestID) -> Void
@@ -155,10 +167,16 @@ final class NativePhotosVideoRequest: @unchecked Sendable {
         self.continuation = continuation
         lock.unlock()
 
+        #if DEBUG
+        traceVideoPreparation("photos.request.submit", id: preparationTraceID)
+        #endif
         let requestID = request(asset, options) { [weak self] asset, audioMix, info in
           self?.complete(asset: asset, audioMix: audioMix, info: info)
         }
 
+        #if DEBUG
+        traceVideoPreparation("photos.request.registered", id: preparationTraceID)
+        #endif
         lock.lock()
         switch state {
         case .pending:
@@ -177,6 +195,9 @@ final class NativePhotosVideoRequest: @unchecked Sendable {
   }
 
   private func complete(asset: AVAsset?, audioMix: AVAudioMix?, info: [AnyHashable: Any]?) {
+    #if DEBUG
+    traceVideoPreparation("photos.request.callback", id: preparationTraceID)
+    #endif
     if (info?[PHImageCancelledKey] as? NSNumber)?.boolValue == true {
       finish(.failure(CancellationError()))
     } else if let error = info?[PHImageErrorKey] as? Error {

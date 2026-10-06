@@ -1,6 +1,17 @@
 import AVFoundation
 import Foundation
 import Observation
+#if DEBUG
+import OSLog
+
+private let videoPreparationLogger = Logger(subsystem: "VideoComponents", category: "PreparationTrace")
+
+// Opt-in, process-local diagnostics. Never pass identifiers, paths, or native errors.
+func traceVideoPreparation(_ stage: String, id: UUID) {
+  guard ProcessInfo.processInfo.environment["VIDEO_PREPARATION_TRACE"] == "1" else { return }
+  videoPreparationLogger.notice("t=\(ProcessInfo.processInfo.systemUptime, privacy: .public) id=\(id.uuidString, privacy: .public) \(stage, privacy: .public)")
+}
+#endif
 
 /// Sources are interned while a caller, preparation, or receipt retains them.
 /// This object owns neither a library nor a global media cache.
@@ -90,6 +101,14 @@ public final class VideoSource {
     return storedState
   }
   @ObservationIgnored fileprivate let kind: Kind
+  #if DEBUG
+  @ObservationIgnored private let preparationTraceID = UUID()
+
+  /// Debug-only stage labels; callers must not include user content or identifiers.
+  public func tracePreparation(_ stage: String) {
+    traceVideoPreparation(stage, id: preparationTraceID)
+  }
+  #endif
   @ObservationIgnored private var epoch: UInt64 = 0
   @ObservationIgnored private var work: [VideoRequest: VideoOperation] = [:]
   @ObservationIgnored private var cached: Loaded?
@@ -122,6 +141,10 @@ public final class VideoSource {
 
   /// Registers this cancellation share synchronously, before native work can start.
   public func prepare(_ requested: VideoRequest = .init()) -> VideoPreparation {
+    #if DEBUG
+    tracePreparation("prepare.enter requestedQuality=\(requested.quality) requestedNetwork=\(requested.network)")
+    defer { tracePreparation("prepare.return") }
+    #endif
     let request: VideoRequest
     if case .file = kind { request = .init(quality: .highest, network: .forbidden) }
     else { request = requested }
@@ -134,10 +157,18 @@ public final class VideoSource {
         return handle
       }
     }
-    if let active = work[request] { return VideoPreparation(source: self, operation: active) }
+    if let active = work[request] {
+      #if DEBUG
+      tracePreparation("prepare.join operation=\(active.preparationTraceID)")
+      #endif
+      return VideoPreparation(source: self, operation: active)
+    }
     let operation = VideoOperation(source: self, request: request, epoch: epoch)
     let handle = VideoPreparation(source: self, operation: operation)
     work[request] = operation
+    #if DEBUG
+    tracePreparation("prepare.new operation=\(operation.preparationTraceID)")
+    #endif
     // A local probe cannot clear an ordinary acquisition's known failure.
     if case .unavailable = storedState, isLocalPhotosProbe(request) {} else {
       publishState(.acquiring(0), epoch: operation.epoch, work: work)
@@ -156,10 +187,18 @@ public final class VideoSource {
         previous == authority, cached.evidence.satisfies(request),
         Self.backingAvailable(cached.representation.asset)
       {
+        #if DEBUG
+        tracePreparation("prepare.cached operation=\(operation.preparationTraceID)")
+        #endif
         accept(cached, for: operation)
         return handle
       }
       load = { [weak operation] in
+        #if DEBUG
+        let traceID = operation?.preparationTraceID ?? UUID()
+        traceVideoPreparation("provider.begin", id: traceID)
+        defer { traceVideoPreparation("provider.end", id: traceID) }
+        #endif
         let value = try await provider.load(identifier, request) { [weak operation] progress in
           Task { @MainActor in operation?.report(progress) }
         }
@@ -237,6 +276,10 @@ public final class VideoSource {
   }
 
   private func observePhotoAuthority(identifier: String, provider: PhotosVideoProvider) throws -> String {
+    #if DEBUG
+    tracePreparation("authority.begin")
+    defer { tracePreparation("authority.end") }
+    #endif
     do {
       let current = try provider.authority(identifier)
       updatePhotoAuthority(current)
@@ -437,6 +480,9 @@ fileprivate final class VideoOperation {
   let epoch: UInt64
   private(set) var progress: Double?
   @ObservationIgnored private(set) var result: Result<VideoReceipt, Error>?
+  #if DEBUG
+  let preparationTraceID = UUID()
+  #endif
   @ObservationIgnored private var shares: Set<UUID> = []
   @ObservationIgnored private var task: Task<Void, Never>?
   private struct Waiter {
@@ -489,6 +535,14 @@ fileprivate final class VideoOperation {
 
   func finish(_ result: Result<VideoReceipt, Error>) {
     guard self.result == nil else { return }
+    #if DEBUG
+    let outcome: String
+    switch result {
+    case .success: outcome = "receipt"
+    case .failure(let error): outcome = error is CancellationError ? "cancelled" : "failed"
+    }
+    traceVideoPreparation("operation.\(outcome)", id: preparationTraceID)
+    #endif
     self.result = result
     source?.retired(self, result: result)
     let native = task
