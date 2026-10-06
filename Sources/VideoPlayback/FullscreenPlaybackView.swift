@@ -162,7 +162,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
       isMultiTouchGestureActive: zoomContext.isMultiTouchGestureActive,
       isBlockingStatusOverlayVisible: playbackSession.status.allowsHitTesting,
       safeAreaInsets: safeAreaInsets,
-      playbackRateText: playbackSession.playbackRateIndicatorText,
+      playbackRateText: nil,
       labels: labels,
       onResetZoom: {
         zoomContext.resetZoom()
@@ -176,9 +176,6 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
         )
       },
       trailingAction: {
-        if let highQualityControl {
-          VideoHighQualityButton(control: highQualityControl, labels: labels)
-        }
         trailingAccessory()
       }
     )
@@ -188,13 +185,30 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
   }
 
   private var fullscreenControls: some View {
-    VideoPlaybackControls(
-      playbackSession: playbackSession,
-      style: .fullscreen,
-      labels: labels,
-      tint: .white,
-      fullscreenAction: nil
-    )
+    let playbackRateText = playbackSession.playbackRateIndicatorText
+    return VStack(spacing: 8) {
+      if highQualityControl != nil || playbackRateText != nil {
+        HStack(spacing: 12) {
+          if let playbackRateText {
+            VideoPlaybackRateBadge(text: playbackRateText)
+          }
+
+          Spacer(minLength: 0)
+
+          if let highQualityControl {
+            VideoHighQualityButton(control: highQualityControl, labels: labels)
+          }
+        }
+      }
+
+      VideoPlaybackControls(
+        playbackSession: playbackSession,
+        style: .fullscreen,
+        labels: labels,
+        tint: .white,
+        fullscreenAction: nil
+      )
+    }
     .buttonStyle(.plain)
     .foregroundStyle(.white)
     .padding(.horizontal, 12)

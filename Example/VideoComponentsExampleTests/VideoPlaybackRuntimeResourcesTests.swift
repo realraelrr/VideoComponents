@@ -2473,12 +2473,13 @@ extension VideoPlaybackMountedTests {
     let window = try mountHighQualityHost(host, size: CGSize(width: 390, height: 700))
     defer { window.isHidden = true; window.rootViewController = nil; session.cleanup() }
     try await Task.sleep(for: .milliseconds(100))
-    XCTAssertTrue(hasHighQualityPixels(in: host.view))
+    let region = try highQualityRegion(in: host.view)
+    XCTAssertTrue(hasHighQualityPixels(in: host.view, region: region))
     let button = try XCTUnwrap(highQualityButton(in: host.view, label: labels.highQualityAccessibility))
     XCTAssertTrue(button.accessibilityActivate())
     XCTAssertEqual(requests, 1)
     try await Task.sleep(for: .milliseconds(3_400))
-    XCTAssertFalse(hasHighQualityPixels(in: host.view), "HQ must disappear with the existing chrome timeout")
+    XCTAssertFalse(hasHighQualityPixels(in: host.view, region: region), "HQ must disappear with the existing chrome timeout")
 
     let surface = try XCTUnwrap(findGestureSurface(host.view))
     let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
@@ -2486,7 +2487,7 @@ extension VideoPlaybackMountedTests {
     surface.addGestureRecognizer(tap)
     coordinator.handleSingleTap(tap)
     try await Task.sleep(for: .milliseconds(50))
-    XCTAssertTrue(hasHighQualityPixels(in: host.view))
+    XCTAssertTrue(hasHighQualityPixels(in: host.view, region: region))
     let restored = try XCTUnwrap(highQualityButton(in: host.view, label: labels.highQualityAccessibility))
     XCTAssertTrue(restored.accessibilityActivate())
     XCTAssertEqual(requests, 2)
@@ -2512,16 +2513,304 @@ extension VideoPlaybackMountedTests {
       try await Task.sleep(for: .milliseconds(100))
       guard let expectedValue else {
         XCTAssertNil(highQualityButton(in: host.view, label: labels.highQualityAccessibility))
-        XCTAssertFalse(hasHighQualityPixels(in: host.view))
+        XCTAssertNotNil(highQualityButton(in: host.view, label: labels.play))
         continue
       }
+      let region = try highQualityRegion(in: host.view)
       let loading = try XCTUnwrap(highQualityButton(in: host.view, label: labels.highQualityAccessibility))
       XCTAssertTrue(loading.accessibilityTraits.contains(.notEnabled))
       XCTAssertEqual(loading.accessibilityValue, expectedValue)
       XCTAssertGreaterThanOrEqual(loading.accessibilityFrame.width, 44)
       XCTAssertGreaterThanOrEqual(loading.accessibilityFrame.height, 44)
       try await Task.sleep(for: .milliseconds(3_400))
-      XCTAssertFalse(hasHighQualityPixels(in: host.view), "Busy HQ follows the existing chrome timeout")
+      XCTAssertFalse(hasHighQualityPixels(in: host.view, region: region), "Busy HQ follows the existing chrome timeout")
+    }
+  }
+
+  func testFullscreenHighQualityAndPlaybackControlsHideDuringUnzoomedMultiTouch() async throws {
+    try await requireNativeControlAccessibilityRuntime()
+    for (width, typeSize) in [(CGFloat(390), DynamicTypeSize.large), (320, .accessibility3)] {
+      let session = try await readySession()
+      session.updatePlaybackRate(1.5)
+      let labels = VideoPlaybackLabels(locale: Locale(identifier: "en"))
+      var closes = 0
+      var accessoryActivations = 0
+      let host = UIHostingController(rootView: FullscreenPlaybackView(
+        playbackSession: session, onClose: { closes += 1 }, labels: labels,
+        highQualityControl: .available {},
+        trailingAccessory: { Button("Fixture accessory") { accessoryActivations += 1 } },
+        statusOverlay: { EmptyView() }
+      ).environment(\.scenePhase, .active).environment(\.dynamicTypeSize, typeSize))
+      let window = try mountHighQualityHost(host, size: CGSize(width: width, height: 700))
+      defer { window.isHidden = true; window.rootViewController = nil; session.cleanup() }
+      try await Task.sleep(for: .milliseconds(100))
+      let region = try highQualityRegion(in: host.view)
+      assertFullscreenPlaybackControls(in: host.view, session: session, labels: labels, region: region, visible: true)
+
+      let surface = try XCTUnwrap(findGestureSurface(host.view))
+      let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
+      // Drive the mounted production gesture callback, without changing the view's private state.
+      coordinator.onPinchUpdate(.init(scale: 1, location: CGPoint(x: width / 2, y: 350),
+        state: .began, numberOfTouches: 2))
+      try await Task.sleep(for: .milliseconds(50))
+      assertFullscreenPlaybackControls(in: host.view, session: session, labels: labels, region: region, visible: false)
+      let close = try XCTUnwrap(highQualityButton(in: host.view, label: labels.close))
+      XCTAssertTrue(close.accessibilityActivate())
+      XCTAssertEqual(closes, 1)
+      let accessory = try XCTUnwrap(highQualityButton(in: host.view, label: "Fixture accessory"))
+      XCTAssertTrue(accessory.accessibilityActivate())
+      XCTAssertEqual(accessoryActivations, 1)
+
+      coordinator.onPinchUpdate(.init(scale: 1, location: CGPoint(x: width / 2, y: 350),
+        state: .ended, numberOfTouches: 2))
+      try await Task.sleep(for: .milliseconds(50))
+      assertFullscreenPlaybackControls(in: host.view, session: session, labels: labels, region: region, visible: true)
+      XCTAssertTrue(session.canUsePlaybackControls)
+    }
+  }
+
+  func testFullscreenHighQualityAndPlaybackControlsHideWhileZoomedUntilReset() async throws {
+    try await requireNativeControlAccessibilityRuntime()
+    let session = try await readySession()
+    session.updatePlaybackRate(1.5)
+    let labels = VideoPlaybackLabels(locale: Locale(identifier: "en"))
+    var closes = 0
+    let host = UIHostingController(rootView: FullscreenPlaybackView(
+      playbackSession: session, onClose: { closes += 1 }, labels: labels,
+      highQualityControl: .available {},
+      trailingAccessory: { Button("Fixture accessory") {} }, statusOverlay: { EmptyView() }
+    ).environment(\.scenePhase, .active))
+    let window = try mountHighQualityHost(host, size: CGSize(width: 390, height: 700))
+    defer { window.isHidden = true; window.rootViewController = nil; session.cleanup() }
+    try await Task.sleep(for: .milliseconds(100))
+    let region = try highQualityRegion(in: host.view)
+    assertFullscreenPlaybackControls(in: host.view, session: session, labels: labels, region: region, visible: true)
+    let surface = try XCTUnwrap(findGestureSurface(host.view))
+    let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
+    for (state, scale) in [(UIGestureRecognizer.State.began, CGFloat(1)), (.changed, 2), (.ended, 2)] {
+      coordinator.onPinchUpdate(.init(scale: scale, location: CGPoint(x: 195, y: 350),
+        state: state, numberOfTouches: 2))
+    }
+    try await Task.sleep(for: .milliseconds(50))
+    assertFullscreenPlaybackControls(in: host.view, session: session, labels: labels, region: region, visible: false)
+    let close = try XCTUnwrap(highQualityButton(in: host.view, label: labels.close))
+    XCTAssertTrue(close.accessibilityActivate())
+    XCTAssertEqual(closes, 1)
+    XCTAssertNotNil(highQualityButton(in: host.view, label: "Fixture accessory"))
+    let reset = try XCTUnwrap(highQualityButton(in: host.view, label: labels.resetZoom))
+    XCTAssertTrue(reset.accessibilityActivate())
+    try await Task.sleep(for: .milliseconds(50))
+    assertFullscreenPlaybackControls(in: host.view, session: session, labels: labels, region: region, visible: true)
+    XCTAssertNil(highQualityButton(in: host.view, label: labels.resetZoom))
+    XCTAssertTrue(session.canUsePlaybackControls)
+  }
+
+  func testFullscreenHighQualityCannotAppearWithoutThePlaybackControls() async throws {
+    try await requireNativeControlAccessibilityRuntime()
+    let session = PlaybackSession()
+    session.updatePlaybackRate(1.5)
+    defer { session.cleanup() }
+    let labels = VideoPlaybackLabels(locale: Locale(identifier: "en"))
+    XCTAssertFalse(session.hasCurrentItem)
+    XCTAssertFalse(session.canTogglePlayback)
+    for control in [VideoHighQualityControl.available {}, .loading(nil), .loading(0.42)] {
+      var closes = 0
+      let host = UIHostingController(rootView: FullscreenPlaybackView(
+        playbackSession: session, onClose: { closes += 1 }, labels: labels, highQualityControl: control,
+        trailingAccessory: { Button("Fixture accessory") {} }, statusOverlay: { EmptyView() }
+      ).environment(\.scenePhase, .active))
+      let window = try mountHighQualityHost(host, size: CGSize(width: 390, height: 700))
+      defer { window.isHidden = true; window.rootViewController = nil }
+      try await Task.sleep(for: .milliseconds(100))
+      let region = CGRect(x: 0, y: host.view.bounds.height - 120,
+        width: host.view.bounds.width, height: 120)
+      assertFullscreenPlaybackControls(in: host.view, session: session, labels: labels, region: region, visible: false)
+      let close = try XCTUnwrap(highQualityButton(in: host.view, label: labels.close))
+      XCTAssertTrue(close.accessibilityActivate())
+      XCTAssertEqual(closes, 1)
+      XCTAssertNotNil(highQualityButton(in: host.view, label: "Fixture accessory"))
+    }
+  }
+
+  func testRenderedFullscreenControlsHideDuringUnzoomedMultiTouch() async throws {
+    for (width, typeSize) in [(CGFloat(390), DynamicTypeSize.large), (320, .accessibility3)] {
+      let session = try await readySession()
+      session.updatePlaybackRate(1.5)
+      let host = UIHostingController(rootView: FullscreenPlaybackView(
+        playbackSession: session, onClose: {},
+        highQualityControl: .available {},
+        trailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() }
+      ).environment(\.scenePhase, .active).environment(\.dynamicTypeSize, typeSize))
+      let window = try mountHighQualityHost(host, size: CGSize(width: width, height: 700))
+      defer { window.isHidden = true; window.rootViewController = nil; session.cleanup() }
+      try await Task.sleep(for: .milliseconds(100))
+      assertRenderedFullscreenControls(in: host.view, visible: true, name: "\(width)pt controls before multitouch")
+      let surface = try XCTUnwrap(findGestureSurface(host.view))
+      let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
+      coordinator.onPinchUpdate(.init(scale: 1, location: CGPoint(x: width / 2, y: 350),
+        state: .began, numberOfTouches: 2))
+      try await Task.sleep(for: .milliseconds(50))
+      assertRenderedFullscreenControls(in: host.view, visible: false, name: "\(width)pt unzoomed multitouch")
+      coordinator.onPinchUpdate(.init(scale: 1, location: CGPoint(x: width / 2, y: 350),
+        state: .ended, numberOfTouches: 2))
+      try await Task.sleep(for: .milliseconds(50))
+      assertRenderedFullscreenControls(in: host.view, visible: true, name: "\(width)pt controls after multitouch")
+      XCTAssertFalse(session.isPlaybackRequested)
+    }
+  }
+
+  func testRenderedFullscreenControlsStayHiddenWhileZoomed() async throws {
+    let session = try await readySession()
+    session.updatePlaybackRate(1.5)
+    let host = UIHostingController(rootView: FullscreenPlaybackView(
+      playbackSession: session, onClose: {}, highQualityControl: .available {},
+      trailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() }
+    ).environment(\.scenePhase, .active))
+    let window = try mountHighQualityHost(host, size: CGSize(width: 390, height: 700))
+    defer { window.isHidden = true; window.rootViewController = nil; session.cleanup() }
+    try await Task.sleep(for: .milliseconds(100))
+    assertRenderedFullscreenControls(in: host.view, visible: true, name: "Controls before zoom")
+    let surface = try XCTUnwrap(findGestureSurface(host.view))
+    let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
+    for (state, scale) in [(UIGestureRecognizer.State.began, CGFloat(1)), (.changed, 2), (.ended, 2)] {
+      coordinator.onPinchUpdate(.init(scale: scale, location: CGPoint(x: 195, y: 350),
+        state: state, numberOfTouches: 2))
+    }
+    try await Task.sleep(for: .milliseconds(50))
+    assertRenderedFullscreenControls(in: host.view, visible: false, name: "Zoom ended with playback controls hidden")
+    XCTAssertFalse(session.isPlaybackRequested)
+  }
+
+  func testRenderedFullscreenCannotShowHQWithoutPlaybackItem() async throws {
+    let session = PlaybackSession()
+    session.updatePlaybackRate(1.5)
+    defer { session.cleanup() }
+    XCTAssertFalse(session.hasCurrentItem)
+    for (index, control) in [VideoHighQualityControl.available {}, .loading(nil), .loading(0.42)].enumerated() {
+      let host = UIHostingController(rootView: FullscreenPlaybackView(
+        playbackSession: session, onClose: {}, highQualityControl: control,
+        trailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() }
+      ).environment(\.scenePhase, .active))
+      let window = try mountHighQualityHost(host, size: CGSize(width: 390, height: 700))
+      defer { window.isHidden = true; window.rootViewController = nil }
+      try await Task.sleep(for: .milliseconds(100))
+      assertRenderedFullscreenControls(in: host.view, visible: false, name: "No playback item, HQ presentation \(index)")
+    }
+  }
+
+  func testRenderedFullscreenHQUsesIdleTimeoutAndSingleTapWithoutPlaying() async throws {
+    let session = try await readySession()
+    session.updatePlaybackRate(1.5)
+    let host = UIHostingController(rootView: FullscreenPlaybackView(
+      playbackSession: session, onClose: {}, highQualityControl: .available {},
+      trailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() }
+    ).environment(\.scenePhase, .active))
+    let window = try mountHighQualityHost(host, size: CGSize(width: 390, height: 700))
+    defer { window.isHidden = true; window.rootViewController = nil; session.cleanup() }
+    try await Task.sleep(for: .milliseconds(100))
+    assertRenderedFullscreenControls(in: host.view, visible: true, name: "Paused controls initially visible")
+    try await Task.sleep(for: .milliseconds(3_400))
+    // Idle hides navigation too, so this image has no white pixels anywhere.
+    let hidden = try fullscreenRenderedControlPixelCounts(in: host.view, name: "Paused controls after idle timeout")
+    XCTAssertEqual(hidden.playback, 0)
+    XCTAssertEqual(hidden.navigation, 0)
+    let surface = try XCTUnwrap(findGestureSurface(host.view))
+    let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
+    let tap = MountedTap()
+    surface.addGestureRecognizer(tap)
+    coordinator.handleSingleTap(tap)
+    try await Task.sleep(for: .milliseconds(50))
+    assertRenderedFullscreenControls(in: host.view, visible: true, name: "Single tap restores paused controls")
+    XCTAssertFalse(session.isPlaybackRequested)
+  }
+
+  private func assertRenderedFullscreenControls(
+    in view: UIView, visible: Bool, name: String,
+    file: StaticString = #filePath, line: UInt = #line
+  ) {
+    do {
+      let counts = try fullscreenRenderedControlPixelCounts(in: view, name: name)
+      XCTAssertGreaterThan(counts.navigation, 0, "Close/reset navigation must stay rendered", file: file, line: line)
+      if visible {
+        XCTAssertGreaterThan(counts.playback, 50, "The actual playback controls must render", file: file, line: line)
+      } else {
+        XCTAssertEqual(counts.playback, 0, "No playback control, rate badge or isolated HQ may remain rendered", file: file, line: line)
+      }
+    } catch {
+      XCTFail("The mounted fullscreen image must be readable: \(error)", file: file, line: line)
+    }
+  }
+
+  private func fullscreenRenderedControlPixelCounts(
+    in view: UIView, name: String
+  ) throws -> (navigation: Int, playback: Int) {
+    // The fixture has black media, no status overlay and no trailing accessory.
+    // Exclude only the close/reset area, so old top-right HQ remains detectable.
+    view.layoutIfNeeded()
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { _ in
+      XCTAssertTrue(view.drawHierarchy(in: view.bounds, afterScreenUpdates: true))
+    }
+    let screenshot = XCTAttachment(image: image)
+    screenshot.name = name
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+    let cgImage = try XCTUnwrap(image.cgImage)
+    let context = try XCTUnwrap(CGContext(data: nil, width: cgImage.width, height: cgImage.height,
+      bitsPerComponent: 8, bytesPerRow: cgImage.width * 4,
+      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    let data = try XCTUnwrap(context.data)
+    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+    let bytes = data.assumingMemoryBound(to: UInt8.self)
+    var navigation = 0
+    var playback = 0
+    for y in 0..<cgImage.height {
+      for x in 0..<cgImage.width {
+        let offset = (y * cgImage.width + x) * 4
+        guard bytes[offset] > 200 && bytes[offset + 1] > 200 && bytes[offset + 2] > 200 else { continue }
+        if x < 160 && y < 120 { navigation += 1 }
+        else { playback += 1 }
+      }
+    }
+    let diagnostic = XCTAttachment(string: "Navigation white pixels: \(navigation); playback/HQ white pixels: \(playback)")
+    diagnostic.name = "\(name) pixel counts"
+    diagnostic.lifetime = .keepAlways
+    add(diagnostic)
+    return (navigation, playback)
+  }
+
+  private func assertFullscreenPlaybackControls(
+    in root: UIView, session: PlaybackSession, labels: VideoPlaybackLabels, region: CGRect, visible: Bool,
+    file: StaticString = #filePath, line: UInt = #line
+  ) {
+    let elements = fullscreenAccessibilityElements(in: root)
+    let rate = session.playbackRateIndicatorText
+    XCTAssertNotNil(rate, file: file, line: line)
+    for label in [labels.play, labels.progress, labels.highQualityAccessibility, rate ?? ""] {
+      XCTAssertEqual(elements.contains { $0.accessibilityLabel == label }, visible,
+        "The actual fullscreen control \(label) must share the group's visibility", file: file, line: line)
+    }
+    XCTAssertEqual(hasHighQualityPixels(in: root, region: region), visible,
+      "HQ must share both rendered and accessibility visibility", file: file, line: line)
+    if visible {
+      let bounds = UIAccessibility.convertToScreenCoordinates(root.bounds, in: root)
+      for label in [labels.play, labels.progress, labels.highQualityAccessibility] {
+        guard let element = elements.first(where: { $0.accessibilityLabel == label }) else { continue }
+        let frame = element.accessibilityFrame
+        if label == labels.play {
+          // Play's natural AX frame describes the SF Symbol, not its 44-point label.
+          // Verify the ordinary-touch area with coordinate touches, not this AX metric.
+          XCTAssertTrue(element.accessibilityTraits.contains(.button),
+            "Play must retain its natural button semantics", file: file, line: line)
+          XCTAssertGreaterThan(frame.width, 0, "Play must retain a nonempty AX frame", file: file, line: line)
+          XCTAssertGreaterThan(frame.height, 0, "Play must retain a nonempty AX frame", file: file, line: line)
+        } else {
+          XCTAssertGreaterThanOrEqual(frame.width, 44, "\(label) must retain its action target", file: file, line: line)
+          XCTAssertGreaterThanOrEqual(frame.height, 44, "\(label) must retain its action target", file: file, line: line)
+        }
+        XCTAssertTrue(bounds.contains(frame), "\(label) must fit the mounted window", file: file, line: line)
+      }
     }
   }
 
@@ -2538,14 +2827,17 @@ extension VideoPlaybackMountedTests {
   }
 
   private func highQualityButton(in root: UIView, label: String) -> NSObject? {
+    fullscreenAccessibilityElements(in: root).first {
+      $0.accessibilityTraits.contains(.button) && $0.accessibilityLabel == label
+    }
+  }
+
+  private func fullscreenAccessibilityElements(in root: UIView) -> [NSObject] {
     var visited: Set<ObjectIdentifier> = []
-    var button: NSObject?
+    var elements: [NSObject] = []
     func collect(_ object: NSObject) {
-      guard button == nil, visited.insert(ObjectIdentifier(object)).inserted else { return }
-      if object.isAccessibilityElement, object.accessibilityTraits.contains(.button), object.accessibilityLabel == label {
-        button = object
-        return
-      }
+      guard visited.insert(ObjectIdentifier(object)).inserted else { return }
+      if object.isAccessibilityElement { elements.append(object) }
       (object.accessibilityElements as? [NSObject] ?? []).forEach(collect)
       (object.automationElements as? [NSObject] ?? []).forEach(collect)
       let count = object.accessibilityElementCount()
@@ -2558,17 +2850,31 @@ extension VideoPlaybackMountedTests {
     }
     if let window = root.window { collect(window) }
     collect(root)
-    return button
+    return elements
   }
 
-  private func hasHighQualityPixels(in view: UIView) -> Bool {
+  private func highQualityRegion(in view: UIView) throws -> CGRect {
+    let labels = VideoPlaybackLabels(locale: Locale(identifier: "en"))
+    let button = try XCTUnwrap(highQualityButton(in: view, label: labels.highQualityAccessibility))
+    view.layoutIfNeeded()
+    let screenBounds = UIAccessibility.convertToScreenCoordinates(view.bounds, in: view)
+    let region = button.accessibilityFrame.offsetBy(dx: -screenBounds.minX, dy: -screenBounds.minY)
+      .intersection(view.bounds).integral
+    guard !region.isNull, !region.isEmpty else {
+      XCTFail("The mounted HQ control must have an on-screen frame")
+      throw CocoaError(.coderInvalidValue)
+    }
+    return region
+  }
+
+  private func hasHighQualityPixels(in view: UIView, region: CGRect) -> Bool {
+    // Keep the visible baseline's region even after AX hides the control.
     view.layoutIfNeeded()
     let format = UIGraphicsImageRendererFormat()
     format.scale = 1
     let image = UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { _ in
       XCTAssertTrue(view.drawHierarchy(in: view.bounds, afterScreenUpdates: true))
     }
-    let region = CGRect(x: view.bounds.width - 80, y: 0, width: 80, height: 120)
     guard let crop = image.cgImage?.cropping(to: region),
       let context = CGContext(data: nil, width: crop.width, height: crop.height,
         bitsPerComponent: 8, bytesPerRow: crop.width * 4,
@@ -2673,5 +2979,129 @@ private func requireNativeControlAccessibilityRuntime() async throws {
   guard providesExpectedSemantics else {
     XCTFail("Independent standard controls returned partial accessibility metadata; this is not the verified wholly unavailable-runtime condition")
     throw CocoaError(.coderInvalidValue)
+  }
+}
+
+extension VideoPlaybackMountedTests {
+  func testFullscreenControlCoordinatesDoNotRouteToPlaybackGestureSurface() async throws {
+    for (width, typeSize) in [(CGFloat(390), DynamicTypeSize.large), (320, .accessibility3)] {
+      let session = try await readySession()
+      session.updatePlaybackRate(1.5)
+      let host = UIHostingController(rootView: FullscreenPlaybackView(
+        playbackSession: session, onClose: {},
+        labels: VideoPlaybackLabels(locale: Locale(identifier: "en")),
+        highQualityControl: .available {},
+        trailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() }
+      ).environment(\.scenePhase, .active).environment(\.dynamicTypeSize, typeSize))
+      let window = try mountHighQualityHost(host, size: CGSize(width: width, height: 700))
+      defer { window.isHidden = true; window.rootViewController = nil; session.cleanup() }
+      try await Task.sleep(for: .milliseconds(100))
+      host.view.layoutIfNeeded()
+
+      let surface = try XCTUnwrap(findGestureSurface(host.view))
+      let targets = try routingRenderedTargets(in: host.view,
+        name: "HQ routing \(Int(width)) \(typeSize)")
+      let points: [(String, CGPoint)] = [
+        ("HQ glyph center", CGPoint(x: targets.hq.midX, y: targets.hq.midY)),
+        ("HQ glyph upper interior", CGPoint(x: targets.hq.midX, y: targets.hq.minY + 0.5)),
+        ("play glyph center", CGPoint(x: targets.play.midX, y: targets.play.midY)),
+        ("progress rendered track center", CGPoint(x: targets.progress.midX, y: targets.progress.midY))
+      ]
+      var routes: [String] = []
+      for (name, point) in points {
+        let windowPoint = host.view.convert(point, to: window)
+        let hit = try XCTUnwrap(window.hitTest(windowPoint, with: nil),
+          "\(name) must have a natural UIKit hit")
+        XCTAssertFalse(hit === surface || hit.isDescendant(of: surface),
+          "\(name) must not route to the playback gesture UIView; hit=\(type(of: hit))")
+        var path: [String] = []
+        var ancestor: UIView? = hit
+        while let view = ancestor {
+          path.append(String(describing: type(of: view)))
+          ancestor = view.superview
+        }
+        routes.append("\(name): root=\(point), window=\(windowPoint), route=\(path.joined(separator: " -> "))")
+      }
+
+      // A positive control rules out an entirely disabled/misidentified surface.
+      let videoCenter = CGPoint(x: host.view.bounds.midX, y: host.view.bounds.midY)
+      let videoHit = try XCTUnwrap(window.hitTest(host.view.convert(videoCenter, to: window), with: nil))
+      XCTAssertTrue(videoHit === surface || videoHit.isDescendant(of: surface),
+        "The unobstructed video center must route to the actual playback gesture UIView")
+      routes.append("video center: root=\(videoCenter), hit=\(type(of: videoHit))")
+      let diagnostic = XCTAttachment(string: routes.joined(separator: "\n"))
+      diagnostic.name = "Natural UIKit control routing \(Int(width)) \(typeSize)"
+      diagnostic.lifetime = .keepAlways
+      add(diagnostic)
+    }
+  }
+
+  private func routingRenderedTargets(
+    in root: UIView, name: String
+  ) throws -> (hq: CGRect, play: CGRect, progress: CGRect) {
+    // This uses only the production fixture's fixed 16+12 horizontal padding,
+    // 20+10 bottom padding, 44-point play frame and 8-point row spacing.
+    // Actual HQ/play ink and the progress track are then found in the render.
+    // Glyph/track bounds are coordinates, never proof of a 44-point hit target.
+    XCTAssertEqual(root.bounds.origin, .zero)
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    let image = UIGraphicsImageRenderer(size: root.bounds.size, format: format).image { _ in
+      XCTAssertTrue(root.drawHierarchy(in: root.bounds, afterScreenUpdates: true))
+    }
+    let screenshot = XCTAttachment(image: image)
+    screenshot.name = name
+    screenshot.lifetime = .keepAlways
+    add(screenshot)
+    let cgImage = try XCTUnwrap(image.cgImage)
+    let context = try XCTUnwrap(CGContext(data: nil, width: cgImage.width, height: cgImage.height,
+      bitsPerComponent: 8, bytesPerRow: cgImage.width * 4,
+      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    let data = try XCTUnwrap(context.data)
+    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+    let bytes = data.assumingMemoryBound(to: UInt8.self)
+    func isNeutralInk(x: Int, y: Int, threshold: Int) -> Bool {
+      let offset = (y * cgImage.width + x) * 4
+      let red = Int(bytes[offset]), green = Int(bytes[offset + 1]), blue = Int(bytes[offset + 2])
+      return red > threshold && abs(red - green) < 8 && abs(red - blue) < 8
+    }
+    func whiteBounds(in region: CGRect) throws -> CGRect {
+      let region = region.intersection(root.bounds).integral
+      guard !region.isNull, !region.isEmpty else { throw CocoaError(.coderInvalidValue) }
+      var left = cgImage.width, top = cgImage.height, right = -1, bottom = -1
+      for y in Int(region.minY)..<Int(region.maxY) {
+        for x in Int(region.minX)..<Int(region.maxX) where isNeutralInk(x: x, y: y, threshold: 200) {
+          left = min(left, x); right = max(right, x)
+          top = min(top, y); bottom = max(bottom, y)
+        }
+      }
+      guard right >= left, bottom >= top else {
+        XCTFail("The expected control must have actual rendered glyphs in \(region)")
+        throw CocoaError(.coderInvalidValue)
+      }
+      return CGRect(x: left, y: top, width: right - left + 1, height: bottom - top + 1)
+    }
+
+    let playY = root.bounds.maxY - 20 - 10 - 44
+    let play = try whiteBounds(in: CGRect(x: 28, y: playY, width: 44, height: 44))
+    let hq = try whiteBounds(in: CGRect(x: root.bounds.maxX - 128,
+      y: playY - 8 - 132, width: 100, height: 132))
+
+    // Find the longest continuous neutral run starting beside the play button.
+    // This selects the real gray/white progress track, stops at the time-label
+    // gap, and tolerates its row moving vertically with Dynamic Type.
+    let search = CGRect(x: 84, y: playY, width: root.bounds.width - 112, height: 44)
+      .intersection(root.bounds).integral
+    var progress: CGRect?
+    for y in Int(search.minY)..<Int(search.maxY) {
+      let first = (Int(search.minX)..<min(Int(search.minX) + 24, Int(search.maxX)))
+        .first { isNeutralInk(x: $0, y: y, threshold: 50) }
+      guard let first else { continue }
+      var last = first
+      while last + 1 < Int(search.maxX), isNeutralInk(x: last + 1, y: y, threshold: 50) { last += 1 }
+      let run = CGRect(x: first, y: y, width: last - first + 1, height: 1)
+      if run.width > (progress?.width ?? 0) { progress = run }
+    }
+    return (hq, play, try XCTUnwrap(progress, "The actual progress track must be rendered"))
   }
 }
