@@ -109,6 +109,156 @@ final class VideoResourcesFramesTests: XCTestCase {
     try oldSelection.validate()
   }
 
+  func testExportReportsActualPreparationAndContinuesOnlyAfterItsReceiptReturns() async throws {
+    let probe = FramesProgressProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "export-preparation")
+    let asset = try await movie()
+    var preparation: VideoPreparation?
+    var ended = 0
+    var nativeProgress: [Double] = []
+    let task = Task { @MainActor in
+      try await VideoResourcesFrames.export(source: source, rate: 0.5,
+        onPreparation: { handle, began in
+          if began { preparation = handle } else {
+            ended += 1
+            if preparation === handle { preparation = nil }
+          }
+        }, onProgress: { progress in
+          XCTAssertNil(preparation, "Native export begins after resource preparation ends")
+          nativeProgress.append(progress)
+        })
+    }
+    defer { task.cancel(); probe.finishOutstanding() }
+    try await waitUntil { preparation != nil && probe.invocations.count == 1 }
+    let handle = try XCTUnwrap(preparation)
+    XCTAssertEqual(probe.invocations[0].request, .init(quality: .highest, network: .allowed))
+    XCTAssertNil(handle.progress)
+    probe.invocations[0].progress(0.42)
+    try await waitUntil { handle.progress == 0.42 }
+    XCTAssertTrue(nativeProgress.isEmpty)
+    probe.invocations[0].progress(1)
+    try await waitUntil { handle.progress == 1 }
+    XCTAssertEqual(ended, 0, "Download progress 1 is not an accepted receipt")
+    XCTAssertTrue(nativeProgress.isEmpty)
+    probe.finish(0, with: .success(.init(asset: asset)))
+    let output = try await task.value
+    defer { try? FileManager.default.removeItem(at: output.url) }
+    XCTAssertEqual(ended, 1)
+    XCTAssertNil(preparation)
+    XCTAssertEqual(nativeProgress.last, 1)
+    XCTAssertTrue(output.receipt.isCurrent)
+    XCTAssertEqual(probe.invocations.count, 1)
+  }
+
+  func testExportPreparationFailureEndsAndRetryUsesAcceptedHQWithoutAnotherLoad() async throws {
+    let probe = FramesProgressProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "export-preparation-retry")
+    let asset = try await movie()
+    var ended = 0
+    var nativeProgress: [Double] = []
+    let task = Task { @MainActor in
+      try await VideoResourcesFrames.export(source: source, rate: 0.5,
+        onPreparation: { _, began in if !began { ended += 1 } },
+        onProgress: { nativeProgress.append($0) })
+    }
+    defer { task.cancel(); probe.finishOutstanding() }
+    try await waitUntil { probe.invocations.count == 1 }
+    probe.finish(0, with: .failure(VideoResourceFailure.sourceUnavailable))
+    do { _ = try await task.value; XCTFail("Failed resource preparation cannot export") }
+    catch { XCTAssertEqual(error as? VideoResourceFailure, .sourceUnavailable) }
+    XCTAssertEqual(ended, 1)
+    XCTAssertTrue(nativeProgress.isEmpty)
+
+    let manual = source.prepare(.init(quality: .highest, network: .allowed))
+    defer { manual.cancel() }
+    try await waitUntil { probe.invocations.count == 2 }
+    probe.finish(1, with: .success(.init(asset: asset)))
+    let accepted = try await manual.value()
+    var callbacks: [Bool] = []
+    let output = try await VideoResourcesFrames.export(source: source, rate: 0.5,
+      onPreparation: { _, began in callbacks.append(began) }, onProgress: { _ in })
+    defer { try? FileManager.default.removeItem(at: output.url) }
+    XCTAssertEqual(callbacks, [true, false])
+    XCTAssertEqual(output.receipt.representationID, accepted.representationID)
+    XCTAssertEqual(probe.invocations.count, 2, "An already accepted HQ receipt does not download again")
+  }
+
+  func testCancellingExportPreparationLeavesManualHQShareAlive() async throws {
+    let probe = FramesProgressProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "shared-export-hq")
+    let asset = try await movie()
+    let manual = source.prepare(.init(quality: .highest, network: .allowed))
+    var exportHandle: VideoPreparation?
+    var ended = 0
+    let task = Task { @MainActor in
+      try await VideoResourcesFrames.export(source: source, rate: 0.5,
+        onPreparation: { handle, began in
+          if began { exportHandle = handle } else { ended += 1 }
+        }, onProgress: { _ in XCTFail("Cancelled preparation cannot start native export") })
+    }
+    defer { task.cancel(); manual.cancel(); probe.finishOutstanding() }
+    try await waitUntil { exportHandle != nil && probe.invocations.count == 1 }
+    probe.invocations[0].progress(0.42)
+    try await waitUntil { exportHandle?.progress == 0.42 && manual.progress == 0.42 }
+    task.cancel()
+    do { _ = try await task.value; XCTFail("Expected export cancellation") }
+    catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
+    XCTAssertEqual(ended, 1)
+    await settle()
+    XCTAssertTrue(probe.cancelledIndices.isEmpty)
+    probe.finish(0, with: .success(.init(asset: asset)))
+    let receipt = try await manual.value()
+    XCTAssertTrue(receipt.isCurrent)
+    XCTAssertEqual(probe.invocations.count, 1)
+  }
+
+  func testPreparationCallbacksCanSynchronouslyCancelExportBeforeNativeWork() async throws {
+    let asset = try await movie()
+    for cancelOnBegin in [true, false] {
+      let resources = VideoResources(photos: PhotosVideoProvider(authority: { _ in "cancel-callback-photo" },
+        load: { _, _, _ in .init(asset: asset) }))
+      let source = resources.photosSource(serializedCloudIdentifier: "cancel-callback-export")
+      let directory = FileManager.default.temporaryDirectory.appendingPathComponent("preparation-cancel-\(UUID())")
+      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+      defer { try? FileManager.default.removeItem(at: directory) }
+      let holder = FramesExportTaskHolder()
+      var callbacks: [Bool] = []
+      holder.task = Task { @MainActor [weak holder] in
+        _ = try await VideoResourcesFrames.export(source: source, rate: 0.5, outputDirectory: directory,
+          onPreparation: { [weak holder] _, began in
+            callbacks.append(began)
+            if began == cancelOnBegin { holder?.task?.cancel() }
+          }, onProgress: { _ in XCTFail("Preparation callback cancellation must precede native work") })
+      }
+      do { try await XCTUnwrap(holder.task).value; XCTFail("Expected callback cancellation") }
+      catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
+      holder.task = nil
+      XCTAssertEqual(callbacks, [true, false])
+      XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+    }
+  }
+
+  func testPreparationEndCallbackInvalidatingReceiptPreventsNativeExport() async throws {
+    let asset = try await movie()
+    let resources = VideoResources(photos: PhotosVideoProvider(authority: { _ in "end-callback-photo" },
+      load: { _, _, _ in .init(asset: asset) }))
+    let source = resources.photosSource(serializedCloudIdentifier: "end-callback-export")
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("preparation-end-\(UUID())")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    var callbacks: [Bool] = []
+    do {
+      _ = try await VideoResourcesFrames.export(source: source, rate: 0.5, outputDirectory: directory,
+        onPreparation: { _, began in
+          callbacks.append(began)
+          if !began { source.invalidate() }
+        }, onProgress: { _ in XCTFail("An invalid receipt cannot enter native export") })
+      XCTFail("End callback invalidation must reject the receipt")
+    } catch { XCTAssertEqual(error as? VideoResourceFailure, .sourceChanged) }
+    XCTAssertEqual(callbacks, [true, false])
+    XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+  }
+
   func testExportRejectsReceiptInvalidatedByNativeCompletionAndRemovesOnlyItsOutput() async throws {
     let asset = try await movie()
     var loads = 0
@@ -454,6 +604,15 @@ private final class FramesProgressProbe {
   func resources() -> VideoResources {
     VideoResources(photos: PhotosVideoProvider(authority: { "visible:\($0)" },
       load: { [self] _, request, progress in try await load(request, progress: progress) }))
+  }
+
+  func finish(_ index: Int, with result: Result<VideoRepresentation, Error>) {
+    guard invocations.indices.contains(index), let continuation = invocations[index].continuation else {
+      XCTFail("Expected unfinished request \(index)")
+      return
+    }
+    invocations[index].continuation = nil
+    continuation.resume(with: result)
   }
 
   func finishOutstanding() {

@@ -49,12 +49,30 @@ public enum VideoResourcesFrames {
   }
 
   /// Success transfers only this operation's unique output file to the host.
+  /// `onPreparation` reports this export's actual finite resource handle at start
+  /// and end. The host may observe its progress without acquiring another share.
   public static func export(
     source: VideoSource, rate: Double,
     outputDirectory: URL = FileManager.default.temporaryDirectory,
+    onPreparation: @escaping @MainActor (VideoPreparation, Bool) -> Void = { _, _ in },
     onProgress: @escaping @MainActor (Double) -> Void
   ) async throws -> (url: URL, receipt: VideoReceipt) {
-    let receipt = try await source.acquire(.init(quality: .highest, network: .allowed))
+    let receipt = try await { () async throws -> VideoReceipt in
+      try Task.checkCancellation()
+      let preparation = source.prepare(.init(quality: .highest, network: .allowed))
+      defer {
+        preparation.cancel()
+        onPreparation(preparation, false)
+      }
+      onPreparation(preparation, true)
+      try Task.checkCancellation()
+      return try await withTaskCancellationHandler {
+        try await preparation.value()
+      } onCancel: {
+        Task { @MainActor in preparation.cancel() }
+      }
+    }()
+    // Ending host preparation feedback can synchronously cancel or invalidate.
     try validate(receipt)
     let url = try await SlowVideoExporter.exportSlowedVideo(
       asset: receipt.asset, audioMix: receipt.audioMix, rate: rate, outputDirectory: outputDirectory, onProgress: { progress in
