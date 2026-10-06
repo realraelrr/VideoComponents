@@ -872,6 +872,474 @@ final class VideoResourcePlaybackTests: XCTestCase {
     return observation
   }
 
+  // Insert inside VideoResourcePlaybackTests before its private helpers.
+  // Reuses the existing movie/ready/waitUntil/settle, BindingLoaderProbe,
+  // and BindingReplacementGate fixtures. No additional owner or provider.
+
+  func testExternalHighestReceiptBeforeInitialReadinessIsInstalledWithoutAnotherRequest() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(
+      serializedCloudIdentifier: "external-HQ-before-ready")
+    var replacements = 0
+    let native = PlaybackSession(
+      transportSeek: PlaybackSession.seekTransport,
+      prepareReplacement: { asset in
+        replacements += 1
+        return AVPlayerItem(asset: asset)
+      })
+    let binding = VideoResourcePlayback(session: native)
+    defer { binding.cleanup(); probe.finishOutstanding() }
+
+    let automatic = try await movie()
+    let highest = try await movie(blue: true)
+    binding.load(source: source, playbackRate: 0.5, isLooping: false)
+    try await waitUntil { probe.invocations.count == 1 }
+
+    let external = source.prepare(.init(quality: .highest, network: .allowed))
+    defer { external.cancel() }
+    try await waitUntil { probe.invocations.count == 2 }
+
+    // Keep the initial automatic request pending to guarantee native is not ready.
+    probe.finish(1, with: .success(.init(asset: highest)))
+    let hq = try await external.value()
+    XCTAssertEqual(hq.evidence.quality, .highest)
+    XCTAssertEqual(source.preferred?.representationID, hq.representationID)
+    XCTAssertFalse(native.isPlayerReady)
+    XCTAssertNil(native.player.currentItem)
+    XCTAssertEqual(replacements, 0)
+
+    // The late automatic result cannot downgrade preferred. Once its own native
+    // item is ready, playback must adopt the already completed external receipt.
+    probe.finish(0, with: .success(.init(asset: automatic)))
+    try await waitUntil {
+      binding.installedReceipt?.representationID == hq.representationID
+        && binding.installedReceipt?.evidence.quality == .highest
+    }
+
+    XCTAssertTrue(native.player.currentItem?.asset === highest)
+    XCTAssertEqual(native.playbackConfig.playbackRate, 0.5)
+    XCTAssertFalse(native.playbackConfig.isLooping)
+    XCTAssertFalse(native.isPlaybackRequested)
+    XCTAssertEqual(binding.highQualityAction, .hidden)
+    XCTAssertNil(binding.qualityFailure)
+    XCTAssertEqual(replacements, 1)
+    XCTAssertEqual(probe.invocations.count, 2,
+      "Adopting an existing receipt must not start another native resource request")
+  }
+
+  func testExternalPreferredSameRepresentationUpdatesQualityAndNetworkEvidenceWithoutReplacingItem() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(
+      serializedCloudIdentifier: "external-same-representation")
+    var replacements = 0
+    let native = PlaybackSession(
+      transportSeek: PlaybackSession.seekTransport,
+      prepareReplacement: { asset in
+        replacements += 1
+        return AVPlayerItem(asset: asset)
+      })
+    let binding = VideoResourcePlayback(session: native)
+    defer { binding.cleanup(); probe.finishOutstanding() }
+
+    let asset = try await movie()
+    let mix = AVMutableAudioMix()
+    binding.load(source: source)
+    try await waitUntil { probe.invocations.count == 1 }
+    probe.finish(0, with: .success(.init(asset: asset, audioMix: mix)))
+    try await waitUntil { binding.installedReceipt != nil }
+
+    let original = try XCTUnwrap(binding.installedReceipt)
+    let originalItem = try XCTUnwrap(native.player.currentItem)
+    let visit = native.sourcePresentationID
+    XCTAssertEqual(original.evidence.quality, .automatic)
+
+    let highest = source.prepare(.init(quality: .highest, network: .allowed))
+    defer { highest.cancel() }
+    try await waitUntil { probe.invocations.count == 2 }
+    // Identical asset and audioMix objects preserve the representation ID.
+    probe.finish(1, with: .success(.init(asset: asset, audioMix: mix)))
+    let hq = try await highest.value()
+    XCTAssertEqual(hq.representationID, original.representationID)
+    XCTAssertEqual(hq.evidence.quality, .highest)
+
+    try await waitUntil { binding.installedReceipt?.evidence == hq.evidence }
+    XCTAssertTrue(native.player.currentItem === originalItem)
+    XCTAssertTrue(binding.installedReceipt?.audioMix === mix)
+    XCTAssertTrue(native.currentLoadedMedia?.audioMix === mix)
+    XCTAssertEqual(binding.highQualityAction, .hidden)
+
+    // Preserve the same ID again, changing only network evidence.
+    let local = source.prepare(.init(quality: .highest, network: .forbidden))
+    defer { local.cancel() }
+    try await waitUntil { probe.invocations.count == 3 }
+    probe.finish(2, with: .success(.init(asset: asset, audioMix: mix)))
+    let localHQ = try await local.value()
+    XCTAssertEqual(localHQ.representationID, original.representationID)
+    XCTAssertEqual(localHQ.evidence.network, .forbidden)
+
+    try await waitUntil { binding.installedReceipt?.evidence == localHQ.evidence }
+    XCTAssertTrue(native.player.currentItem === originalItem)
+    XCTAssertEqual(native.sourcePresentationID, visit)
+    XCTAssertEqual(replacements, 0)
+    XCTAssertEqual(probe.invocations.count, 3,
+      "Only the initial request and the two explicit external requests may run")
+  }
+
+  func testExternalHighestInstallationFailurePreservesItemAndRequiresExplicitRetry() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(
+      serializedCloudIdentifier: "external-HQ-failed-install")
+    var installations = 0
+    let native = PlaybackSession(
+      transportSeek: PlaybackSession.seekTransport,
+      prepareReplacement: { asset in
+        installations += 1
+        if installations == 1 { throw BindingTestError.installationDenied }
+        return AVPlayerItem(asset: asset)
+      })
+    let binding = VideoResourcePlayback(session: native)
+    defer { binding.cleanup(); probe.finishOutstanding() }
+
+    let automatic = try await movie()
+    let highest = try await movie(blue: true)
+    try await ready(binding, source: source, probe: probe, asset: automatic)
+    let original = try XCTUnwrap(binding.installedReceipt)
+    let originalItem = try XCTUnwrap(native.player.currentItem)
+    let visit = native.sourcePresentationID
+
+    let external = source.prepare(.init(quality: .highest, network: .allowed))
+    defer { external.cancel() }
+    try await waitUntil { probe.invocations.count == 2 }
+    probe.finish(1, with: .success(.init(asset: highest)))
+    let hq = try await external.value()
+    try await waitUntil { binding.qualityFailure != nil }
+    await settle()
+
+    XCTAssertEqual(installations, 1)
+    XCTAssertTrue(native.player.currentItem === originalItem)
+    XCTAssertEqual(binding.installedReceipt?.representationID, original.representationID)
+    XCTAssertTrue(original.isCurrent)
+    XCTAssertTrue(native.isPlayerReady)
+    XCTAssertNil(native.failure)
+    XCTAssertEqual(binding.highQualityAction, .available)
+
+    // Force a real second preferred notification. The same failed native
+    // representation must not install itself again merely because evidence grew.
+    let local = source.prepare(.init(quality: .highest, network: .forbidden))
+    defer { local.cancel() }
+    try await waitUntil { probe.invocations.count == 3 }
+    probe.finish(2, with: .success(.init(asset: highest)))
+    let localHQ = try await local.value()
+    XCTAssertEqual(localHQ.representationID, hq.representationID)
+    XCTAssertEqual(localHQ.evidence.network, .forbidden)
+    await settle()
+
+    XCTAssertEqual(installations, 1)
+    XCTAssertTrue(native.player.currentItem === originalItem)
+    XCTAssertNotNil(binding.qualityFailure)
+    XCTAssertEqual(binding.highQualityAction, .available)
+
+    // Only the explicit retry below may attempt native installation again.
+    binding.requestHighQuality()
+    try await waitUntil {
+      binding.installedReceipt?.representationID == localHQ.representationID
+        && binding.installedReceipt?.evidence == localHQ.evidence
+    }
+    XCTAssertEqual(installations, 2)
+    XCTAssertEqual(probe.invocations.count, 3,
+      "Explicit installation retry must reuse the already acquired HQ receipt")
+    XCTAssertTrue(native.player.currentItem?.asset === highest)
+    XCTAssertEqual(native.sourcePresentationID, visit)
+    XCTAssertEqual(binding.highQualityAction, .hidden)
+    XCTAssertNil(binding.qualityFailure)
+  }
+
+  func testExternalHighestReceiptIsAcceptedOnlyAfterNativeInstallation() async throws {
+    let probe = BindingLoaderProbe()
+    let gate = BindingReplacementGate()
+    let resources = probe.resources()
+    let source = resources.photosSource(serializedCloudIdentifier: "external-HQ-pending-success")
+    let native = PlaybackSession(
+      transportSeek: PlaybackSession.seekTransport,
+      prepareReplacement: gate.prepare)
+    let binding = VideoResourcePlayback(session: native)
+    defer { binding.cleanup(); gate.finishAll(); probe.finishOutstanding() }
+
+    let automatic = try await movie()
+    let highest = try await movie(blue: true)
+    let mix = AVMutableAudioMix()
+    try await ready(binding, source: source, probe: probe, asset: automatic)
+    let original = try XCTUnwrap(binding.installedReceipt)
+    let originalItem = try XCTUnwrap(native.player.currentItem)
+    let visit = native.sourcePresentationID
+
+    let external = source.prepare(.init(quality: .highest, network: .allowed))
+    defer { external.cancel() }
+    try await waitUntil { probe.invocations.count == 2 }
+
+    // Native progress=1 is neither a receipt nor installation completion.
+    probe.report(1, at: 1)
+    await settle()
+    XCTAssertEqual(source.preferred?.representationID, original.representationID)
+    XCTAssertTrue(native.player.currentItem === originalItem)
+
+    probe.finish(1, with: .success(.init(asset: highest, audioMix: mix)))
+    let hq = try await external.value()
+    try await waitUntil { gate.invocationCount == 1 }
+    XCTAssertEqual(source.preferred?.representationID, hq.representationID)
+    XCTAssertTrue(native.player.currentItem === originalItem)
+    XCTAssertEqual(binding.installedReceipt?.representationID, original.representationID)
+
+    gate.finishAll()
+    try await waitUntil {
+      binding.installedReceipt?.representationID == hq.representationID
+    }
+    XCTAssertTrue(native.player.currentItem?.asset === highest)
+    XCTAssertTrue(native.currentLoadedMedia?.audioMix === mix)
+    XCTAssertTrue(binding.installedReceipt?.audioMix === mix)
+    XCTAssertEqual(native.sourcePresentationID, visit)
+    XCTAssertEqual(binding.highQualityAction, .hidden)
+    XCTAssertNil(binding.qualityFailure)
+    XCTAssertEqual(gate.invocationCount, 1)
+    XCTAssertEqual(probe.invocations.count, 2)
+  }
+
+  func testExternalHighestControlPreservesVisibilityUntilRestorationCompletes() async throws {
+    for wasAvailable in [false, true] {
+      let probe = BindingLoaderProbe()
+      let resources = probe.resources()
+      let source = resources.photosSource(serializedCloudIdentifier: "external-HQ-restoration-\(wasAvailable)")
+      let automatic = try await movie()
+      let highest = try await movie(blue: true)
+      var heldRestore: (@MainActor () -> Void)?
+      let native = PlaybackSession(transportSeek: { player, target, completion in
+        PlaybackSession.seekTransport(player: player, target: target) { finished in
+          if player.currentItem?.asset === highest {
+            XCTAssertTrue(finished, "The real native seek must succeed before its callback is held")
+            heldRestore = { completion(finished) }
+          } else {
+            completion(finished)
+          }
+        }
+      })
+      let binding = VideoResourcePlayback(session: native)
+      defer { binding.cleanup(); heldRestore = nil; probe.finishOutstanding() }
+      try await ready(binding, source: source, probe: probe, asset: automatic)
+      if wasAvailable {
+        binding.checkLocalHighQuality()
+        try await waitUntil { probe.invocations.count == 2 }
+        probe.finish(1, with: .failure(VideoResourceFailure.networkRequired))
+        try await waitUntil { binding.highQualityAction == .available }
+      } else {
+        XCTAssertEqual(binding.highQualityAction, .hidden)
+      }
+
+      let external = source.prepare(.init(quality: .highest, network: .allowed))
+      defer { external.cancel() }
+      let requestCount = wasAvailable ? 3 : 2
+      try await waitUntil { probe.invocations.count == requestCount }
+      probe.finish(requestCount - 1, with: .success(.init(asset: highest)))
+      let hq = try await external.value()
+      try await waitUntil {
+        heldRestore != nil && native.player.currentItem?.asset === highest && native.isPlayerReady
+      }
+      XCTAssertNil(binding.installedReceipt, "Native readiness does not complete the owner's restoring seek")
+      XCTAssertEqual(binding.highQualityAction, wasAvailable ? .loading(nil) : .hidden,
+        "Keep the existing control until acceptance without revealing a previously hidden control")
+      let finish = try XCTUnwrap(heldRestore)
+      heldRestore = nil
+      finish()
+      try await waitUntil { binding.installedReceipt?.representationID == hq.representationID }
+      XCTAssertEqual(binding.highQualityAction, .hidden)
+      XCTAssertNil(binding.qualityFailure)
+      XCTAssertEqual(probe.invocations.count, requestCount)
+    }
+  }
+
+  func testSourceSwapDuringExternalHighestInstallationRejectsOldCandidate() async throws {
+    let probe = BindingLoaderProbe()
+    let gate = BindingReplacementGate()
+    let resources = probe.resources()
+    let source = resources.photosSource(serializedCloudIdentifier: "external-HQ-pending-swap")
+    let native = PlaybackSession(
+      transportSeek: PlaybackSession.seekTransport,
+      prepareReplacement: gate.prepare)
+    let binding = VideoResourcePlayback(session: native)
+    defer { binding.cleanup(); gate.finishAll(); probe.finishOutstanding() }
+
+    let automatic = try await movie()
+    let highest = try await movie(blue: true)
+    let mix = AVMutableAudioMix()
+    try await ready(binding, source: source, probe: probe, asset: automatic)
+    let original = try XCTUnwrap(binding.installedReceipt)
+    let originalItem = try XCTUnwrap(native.player.currentItem)
+    let visit = native.sourcePresentationID
+
+    let external = source.prepare(.init(quality: .highest, network: .allowed))
+    defer { external.cancel() }
+    try await waitUntil { probe.invocations.count == 2 }
+    probe.report(1, at: 1)
+    await settle()
+    XCTAssertEqual(source.preferred?.representationID, original.representationID)
+    XCTAssertTrue(native.player.currentItem === originalItem)
+
+    probe.finish(1, with: .success(.init(asset: highest, audioMix: mix)))
+    let hq = try await external.value()
+    try await waitUntil { gate.invocationCount == 1 }
+    XCTAssertEqual(source.preferred?.representationID, hq.representationID)
+    XCTAssertTrue(native.player.currentItem === originalItem)
+    XCTAssertEqual(binding.installedReceipt?.representationID, original.representationID)
+
+    let sourceB = resources.photosSource(serializedCloudIdentifier: "replacement-B")
+    let assetB = try await movie()
+    binding.load(source: sourceB)
+    try await waitUntil { probe.invocations.count == 3 }
+    probe.finish(2, with: .success(.init(asset: assetB)))
+    try await waitUntil { binding.installedReceipt?.asset === assetB }
+    let itemB = try XCTUnwrap(native.player.currentItem)
+    let receiptB = try XCTUnwrap(binding.installedReceipt)
+    let visitB = native.sourcePresentationID
+
+    gate.finishAll()
+    try await waitUntil { gate.returnedCount == 1 }
+    await settle()
+
+    XCTAssertNotEqual(visitB, visit)
+    XCTAssertEqual(native.sourcePresentationID, visitB)
+    XCTAssertTrue(native.player.currentItem === itemB)
+    XCTAssertEqual(binding.installedReceipt?.representationID, receiptB.representationID)
+    XCTAssertTrue(hq.isCurrent,
+      "Switching playback must not invalidate another consumer's completed resource")
+    XCTAssertEqual(source.preferred?.representationID, hq.representationID)
+    XCTAssertNil(binding.qualityFailure)
+    XCTAssertEqual(probe.invocations.count, 3)
+  }
+
+  func testSourceInvalidationDuringExternalHighestInstallationRejectsExpiredReceipt() async throws {
+    let probe = BindingLoaderProbe()
+    let gate = BindingReplacementGate()
+    let resources = probe.resources()
+    let source = resources.photosSource(serializedCloudIdentifier: "external-HQ-pending-invalidation")
+    let native = PlaybackSession(
+      transportSeek: PlaybackSession.seekTransport,
+      prepareReplacement: gate.prepare)
+    let binding = VideoResourcePlayback(session: native)
+    defer { binding.cleanup(); gate.finishAll(); probe.finishOutstanding() }
+
+    let automatic = try await movie()
+    let highest = try await movie(blue: true)
+    let mix = AVMutableAudioMix()
+    try await ready(binding, source: source, probe: probe, asset: automatic)
+    let original = try XCTUnwrap(binding.installedReceipt)
+    let originalItem = try XCTUnwrap(native.player.currentItem)
+
+    let external = source.prepare(.init(quality: .highest, network: .allowed))
+    defer { external.cancel() }
+    try await waitUntil { probe.invocations.count == 2 }
+    probe.report(1, at: 1)
+    await settle()
+    XCTAssertEqual(source.preferred?.representationID, original.representationID)
+    XCTAssertTrue(native.player.currentItem === originalItem)
+
+    probe.finish(1, with: .success(.init(asset: highest, audioMix: mix)))
+    let hq = try await external.value()
+    try await waitUntil { gate.invocationCount == 1 }
+    XCTAssertEqual(source.preferred?.representationID, hq.representationID)
+    XCTAssertTrue(native.player.currentItem === originalItem)
+    XCTAssertEqual(binding.installedReceipt?.representationID, original.representationID)
+
+    source.invalidate()
+    XCTAssertFalse(original.isCurrent)
+    XCTAssertFalse(hq.isCurrent)
+    gate.finishAll()
+    try await waitUntil { gate.returnedCount == 1 }
+    await settle()
+
+    // The getter can hide an expired receipt: also inspect actual native media.
+    XCTAssertFalse(native.player.currentItem?.asset === highest)
+    XCTAssertNil(binding.installedReceipt)
+    XCTAssertNil(source.preferred)
+    XCTAssertNil(binding.qualityFailure)
+    XCTAssertEqual(probe.invocations.count, 2)
+
+    // Match the existing invalidated-current final-use contract.
+    native.togglePlayback()
+    XCTAssertNil(native.player.currentItem)
+    guard case .source(let reason) = native.failure else {
+      return XCTFail("Invalidated media must fail final-use validation")
+    }
+    XCTAssertEqual(reason as? VideoResourceFailure, .sourceChanged)
+  }
+
+  func testExternalHighestDuringLocalProbeIsInstalledAfterThatProbeFinishes() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "external-HQ-during-local-probe")
+    let binding = VideoResourcePlayback()
+    defer { binding.cleanup(); probe.finishOutstanding() }
+    let automatic = try await movie()
+    let highest = try await movie(blue: true)
+    try await ready(binding, source: source, probe: probe, asset: automatic)
+    let originalItem = try XCTUnwrap(binding.session.player.currentItem)
+
+    binding.checkLocalHighQuality()
+    try await waitUntil { probe.invocations.count == 2 }
+    XCTAssertEqual(probe.invocations[1].request, .init(quality: .highest, network: .forbidden))
+    let external = source.prepare(.init(quality: .highest, network: .allowed))
+    defer { external.cancel() }
+    try await waitUntil { probe.invocations.count == 3 }
+    probe.finish(2, with: .success(.init(asset: highest)))
+    let receipt = try await external.value()
+    await settle()
+    XCTAssertTrue(binding.session.player.currentItem === originalItem,
+      "The local probe and preferred observer must use the same serialized quality task")
+
+    probe.finish(1, with: .failure(VideoResourceFailure.networkRequired))
+    try await waitUntil { binding.installedReceipt?.representationID == receipt.representationID }
+    XCTAssertTrue(binding.session.player.currentItem?.asset === highest)
+    XCTAssertEqual(binding.installedReceipt?.evidence, receipt.evidence)
+    XCTAssertEqual(binding.highQualityAction, .hidden)
+    XCTAssertNil(binding.qualityFailure)
+    XCTAssertEqual(probe.invocations.count, 3,
+      "A preferred change while the probe is busy must be consumed without another request")
+  }
+
+  func testLocalHighestNativeFailureStaysQuietAndDoesNotBecomeAnAutomaticRetry() async throws {
+    let probe = BindingLoaderProbe()
+    let source = probe.resources().photosSource(serializedCloudIdentifier: "local-HQ-native-failure")
+    var installations = 0
+    let native = PlaybackSession(transportSeek: PlaybackSession.seekTransport,
+      prepareReplacement: { _ in
+        installations += 1
+        throw BindingTestError.installationDenied
+      })
+    let binding = VideoResourcePlayback(session: native)
+    defer { binding.cleanup(); probe.finishOutstanding() }
+    let automatic = try await movie()
+    let highest = try await movie(blue: true)
+    try await ready(binding, source: source, probe: probe, asset: automatic)
+    let originalItem = try XCTUnwrap(native.player.currentItem)
+    let originalReceipt = try XCTUnwrap(binding.installedReceipt)
+
+    binding.checkLocalHighQuality()
+    try await waitUntil { probe.invocations.count == 2 }
+    probe.finish(1, with: .success(.init(asset: highest)))
+    try await waitUntil { installations == 1 }
+    await settle()
+    binding.checkLocalHighQuality()
+    await settle()
+
+    XCTAssertEqual(source.preferred?.evidence.quality, .highest)
+    XCTAssertEqual(installations, 1,
+      "The preferred observer must not retry a local probe's failed native candidate")
+    XCTAssertTrue(native.player.currentItem === originalItem)
+    XCTAssertEqual(binding.installedReceipt?.representationID, originalReceipt.representationID)
+    XCTAssertTrue(native.isPlayerReady)
+    XCTAssertNil(native.failure)
+    XCTAssertNil(binding.qualityFailure, "A local install failure keeps its existing quiet contract")
+    XCTAssertEqual(binding.highQualityAction, .hidden)
+    XCTAssertEqual(probe.invocations.count, 2)
+  }
+
   private func ready(_ binding: VideoResourcePlayback, source: VideoSource,
     probe: BindingLoaderProbe, asset: AVAsset) async throws {
     binding.load(source: source)

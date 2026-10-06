@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import Observation
 import UIKit
 import VideoPlayback
@@ -22,14 +23,22 @@ public final class VideoResourcePlayback {
     return initialPreparation?.progress
   }
 
-  /// Only this owner's explicit HQ operation supplies busy state and progress.
+  /// Existing HQ controls stay busy until this owner's candidate is installed.
+  /// Acquisition progress belongs only to this owner's explicit HQ request.
   public var highQualityAction: HighQualityAction {
     let attempt = qualityAttempt
     guard let visit, let acceptedReceipt, acceptedReceipt.isCurrent,
       session.isCurrentSource(AnyHashable(ObjectIdentifier(visit.source))) else { return .hidden }
-    if let attempt, attempt.purpose == .explicit { return .loading(attempt.preparation.progress) }
+    if let attempt, attempt.purpose == .explicit { return .loading(attempt.preparation?.progress) }
+    if let attempt, attempt.purpose == .preferred,
+      acceptedReceipt.evidence.quality != .highest,
+      (localAvailability == .requiresNetwork && lastLocalCheckRepresentation == acceptedReceipt.representationID)
+        || hasRequestedHighQuality || qualityFailure != nil {
+      return .loading(nil)
+    }
     guard let installed = installedReceipt, installed.evidence.quality != .highest else { return .hidden }
-    return localHighQualityAvailability == .requiresNetwork || hasRequestedHighQuality ? .available : .hidden
+    return localHighQualityAvailability == .requiresNetwork || hasRequestedHighQuality || qualityFailure != nil
+      ? .available : .hidden
   }
 
   public var localHighQualityAvailability: LocalHighQualityAvailability {
@@ -45,6 +54,8 @@ public final class VideoResourcePlayback {
     guard let visit, let installed = installedReceipt, installed.evidence.quality != .highest,
       lastLocalCheckRepresentation != installed.representationID, !hasRequestedHighQuality,
       qualityTask == nil, storedQualityAttempt == nil else { return }
+    if reconcilePreferred(visitID: visit.id) { return }
+    guard self.visit?.id == visit.id else { return }
     lastLocalCheckRepresentation = installed.representationID
     beginHighQuality(visit: visit, installed: installed, network: .forbidden, purpose: .local)
   }
@@ -62,13 +73,16 @@ public final class VideoResourcePlayback {
     return storedQualityAttempt
   }
   @ObservationIgnored private var qualityTask: Task<Void, Never>?
+  @ObservationIgnored private var readinessObservation: AnyCancellable?
+  @ObservationIgnored private var lastHighQualityInstallation: VideoRepresentationID?
   @ObservationIgnored private var lastLocalCheckRepresentation: VideoRepresentationID?
   @ObservationIgnored private var hasRequestedHighQuality = false
   private var localAvailability = LocalHighQualityAvailability.unknown
 
-  private enum QualityPurpose: Equatable { case local, explicit }
+  private enum QualityPurpose: Equatable { case local, explicit, preferred }
   private struct QualityAttempt {
-    let preparation: VideoPreparation
+    let id = UUID()
+    let preparation: VideoPreparation?
     let purpose: QualityPurpose
   }
 
@@ -103,9 +117,20 @@ public final class VideoResourcePlayback {
       originalEvent(event)
       onEvent(event)
     }
+    readinessObservation = session.$isPlayerReady.sink { [weak self] ready in
+      guard ready else { return }
+      let visitID = MainActor.assumeIsolated { self?.visit?.id }
+      guard let visitID else { return }
+      // Published notifies before committing readiness. Retire this signal
+      // with its original visit instead of applying it to a later source.
+      Task { @MainActor [weak self] in
+        self?.reconcilePreferred(visitID: visitID)
+      }
+    }
   }
 
   isolated deinit {
+    readinessObservation?.cancel()
     releaseVisit()
     session.cleanup()
   }
@@ -159,46 +184,60 @@ public final class VideoResourcePlayback {
     visit: Visit, installed: VideoReceipt, network: VideoRequest.Network, purpose: QualityPurpose
   ) {
     let preparation = visit.source.prepare(.init(quality: .highest, network: network))
+    beginQuality(visit: visit, installed: installed, preparation: preparation, purpose: purpose) {
+      try await preparation.value()
+    }
+  }
+
+  private func beginQuality(
+    visit: Visit, installed: VideoReceipt, preparation: VideoPreparation?, purpose: QualityPurpose,
+    receive: @escaping @MainActor () async throws -> VideoReceipt
+  ) {
+    let attempt = QualityAttempt(preparation: preparation, purpose: purpose)
     guard self.visit?.id == visit.id, qualityTask == nil, storedQualityAttempt == nil else {
-      preparation.cancel()
+      preparation?.cancel()
       return
     }
     // Observation's willSet callback runs before the write. A synchronous close must
     // not put the retired preparation back into this owner after cleanup returned.
     let published = withMutation(keyPath: \.qualityAttempt) {
       guard self.visit?.id == visit.id, qualityTask == nil, storedQualityAttempt == nil else { return false }
-      storedQualityAttempt = QualityAttempt(preparation: preparation, purpose: purpose)
+      storedQualityAttempt = attempt
       return true
     }
     guard published, self.visit?.id == visit.id,
-      storedQualityAttempt?.preparation === preparation else { preparation.cancel(); return }
+      storedQualityAttempt?.id == attempt.id else { preparation?.cancel(); return }
     let native = session
     qualityTask = Task { [weak self] in
       var obtainedReceipt = false
       defer {
-        preparation.cancel()
-        if let self, self.visit?.id == visit.id, storedQualityAttempt?.preparation === preparation {
+        preparation?.cancel()
+        if let self, self.visit?.id == visit.id, storedQualityAttempt?.id == attempt.id {
           qualityTask = nil
           withMutation(keyPath: \.qualityAttempt) {
-            guard self.visit?.id == visit.id, self.storedQualityAttempt?.preparation === preparation else { return }
+            guard self.visit?.id == visit.id, self.storedQualityAttempt?.id == attempt.id else { return }
             self.storedQualityAttempt = nil
           }
+          self.reconcilePreferred(visitID: visit.id)
         }
       }
       do {
         try Task.checkCancellation()
-        let receipt = try await preparation.value()
+        let receipt = try await receive()
         obtainedReceipt = true
         try Task.checkCancellation()
-        guard self?.visit?.id == visit.id, receipt.isCurrent,
+        guard self?.visit?.id == visit.id, receipt.isCurrent, self?.visit?.id == visit.id,
           native.isCurrentSource(AnyHashable(ObjectIdentifier(visit.source))) else {
           throw CancellationError()
         }
+        // Also record receipts obtained by local/explicit requests: the
+        // preferred observer must not retry their failed native candidate.
+        self?.lastHighQualityInstallation = receipt.representationID
         if receipt.representationID != installed.representationID {
           try await native.replaceAsset(Self.media(receipt), for: AnyHashable(ObjectIdentifier(visit.source)))
         }
         try Task.checkCancellation()
-        guard self?.visit?.id == visit.id, receipt.isCurrent,
+        guard self?.visit?.id == visit.id, receipt.isCurrent, self?.visit?.id == visit.id,
           let actual = native.currentLoadedMedia,
           actual.asset === receipt.asset, actual.audioMix === receipt.audioMix else {
           throw CancellationError()
@@ -210,6 +249,11 @@ public final class VideoResourcePlayback {
               actual.asset === receipt.asset, actual.audioMix === receipt.audioMix else { return }
             self.storedAcceptedReceipt = receipt
           }
+          guard self.visit?.id == visit.id else { return }
+          self.withMutation(keyPath: \.qualityFailure) {
+            guard self.visit?.id == visit.id else { return }
+            self._qualityFailure = nil
+          }
         }
       } catch is CancellationError {
         // Closing or superseding this owner is not a resource or installation failure.
@@ -217,7 +261,7 @@ public final class VideoResourcePlayback {
         guard let self, self.visit?.id == visit.id, installed.isCurrent,
           self.visit?.id == visit.id else { return }
         switch purpose {
-        case .explicit:
+        case .explicit, .preferred:
           withMutation(keyPath: \.qualityFailure) {
             guard self.visit?.id == visit.id else { return }
             _qualityFailure = error
@@ -232,6 +276,38 @@ public final class VideoResourcePlayback {
         }
       }
     }
+  }
+
+  private func observePreferred(visitID: UUID) {
+    guard let visit, visit.id == visitID else { return }
+    withObservationTracking {
+      _ = visit.source.preferred
+    } onChange: { [weak self] in
+      // Retain neither the owner nor its source in the one-shot observation.
+      Task { @MainActor [weak self] in
+        guard let self, self.visit?.id == visitID else { return }
+        self.observePreferred(visitID: visitID)
+        self.reconcilePreferred(visitID: visitID)
+      }
+    }
+  }
+
+  @discardableResult
+  private func reconcilePreferred(visitID: UUID) -> Bool {
+    guard let visit, visit.id == visitID, qualityTask == nil, storedQualityAttempt == nil,
+      let installed = installedReceipt,
+      let preferred = visit.source.preferred, preferred.evidence.quality == .highest,
+      preferred.isCurrent, self.visit?.id == visitID else { return false }
+    guard preferred.representationID != installed.representationID
+      || preferred.evidence != installed.evidence else { return true }
+    // The same installed representation may gain stronger evidence without a
+    // native swap. A failed different representation requires explicit retry.
+    guard preferred.representationID == installed.representationID
+      || preferred.representationID != lastHighQualityInstallation else { return true }
+    beginQuality(visit: visit, installed: installed, preparation: nil, purpose: .preferred) {
+      preferred
+    }
+    return true
   }
 
   public func cleanup() { session.cleanup() }
@@ -249,6 +325,8 @@ public final class VideoResourcePlayback {
       // Do not retain the owner across the acquisition await; owner release must cancel its share.
       if let owner = self {
         owner.visit = visit
+        owner.observePreferred(visitID: visit.id)
+        guard owner.visit?.id == visit.id else { throw CancellationError() }
         preparation = source.prepare(request)
         guard owner.visit?.id == visit.id else { preparation.cancel(); throw CancellationError() }
         let published = owner.withMutation(keyPath: \.preparationProgress) {
@@ -285,6 +363,7 @@ public final class VideoResourcePlayback {
         return true
       }
       guard accepted, owner.visit?.id == visit.id else { throw CancellationError() }
+      owner.reconcilePreferred(visitID: visit.id)
       return Self.media(receipt)
     }, thumbnail: thumbnail)
   }
@@ -309,6 +388,7 @@ public final class VideoResourcePlayback {
     }
     qualityTask = nil
     lastLocalCheckRepresentation = nil
+    lastHighQualityInstallation = nil
     hasRequestedHighQuality = false
     if let receipt {
       withMutation(keyPath: \.acceptedReceipt) {
