@@ -114,6 +114,7 @@ public final class VideoSource {
   fileprivate init(kind: Kind) { self.kind = kind }
 
   public var preferred: VideoReceipt? {
+    access(keyPath: \.preferred)
     guard let cached, isCurrent(epoch: epoch, fact: cached.fact),
       Self.backingAvailable(cached.representation.asset) else { return nil }
     return receipt(cached)
@@ -137,7 +138,10 @@ public final class VideoSource {
     let operation = VideoOperation(source: self, request: request, epoch: epoch)
     let handle = VideoPreparation(source: self, operation: operation)
     work[request] = operation
-    publishState(.acquiring(0), epoch: operation.epoch, work: work)
+    // A local probe cannot clear an ordinary acquisition's known failure.
+    if case .unavailable = storedState, isLocalPhotosProbe(request) {} else {
+      publishState(.acquiring(0), epoch: operation.epoch, work: work)
+    }
     // Observation may synchronously invalidate this operation during publication.
     guard operation.result == nil, operation.epoch == epoch,
       work[request] === operation else { return handle }
@@ -202,6 +206,7 @@ public final class VideoSource {
   /// A known failure is visible to observers before invalidation callbacks run.
   public func invalidate(reason: VideoResourceFailure? = nil) {
     let callbacks = Array(invalidationCallbacks)
+    let hadCached = cached != nil
     epoch &+= 1
     let invalidatedEpoch = epoch
     cached = nil
@@ -209,6 +214,7 @@ public final class VideoSource {
     work.removeAll()
     publishState(reason.map(State.unavailable) ?? .idle, epoch: invalidatedEpoch, work: work)
     for operation in pending { operation.finish(.failure(VideoResourceFailure.sourceChanged)) }
+    if hadCached { withMutation(keyPath: \.preferred) {} }
     for (id, callback) in callbacks {
       guard invalidationCallbacks[id] != nil else { continue }
       callback()
@@ -260,10 +266,18 @@ public final class VideoSource {
   }
 
   fileprivate func accept(_ incoming: Loaded, for operation: VideoOperation) {
-    guard work[operation.request] === operation, operation.epoch == epoch,
-      isCurrent(epoch: epoch, fact: incoming.fact),
-      Self.backingAvailable(incoming.representation.asset)
-    else {
+    // Authority checks may invalidate the operation. Check ownership again after
+    // reading authority, both before committing facts and after notification.
+    func current(_ value: Loaded) -> Bool {
+      guard operation.result == nil, work[operation.request] === operation,
+        operation.epoch == epoch,
+        isCurrent(epoch: operation.epoch, fact: value.fact),
+        Self.backingAvailable(value.representation.asset)
+      else { return false }
+      return operation.result == nil && work[operation.request] === operation
+        && operation.epoch == epoch
+    }
+    guard current(incoming) else {
       operation.finish(.failure(VideoResourceFailure.sourceChanged))
       return
     }
@@ -282,12 +296,28 @@ public final class VideoSource {
         id: cached.id, representation: incoming.representation, evidence: incoming.evidence,
         fact: incoming.fact)
     }
+    let updatesPreferred: Bool
     if let existing = cached, preferred != nil {
-      if (existing.evidence.quality != .highest && accepted.evidence.quality == .highest)
+      updatesPreferred = (existing.evidence.quality != .highest && accepted.evidence.quality == .highest)
         || (accepted.evidence.satisfies(existing.evidence)
-          && !existing.evidence.satisfies(accepted.evidence)) { cached = accepted }
+          && !existing.evidence.satisfies(accepted.evidence))
     } else {
+      updatesPreferred = true
+    }
+    guard current(accepted) else {
+      operation.finish(.failure(VideoResourceFailure.sourceChanged))
+      return
+    }
+    if updatesPreferred {
+      let changed = cached?.id != accepted.id || cached?.evidence != accepted.evidence
       cached = accepted
+      // Facts commit first. Observers may invalidate or prepare synchronously;
+      // this notification must never write old facts after their callback.
+      if changed { withMutation(keyPath: \.preferred) {} }
+    }
+    guard current(accepted) else {
+      operation.finish(.failure(VideoResourceFailure.sourceChanged))
+      return
     }
     operation.finish(.success(receipt(accepted)))
   }
@@ -297,17 +327,32 @@ public final class VideoSource {
     work.removeValue(forKey: operation.request)
     let retiredEpoch = epoch
     let remainingWork = work
+    let failure: VideoResourceFailure?
+    if case .failure(let error) = result, !(error is CancellationError) {
+      failure = Self.failure(error)
+    } else { failure = nil }
+    let localProbe = isLocalPhotosProbe(operation.request)
+    let quietProbeFailure = localProbe &&
+      (failure == .networkRequired || failure == .networkFailed || failure == .acquisitionFailed)
     let next: State
-    if !work.isEmpty { next = .acquiring(0) }
-    else if preferred != nil { next = .available }
-    else if case .failure(let error) = result, !(error is CancellationError) {
-      next = .unavailable(Self.failure(error))
-    } else { next = .idle }
+    if work.keys.contains(where: { !isLocalPhotosProbe($0) }) { next = .acquiring(0) }
+    else if preferred != nil { next = work.isEmpty ? .available : .acquiring(0) }
+    else if localProbe, quietProbeFailure || failure == nil {
+      if case .unavailable = storedState { next = storedState }
+      else { next = work.isEmpty ? .idle : .acquiring(0) }
+    } else if let failure { next = .unavailable(failure) }
+    else { next = work.isEmpty ? .idle : .acquiring(0) }
     publishState(next, epoch: retiredEpoch, work: remainingWork)
+  }
+
+  private func isLocalPhotosProbe(_ request: VideoRequest) -> Bool {
+    if case .photos = kind { return request.network == .forbidden }
+    return false
   }
 
   fileprivate func progress(_ operation: VideoOperation, value: Double) {
     guard work[operation.request] === operation else { return }
+    if case .unavailable = storedState, isLocalPhotosProbe(operation.request) { return }
     publishState(.acquiring(value.isFinite ? min(1, max(0, value)) : 0),
       epoch: operation.epoch, work: work)
   }
@@ -318,9 +363,18 @@ public final class VideoSource {
   private func publishState(
     _ next: State, epoch expectedEpoch: UInt64, work expectedWork: [VideoRequest: VideoOperation]
   ) -> Bool {
+    // Adding or removing a local Photos probe during a failure notification
+    // cannot suppress that failure. An ordinary retry still replaces it.
+    let ignoreLocalProbes: Bool
+    if case .unavailable = next, case .photos = kind { ignoreLocalProbes = true }
+    else { ignoreLocalProbes = false }
+    let expected = ignoreLocalProbes
+      ? expectedWork.filter { !isLocalPhotosProbe($0.key) } : expectedWork
     let current = {
-      self.epoch == expectedEpoch && self.work.count == expectedWork.count
-        && expectedWork.allSatisfy { self.work[$0.key] === $0.value }
+      let active = ignoreLocalProbes
+        ? self.work.filter { !self.isLocalPhotosProbe($0.key) } : self.work
+      return self.epoch == expectedEpoch && active.count == expected.count
+        && expected.allSatisfy { active[$0.key] === $0.value }
     }
     guard current() else { return false }
     let previous = storedState

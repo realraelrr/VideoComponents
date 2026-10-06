@@ -1067,6 +1067,269 @@ final class PlaybackTransportTests: XCTestCase {
     XCTAssertEqual(session.player.rate, 0)
   }
 
+  func testNativeStatusIsReadAgainAfterTheSynchronousHostEvent() async throws {
+    let observation = ControlledTimeControlStatus()
+    let session = try await makeReadyPlaybackSession(observeTimeControlStatus: observation.observe)
+    try markVideoPresented(session)
+    session.togglePlayback()
+    session.onEvent = { event in
+      if case .willPlay = event { observation.currentStatus = .waitingToPlayAtSpecifiedRate }
+    }
+    observation.send(.playing)
+    XCTAssertEqual(session.status, .buffering,
+      "A host event must not leave presentation using the native status read before the event")
+    XCTAssertTrue(session.isWaitingForPlayback)
+  }
+
+  func testScrubWaitingStaysQuietThroughFinalSeekAndPlaybackRecovery() async throws {
+    let transport = ControlledTransportSeek()
+    let observation = ControlledTimeControlStatus()
+    let session = try await makeReadyPlaybackSession(
+      transportSeek: transport.seek, audioSeconds: 8, observeTimeControlStatus: observation.observe
+    )
+    try markVideoPresented(session)
+    session.togglePlayback()
+    observation.send(.playing)
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertTrue(session.isWaitingForPlayback, "Independent buffering still has feedback")
+
+    session.handleScrubEditingChanged(true)
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertEqual(session.status, .none)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    session.setScrubProgress(0.6)
+    session.handleScrubEditingChanged(false)
+    observation.send(.playing) // An earlier native callback cannot settle a pending final seek.
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertEqual(session.status, .none)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    try await waitUntil { transport.finished(0) == true }
+    try transport.deliver(0)
+
+    observation.send(.paused) // Native pauses inside recovery do not cancel the user's intent.
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertFalse(session.isWaitingForPlayback, "The seek ACK does not prove playback has recovered")
+    XCTAssertTrue(session.isPlaybackRequested)
+    observation.send(.playing)
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertEqual(session.status, .buffering)
+    XCTAssertTrue(session.isWaitingForPlayback, "A later independent stall is visible again")
+  }
+
+  func testScrubRecoveryKeepsFirstPictureAndHostPreparationWaitingVisible() async throws {
+    for previouslyPresented in [false, true] {
+      let transport = ControlledTransportSeek()
+      let observation = ControlledTimeControlStatus()
+      let preparation = ControlledPlaybackPreparation()
+      let session = try await makeReadyPlaybackSession(
+        transportSeek: transport.seek, preparation: preparation.hook, audioSeconds: 8,
+        observeTimeControlStatus: observation.observe
+      )
+      preparation.observe(session)
+      defer { session.cleanup(); preparation.resumeAll() }
+      if previouslyPresented { try markVideoPresented(session) }
+      session.togglePlayback()
+      try await waitUntil { preparation.preparedOwners.count == 1 }
+      let owner = preparation.preparedOwners[0]
+      session.handleScrubEditingChanged(true)
+      session.setScrubProgress(0.4)
+      session.handleScrubEditingChanged(false)
+      observation.send(.waitingToPlayAtSpecifiedRate)
+      XCTAssertTrue(session.isWaitingForPlayback, "Seek feedback cannot hide unfinished host preparation")
+      try await waitUntil { transport.finished(0) == true }
+      try transport.deliver(0)
+      try await finishPreparation(preparation, owner: owner)
+      observation.send(.waitingToPlayAtSpecifiedRate)
+      XCTAssertEqual(session.isWaitingForPlayback, !previouslyPresented,
+        "A first native picture must still be awaited after item/audio/seek readiness")
+    }
+  }
+
+  func testPausingScrubRecoveryDoesNotSilenceTheNextPlaybackRequest() async throws {
+    let transport = ControlledTransportSeek()
+    let observation = ControlledTimeControlStatus()
+    let session = try await makeReadyPlaybackSession(
+      transportSeek: transport.seek, audioSeconds: 8, observeTimeControlStatus: observation.observe
+    )
+    try markVideoPresented(session)
+    session.togglePlayback()
+    session.handleScrubEditingChanged(true)
+    session.setScrubProgress(0.4)
+    session.handleScrubEditingChanged(false)
+    try await waitUntil { transport.finished(0) == true }
+    try transport.deliver(0)
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    session.pausePlayback()
+    XCTAssertFalse(session.isWaitingForPlayback)
+    session.togglePlayback()
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertTrue(session.isWaitingForPlayback, "An explicit later Play is independent of the cancelled scrub")
+  }
+
+  func testNewScrubAndHoldRejectOldSeekAcknowledgementAndEarlyPlaying() async throws {
+    let transport = ControlledTransportSeek()
+    let observation = ControlledTimeControlStatus()
+    let session = try await makeReadyPlaybackSession(
+      transportSeek: transport.seek, audioSeconds: 8, observeTimeControlStatus: observation.observe
+    )
+    try markVideoPresented(session)
+    session.togglePlayback()
+    session.handleScrubEditingChanged(true)
+    session.setScrubProgress(0.3)
+    session.handleScrubEditingChanged(false)
+    try await waitUntil { transport.finished(0) == true }
+    session.handleScrubEditingChanged(true)
+    session.setScrubProgress(0.7)
+    session.handleScrubEditingChanged(false)
+    session.handleHoldGestureStateChanged(.began, allowsHoldBoost: true)
+    try await waitUntil { transport.finished(1) == true }
+    try transport.deliver(0)
+    observation.send(.playing)
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    XCTAssertEqual(session.displayedProgress, 0.7, accuracy: 0.001)
+    try transport.deliver(1)
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    XCTAssertEqual(session.player.rate, 2, accuracy: 0.01)
+    observation.send(.playing)
+    session.cancelHold()
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertTrue(session.isWaitingForPlayback)
+  }
+
+  func testFailedFinalScrubSeekDoesNotSilenceLaterPlayback() async throws {
+    let transport = ControlledTransportSeek()
+    let observation = ControlledTimeControlStatus()
+    let session = try await makeReadyPlaybackSession(
+      transportSeek: transport.seek, audioSeconds: 8, observeTimeControlStatus: observation.observe
+    )
+    try markVideoPresented(session)
+    session.togglePlayback()
+    session.handleScrubEditingChanged(true)
+    session.setScrubProgress(0.4)
+    session.handleScrubEditingChanged(false)
+    try await waitUntil { transport.finished(0) == true }
+    transport.requests[0].completion(false)
+    XCTAssertFalse(session.isPlaybackRequested)
+    try transport.deliver(0) // A superseded success cannot restore the cancelled demand or quiet marker.
+    session.togglePlayback()
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertTrue(session.isWaitingForPlayback)
+  }
+
+  func testSourceSwitchRejectsOldScrubObservationAndAcknowledgement() async throws {
+    let transport = ControlledTransportSeek()
+    let observation = ControlledTimeControlStatus()
+    let session = try await makeReadyPlaybackSession(
+      transportSeek: transport.seek, audioSeconds: 8, observeTimeControlStatus: observation.observe
+    )
+    try markVideoPresented(session)
+    let asset = try XCTUnwrap(session.player.currentItem?.asset)
+    let oldObservation = try XCTUnwrap(observation.callbacks.first)
+    session.togglePlayback()
+    session.handleScrubEditingChanged(true)
+    session.setScrubProgress(0.4)
+    session.handleScrubEditingChanged(false)
+    try await waitUntil { transport.finished(0) == true }
+    session.load(source: PlaybackSource(identity: "next-source", load: { PlaybackLoadedMedia(asset: asset) }),
+      playbackRate: 1, isLooping: false, autoplayWhenReady: true)
+    try await waitUntil { session.isPlayerReady && observation.callbacks.count == 2 }
+    try transport.deliver(0)
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertFalse(session.hasPresentedVideo)
+    XCTAssertTrue(session.isWaitingForPlayback)
+    try markVideoPresented(session)
+    observation.send(.playing)
+    oldObservation { .waitingToPlayAtSpecifiedRate }
+    XCTAssertEqual(session.status, .none, "Old native observations must still obey the loading generation")
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertTrue(session.isWaitingForPlayback)
+  }
+
+  func testLoopRestartDoesNotInheritScrubRecoveryFeedback() async throws {
+    let transport = ControlledTransportSeek()
+    let observation = ControlledTimeControlStatus()
+    let session = try await makeReadyPlaybackSession(
+      transportSeek: transport.seek, audioSeconds: 8, observeTimeControlStatus: observation.observe
+    )
+    try markVideoPresented(session)
+    session.togglePlayback()
+    session.handleScrubEditingChanged(true)
+    session.setScrubProgress(0.4)
+    session.handleScrubEditingChanged(false)
+    try await waitUntil { transport.finished(0) == true }
+    try transport.deliver(0)
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    session.updateLooping(true)
+    let item = try XCTUnwrap(session.player.currentItem)
+    session.player.pause()
+    try await seekPlayerToEnd(session)
+    NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+    try await waitUntil { transport.finished(1) == true }
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertTrue(session.isWaitingForPlayback, "A loop restart is not the user's scrub operation")
+    try transport.deliver(1)
+  }
+
+  func testRepresentationReplacementDoesNotInheritScrubRecoveryFeedback() async throws {
+    let transport = ControlledTransportSeek()
+    let observation = ControlledTimeControlStatus()
+    let session = try await makeReadyPlaybackSession(
+      transportSeek: transport.seek, audioSeconds: 8, observeTimeControlStatus: observation.observe
+    )
+    try markVideoPresented(session)
+    let media = try XCTUnwrap(session.currentLoadedMedia)
+    let identity = try XCTUnwrap(session.currentSourceIdentity)
+    session.togglePlayback()
+    session.handleScrubEditingChanged(true)
+    session.setScrubProgress(0.4)
+    session.handleScrubEditingChanged(false)
+    try await waitUntil { transport.finished(0) == true }
+    try transport.deliver(0)
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    let replacement = Task { try await session.replaceAsset(media, for: identity) }
+    defer { replacement.cancel() }
+    try await waitUntil { session.isPlayerReady && observation.callbacks.count == 2 && transport.finished(1) == true }
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertTrue(session.isWaitingForPlayback, "Restoring a replacement has its own buffering feedback")
+    try transport.deliver(1)
+    try await replacement.value
+  }
+
+  func testAccessRestorationDoesNotInheritScrubRecoveryFeedback() async throws {
+    let transport = ControlledTransportSeek()
+    let observation = ControlledTimeControlStatus()
+    let session = try await makeReadyPlaybackSession(
+      transportSeek: transport.seek, audioSeconds: 8, observeTimeControlStatus: observation.observe
+    )
+    try markVideoPresented(session)
+    let media = try XCTUnwrap(session.currentLoadedMedia)
+    let identity = try XCTUnwrap(session.currentSourceIdentity)
+    session.togglePlayback()
+    session.handleScrubEditingChanged(true)
+    session.setScrubProgress(0.4)
+    session.handleScrubEditingChanged(false)
+    try await waitUntil { transport.finished(0) == true }
+    try transport.deliver(0)
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertFalse(session.isWaitingForPlayback)
+    let source = PlaybackSource(identity: identity, load: { media })
+    session.revalidateAccess(source: source, refreshID: 1) { .validate { media } }
+    try await waitUntil { session.isPlayerReady && observation.callbacks.count == 2 && transport.finished(1) == true }
+    observation.send(.waitingToPlayAtSpecifiedRate)
+    XCTAssertTrue(session.isWaitingForPlayback, "Access restoration cannot adopt a completed scrub's quiet feedback")
+    try transport.deliver(1)
+  }
+
+  private func markVideoPresented(_ session: PlaybackSession) throws {
+    let identity = try XCTUnwrap(session.currentSourceIdentity)
+    session.didPresentVideo(for: identity, sourcePresentationID: session.sourcePresentationID)
+  }
+
   func testVideoSeekUsesFiniteToleranceOnlyWhileScrubbing() {
     let interactiveTolerance = VideoSeekPrecision.interactive.tolerance.seconds
 
@@ -1241,10 +1504,11 @@ final class PlaybackTransportTests: XCTestCase {
   private func makeReadyPlaybackSession(
     transportSeek: @escaping PlaybackSession.TransportSeek = PlaybackSession.seekTransport,
     preparation: PlaybackPreparation? = nil,
-    audioSeconds: Double = 1
+    audioSeconds: Double = 1,
+    observeTimeControlStatus: @escaping PlaybackSession.ObserveTimeControlStatus = PlaybackSession.observeTimeControlStatus
   ) async throws -> PlaybackSession {
     let url = try temporaryPlayableAudioURL(seconds: audioSeconds)
-    let session = PlaybackSession(transportSeek: transportSeek)
+    let session = PlaybackSession(transportSeek: transportSeek, observeTimeControlStatus: observeTimeControlStatus)
     session.preparation = preparation
     addTeardownBlock { @MainActor in session.cleanup() }
     session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: AVURLAsset(url: url)) }),
@@ -1361,5 +1625,25 @@ private final class ControlledTransportSeek {
     let request = try XCTUnwrap(requests.indices.contains(index) ? requests[index] : nil)
     let finished = try XCTUnwrap(request.finished)
     request.completion(finished)
+  }
+}
+
+/// Controls delivery through the production observation callback without faking an AVPlayer or a seek.
+@MainActor
+private final class ControlledTimeControlStatus {
+  private(set) var callbacks: [@MainActor (@MainActor () -> AVPlayer.TimeControlStatus) -> Void] = []
+  var currentStatus: AVPlayer.TimeControlStatus = .paused
+
+  func observe(
+    player: AVPlayer, onChange: @escaping @MainActor (@MainActor () -> AVPlayer.TimeControlStatus) -> Void
+  ) -> NSKeyValueObservation? {
+    callbacks.append(onChange)
+    return nil
+  }
+
+  func send(_ status: AVPlayer.TimeControlStatus) {
+    guard let callback = callbacks.last else { return XCTFail("No current native status observation") }
+    currentStatus = status
+    callback { self.currentStatus }
   }
 }

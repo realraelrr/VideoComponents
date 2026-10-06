@@ -752,3 +752,436 @@ private final class FiniteLoaderProbe {
     }
   }
 }
+
+extension FiniteOperationTests {
+  func testPreferredOnlyObservationTracksAcceptanceUpgradeAndInvalidation() async throws {
+    let probe = FiniteLoaderProbe()
+    defer { probe.finishOutstanding() }
+    let source = probe.makeResources().photosSource(serializedCloudIdentifier: "preferred-events")
+    let changes = PreparedPreferredEvents()
+    preparedWatchPreferred(source) { changes.count += 1 }
+    let first = source.prepare()
+    await fulfillment(of: [probe.started(0)], timeout: 1)
+    probe.finish(0, with: .success(VideoRepresentation(asset: AVMutableComposition())))
+    let initial = try await first.value()
+    XCTAssertEqual(changes.count, 1)
+
+    preparedWatchPreferred(source) { changes.count += 1 }
+    let high = source.prepare(.init(quality: .highest, network: .forbidden))
+    await fulfillment(of: [probe.started(1)], timeout: 1)
+    probe.finish(1, with: .success(VideoRepresentation(asset: AVMutableComposition())))
+    let upgraded = try await high.value()
+    XCTAssertNotEqual(initial.representationID, upgraded.representationID)
+    XCTAssertEqual(changes.count, 2)
+
+    preparedWatchPreferred(source) { changes.count += 1 }
+    source.invalidate()
+    XCTAssertNil(source.preferred)
+    XCTAssertEqual(changes.count, 3)
+  }
+
+  func testPreferredAcceptanceNotifiesWhilePeerKeepsStateAcquiring() async throws {
+    let probe = FiniteLoaderProbe()
+    defer { probe.finishOutstanding() }
+    let source = probe.makeResources().photosSource(serializedCloudIdentifier: "preferred-pending-peer")
+    let automatic = source.prepare()
+    let high = source.prepare(.init(quality: .highest, network: .forbidden))
+    defer { high.cancel() }
+    await fulfillment(of: [probe.started(0), probe.started(1)], timeout: 1)
+    let changes = PreparedPreferredEvents()
+    let previousState = source.state
+    preparedWatchPreferred(source) { changes.count += 1 }
+    probe.finish(0, with: .success(VideoRepresentation(asset: AVMutableComposition())))
+    _ = try await automatic.value()
+    XCTAssertEqual(previousState, .acquiring(0))
+    XCTAssertEqual(source.state, previousState)
+    XCTAssertEqual(changes.count, 1, "Receipt publication must not depend on terminal state publication")
+  }
+
+  func testSameActualAssetEvidenceUpgradeNotifiesButCacheHitDoesNot() async throws {
+    let probe = FiniteLoaderProbe()
+    defer { probe.finishOutstanding() }
+    let source = probe.makeResources().photosSource(serializedCloudIdentifier: "preferred-evidence")
+    let asset = AVMutableComposition()
+    let first = source.prepare()
+    await fulfillment(of: [probe.started(0)], timeout: 1)
+    probe.finish(0, with: .success(VideoRepresentation(asset: asset)))
+    let original = try await first.value()
+    let changes = PreparedPreferredEvents()
+    preparedWatchPreferred(source) { changes.count += 1 }
+    let request = VideoRequest(quality: .highest, network: .forbidden)
+    let high = source.prepare(request)
+    await fulfillment(of: [probe.started(1)], timeout: 1)
+    probe.finish(1, with: .success(VideoRepresentation(asset: asset)))
+    let upgraded = try await high.value()
+    XCTAssertEqual(upgraded.representationID, original.representationID)
+    XCTAssertEqual(source.preferred?.evidence, request)
+    XCTAssertEqual(changes.count, 1)
+
+    preparedWatchPreferred(source) { changes.count += 1 }
+    let repeated = try await source.prepare(request).value()
+    XCTAssertEqual(repeated.representationID, original.representationID)
+    XCTAssertEqual(probe.invocations.count, 2)
+    XCTAssertEqual(changes.count, 1, "An unchanged receipt cannot create a refresh loop")
+  }
+
+  func testPreferredAcceptanceCallbackInvalidationCannotReturnOrRecacheOldReceipt() async {
+    let probe = FiniteLoaderProbe()
+    defer { probe.finishOutstanding() }
+    let source = probe.makeResources().photosSource(serializedCloudIdentifier: "preferred-invalidated-on-accept")
+    let handle = source.prepare()
+    await fulfillment(of: [probe.started(0)], timeout: 1)
+    let changes = PreparedPreferredEvents()
+    preparedWatchPreferred(source) {
+      // Observation can reenter this callback for the invalidation performed
+      // inside it. The fixture withdraws authority only once.
+      guard changes.count == 0 else { return }
+      changes.count += 1
+      source.invalidate()
+    }
+    probe.finish(0, with: .success(VideoRepresentation(asset: AVMutableComposition())))
+    assertSourceChanged(await result { try await handle.value() })
+    XCTAssertEqual(changes.count, 1)
+    XCTAssertNil(source.preferred)
+    XCTAssertEqual(source.state, .idle)
+  }
+
+  func testPreferredInvalidationCallbackFreshPreparationSurvivesOldPendingBatch() async throws {
+    let probe = FiniteLoaderProbe()
+    defer { probe.finishOutstanding() }
+    let source = probe.makeResources().photosSource(serializedCloudIdentifier: "preferred-restart-on-invalidate")
+    let initial = source.prepare()
+    await fulfillment(of: [probe.started(0)], timeout: 1)
+    probe.finish(0, with: .success(VideoRepresentation(asset: AVMutableComposition())))
+    _ = try await initial.value()
+    let oldHigh = source.prepare(.init(quality: .highest, network: .forbidden))
+    await fulfillment(of: [probe.started(1)], timeout: 1)
+    let events = PreparedPreferredEvents()
+    preparedWatchPreferred(source) { events.fresh = source.prepare() }
+    source.invalidate()
+    assertSourceChanged(await result { try await oldHigh.value() })
+    let fresh = try XCTUnwrap(events.fresh)
+    await fulfillment(of: [probe.started(2)], timeout: 1)
+    let currentAsset = AVMutableComposition()
+    probe.finish(2, with: .success(VideoRepresentation(asset: currentAsset)))
+    let current = try await fresh.value()
+    XCTAssertTrue(current.asset === currentAsset)
+    XCTAssertTrue(current.isCurrent)
+    XCTAssertEqual(source.preferred?.representationID, current.representationID)
+  }
+
+  func testPreferredAcceptanceCallbackLastShareCancellationKeepsTerminalCancellation() async {
+    let probe = FiniteLoaderProbe()
+    defer { probe.finishOutstanding() }
+    let source = probe.makeResources().photosSource(serializedCloudIdentifier: "preferred-cancel-on-accept")
+    let handle = source.prepare()
+    await fulfillment(of: [probe.started(0)], timeout: 1)
+    let events = PreparedPreferredEvents()
+    preparedWatchPreferred(source) {
+      events.count += 1
+      handle.cancel()
+    }
+    probe.finish(0, with: .success(VideoRepresentation(asset: AVMutableComposition())))
+    assertCancelled(await result { try await handle.value() })
+    XCTAssertEqual(events.count, 1)
+  }
+
+  func testFailedHighQualityAndWeakerSuccessDoNotRepublishPreferred() async throws {
+    let probe = FiniteLoaderProbe()
+    defer { probe.finishOutstanding() }
+    let source = probe.makeResources().photosSource(serializedCloudIdentifier: "preferred-retained")
+    let weaker = source.prepare()
+    let highestRequest = VideoRequest(quality: .highest, network: .allowed)
+    let highest = source.prepare(highestRequest)
+    await fulfillment(of: [probe.started(0), probe.started(1)], timeout: 1)
+    probe.finish(1, with: .success(VideoRepresentation(asset: AVMutableComposition())))
+    let best = try await highest.value()
+    let events = PreparedPreferredEvents()
+    preparedWatchPreferred(source) { events.count += 1 }
+    probe.finish(0, with: .success(VideoRepresentation(asset: AVMutableComposition())))
+    _ = try await weaker.value()
+    XCTAssertEqual(source.preferred?.representationID, best.representationID)
+    XCTAssertEqual(events.count, 0)
+
+    let forbidden = source.prepare(.init(quality: .highest, network: .forbidden))
+    await fulfillment(of: [probe.started(2)], timeout: 1)
+    probe.finish(2, with: .failure(VideoResourceFailure.networkRequired))
+    switch await result({ try await forbidden.value() }) {
+    case .success: XCTFail("The failed probe retains its own failure")
+    case .failure(let error): XCTAssertEqual(error as? VideoResourceFailure, .networkRequired)
+    }
+    XCTAssertEqual(source.preferred?.representationID, best.representationID)
+    XCTAssertEqual(source.state, .available)
+    XCTAssertEqual(events.count, 0)
+  }
+}
+
+@MainActor
+private final class PreparedPreferredEvents {
+  var count = 0
+  var fresh: VideoPreparation?
+}
+
+@MainActor
+private func preparedWatchPreferred(_ source: VideoSource, change: @escaping @MainActor () -> Void) {
+  withObservationTracking { _ = source.preferred } onChange: {
+    MainActor.assumeIsolated { change() }
+  }
+}
+
+extension FiniteOperationTests {
+  func testColdPhotosForbiddenProbeFailureKeepsOwnErrorWithoutGlobalUnavailable() async {
+    for quality in [VideoRequest.Quality.automatic, .highest] {
+      for failure in [VideoResourceFailure.networkRequired, .networkFailed, .acquisitionFailed] {
+        let probe = FiniteLoaderProbe()
+        defer { probe.finishOutstanding() }
+        let source = probe.makeResources().photosSource(serializedCloudIdentifier: "cold-local-probe")
+        let request = VideoRequest(quality: quality, network: .forbidden)
+        let handle = source.prepare(request)
+        await fulfillment(of: [probe.started(0)], timeout: 1)
+        probe.finish(0, with: .failure(failure))
+        switch await result({ try await handle.value() }) {
+        case .success: XCTFail("A failed probe must keep its finite failure")
+        case .failure(let error): XCTAssertEqual(error as? VideoResourceFailure, failure)
+        }
+        XCTAssertNil(source.preferred)
+        XCTAssertEqual(source.state, .idle)
+        XCTAssertEqual(probe.invocations.map(\.request), [request], "No automatic retry")
+      }
+    }
+  }
+
+  func testPhotosForbiddenProbeDoesNotSuppressAuthorityOrFileFailures() async {
+    for failure in [VideoResourceFailure.photosAccessRequired, .sourceUnavailable, .sourceChanged,
+      .fileUnavailable, .fileChanged]
+    {
+      let probe = FiniteLoaderProbe()
+      defer { probe.finishOutstanding() }
+      let source = probe.makeResources().photosSource(serializedCloudIdentifier: "probe-authority-failure")
+      let handle = source.prepare(.init(quality: .automatic, network: .forbidden))
+      await fulfillment(of: [probe.started(0)], timeout: 1)
+      probe.finish(0, with: .failure(failure))
+      switch await result({ try await handle.value() }) {
+      case .success: XCTFail("The failure must not be replaced with success")
+      case .failure(let error): XCTAssertEqual(error as? VideoResourceFailure, failure)
+      }
+      XCTAssertEqual(source.state, .unavailable(failure))
+    }
+  }
+
+  func testAllowedPhotosFailuresKeepExistingGlobalUnavailableProjection() async {
+    for quality in [VideoRequest.Quality.automatic, .highest] {
+      for failure in [VideoResourceFailure.networkRequired, .networkFailed, .acquisitionFailed] {
+        let probe = FiniteLoaderProbe()
+        defer { probe.finishOutstanding() }
+        let source = probe.makeResources().photosSource(serializedCloudIdentifier: "allowed-failure")
+        let handle = source.prepare(.init(quality: quality, network: .allowed))
+        await fulfillment(of: [probe.started(0)], timeout: 1)
+        probe.finish(0, with: .failure(failure))
+        switch await result({ try await handle.value() }) {
+        case .success: XCTFail("The allowed acquisition remains failed")
+        case .failure(let error): XCTAssertEqual(error as? VideoResourceFailure, failure)
+        }
+        XCTAssertEqual(source.state, .unavailable(failure))
+      }
+    }
+  }
+
+  func testFileAcquisitionFailuresAreNotPhotosProbeFailures() async {
+    for failure in [VideoResourceFailure.fileUnavailable, .fileChanged, .networkRequired,
+      .networkFailed, .acquisitionFailed]
+    {
+      let resources = VideoResources(verifiedFile: { _ in throw failure })
+      let source = resources.fileSource(identity: "local-file-failure")
+      let handle = source.prepare()
+      switch await result({ try await handle.value() }) {
+      case .success: XCTFail("A file verification failure remains failed")
+      case .failure(let error): XCTAssertEqual(error as? VideoResourceFailure, failure)
+      }
+      XCTAssertEqual(source.state, .unavailable(failure))
+    }
+  }
+}
+
+
+extension FiniteOperationTests {
+  func testAuthorityChangesDuringPreferredComparisonCannotPublishOldCandidate() async throws {
+    let probe = FiniteLoaderProbe()
+    defer { probe.finishOutstanding() }
+    let facts = PreparedPreferredAuthorityChange()
+    let source = probe.makeResources(authority: { _ in
+      if facts.armed {
+        facts.reads += 1
+        if facts.reads == 2 {
+          facts.revision = "B"
+          facts.armed = false
+        }
+      }
+      return facts.revision
+    }).photosSource(serializedCloudIdentifier: "preferred-comparison-authority")
+    let initial = source.prepare()
+    await fulfillment(of: [probe.started(0)], timeout: 1)
+    probe.finish(0, with: .success(VideoRepresentation(asset: AVMutableComposition())))
+    _ = try await initial.value()
+    let high = source.prepare(.init(quality: .highest, network: .forbidden))
+    await fulfillment(of: [probe.started(1)], timeout: 1)
+    let events = PreparedPreferredEvents()
+    func watch() {
+      preparedWatchPreferred(source) {
+        events.count += 1
+        if events.fresh == nil {
+          events.fresh = source.prepare()
+          watch()
+        }
+      }
+    }
+    watch()
+    // The initial incoming receipt check still sees A. Revalidating the cached
+    // preferred candidate then sees B and synchronously invalidates the old work.
+    facts.armed = true
+    probe.finish(1, with: .success(VideoRepresentation(asset: AVMutableComposition())))
+    assertSourceChanged(await result { try await high.value() })
+    let fresh = try XCTUnwrap(events.fresh)
+    await fulfillment(of: [probe.started(2)], timeout: 1)
+    XCTAssertEqual(events.count, 1, "Only invalidation is published before fresh acceptance")
+    XCTAssertNil(source.preferred, "The A candidate cannot reappear in epoch B")
+    let currentAsset = AVMutableComposition()
+    probe.finish(2, with: .success(VideoRepresentation(asset: currentAsset)))
+    let current = try await fresh.value()
+    XCTAssertTrue(current.isCurrent)
+    XCTAssertTrue(source.preferred?.asset === currentAsset)
+    XCTAssertEqual(events.count, 2)
+  }
+}
+
+@MainActor
+private final class PreparedPreferredAuthorityChange {
+  var revision = "A"
+  var reads = 0
+  var armed = false
+}
+
+
+extension FiniteOperationTests {
+  func testLateForbiddenProbeCannotEraseOrdinaryAcquisitionFailure() async {
+    let probe = FiniteLoaderProbe()
+    defer { probe.finishOutstanding() }
+    let source = probe.makeResources().photosSource(serializedCloudIdentifier: "ordinary-then-probe")
+    let ordinary = source.prepare(.init(quality: .automatic, network: .allowed))
+    let local = source.prepare(.init(quality: .highest, network: .forbidden))
+    await fulfillment(of: [probe.started(0), probe.started(1)], timeout: 1)
+    probe.finish(0, with: .failure(VideoResourceFailure.acquisitionFailed))
+    switch await result({ try await ordinary.value() }) {
+    case .success: XCTFail("The ordinary acquisition must fail")
+    case .failure(let error): XCTAssertEqual(error as? VideoResourceFailure, .acquisitionFailed)
+    }
+    XCTAssertEqual(source.state, .unavailable(.acquisitionFailed))
+    probe.finish(1, with: .failure(VideoResourceFailure.networkRequired))
+    switch await result({ try await local.value() }) {
+    case .success: XCTFail("The local probe must keep its own failure")
+    case .failure(let error): XCTAssertEqual(error as? VideoResourceFailure, .networkRequired)
+    }
+    XCTAssertEqual(source.state, .unavailable(.acquisitionFailed))
+    XCTAssertNil(source.preferred)
+    XCTAssertEqual(probe.invocations.count, 2)
+  }
+}
+
+
+extension FiniteOperationTests {
+  func testProbeDuringOrdinaryFailurePublicationCannotSuppressFailureButRetryCan() async {
+    for network in [VideoRequest.Network.forbidden, .allowed] {
+      let probe = FiniteLoaderProbe()
+      defer { probe.finishOutstanding() }
+      let source = probe.makeResources().photosSource(serializedCloudIdentifier: "failure-publication")
+      let ordinary = source.prepare()
+      await fulfillment(of: [probe.started(0)], timeout: 1)
+      let events = PreparedPreferredEvents()
+      withObservationTracking { _ = source.state } onChange: {
+        MainActor.assumeIsolated {
+          guard events.fresh == nil else { return }
+          events.fresh = source.prepare(.init(quality: .highest, network: network))
+        }
+      }
+      probe.finish(0, with: .failure(VideoResourceFailure.acquisitionFailed))
+      _ = await result { try await ordinary.value() }
+      let fresh = try? XCTUnwrap(events.fresh)
+      guard let fresh else { continue }
+      await fulfillment(of: [probe.started(1)], timeout: 1)
+      XCTAssertEqual(source.state, network == .forbidden ? .unavailable(.acquisitionFailed) : .acquiring(0))
+      probe.finish(1, with: .failure(VideoResourceFailure.networkRequired))
+      _ = await result { try await fresh.value() }
+      XCTAssertEqual(source.state, .unavailable(network == .forbidden ? .acquisitionFailed : .networkRequired))
+    }
+  }
+}
+
+
+extension FiniteOperationTests {
+  func testLocalProbeProgressAndQuietCompletionPreserveOrdinaryFailure() async throws {
+    for alreadyPending in [false, true] {
+      for ordinaryFailure in [VideoResourceFailure.networkRequired, .networkFailed, .acquisitionFailed,
+        .photosAccessRequired, .sourceUnavailable, .sourceChanged, .fileUnavailable, .fileChanged]
+      {
+        for probeFailure in [VideoResourceFailure.networkRequired, .networkFailed, .acquisitionFailed, nil] {
+          let probe = FiniteLoaderProbe()
+          defer { probe.finishOutstanding() }
+          let source = probe.makeResources().photosSource(serializedCloudIdentifier: "probe-preserves-error")
+          let ordinary = source.prepare()
+          var local: VideoPreparation?
+          if alreadyPending { local = source.prepare(.init(quality: .highest, network: .forbidden)) }
+          await fulfillment(of: [probe.started(0)], timeout: 1)
+          probe.finish(0, with: .failure(ordinaryFailure))
+          _ = await result { try await ordinary.value() }
+          XCTAssertEqual(source.state, .unavailable(ordinaryFailure))
+          if local == nil { local = source.prepare(.init(quality: .highest, network: .forbidden)) }
+          let handle = try XCTUnwrap(local)
+          await fulfillment(of: [probe.started(1)], timeout: 1)
+          XCTAssertEqual(source.state, .unavailable(ordinaryFailure))
+          let progress = expectation(description: "Local probe publishes its own progress")
+          withObservationTracking { _ = handle.progress } onChange: { progress.fulfill() }
+          probe.invocations[1].progress(0.4)
+          await fulfillment(of: [progress], timeout: 1)
+          XCTAssertEqual(handle.progress, 0.4)
+          XCTAssertEqual(source.state, .unavailable(ordinaryFailure))
+          probe.finish(1, with: .failure(probeFailure.map { $0 as Error } ?? CancellationError()))
+          switch await result({ try await handle.value() }) {
+          case .success: XCTFail("The local probe must retain its failure")
+          case .failure(let error):
+            if let probeFailure { XCTAssertEqual(error as? VideoResourceFailure, probeFailure) }
+            else { XCTAssertTrue(error is CancellationError) }
+          }
+          XCTAssertEqual(source.state, .unavailable(ordinaryFailure))
+          XCTAssertEqual(probe.invocations.count, 2)
+          let retry = source.prepare()
+          await fulfillment(of: [probe.started(2)], timeout: 1)
+          XCTAssertEqual(source.state, .acquiring(0), "An explicit ordinary retry resets the failure")
+          probe.finish(2, with: .success(VideoRepresentation(asset: AVMutableComposition())))
+          _ = try await retry.value()
+          XCTAssertEqual(source.state, .available)
+          XCTAssertEqual(probe.invocations.count, 3)
+        }
+      }
+    }
+  }
+
+  func testLocalProbeSuccessRestoresAvailabilityAfterOrdinaryFailure() async throws {
+    let probe = FiniteLoaderProbe()
+    defer { probe.finishOutstanding() }
+    let source = probe.makeResources().photosSource(serializedCloudIdentifier: "probe-recovers")
+    let ordinary = source.prepare()
+    await fulfillment(of: [probe.started(0)], timeout: 1)
+    probe.finish(0, with: .failure(VideoResourceFailure.networkFailed))
+    _ = await result { try await ordinary.value() }
+    let local = source.prepare(.init(quality: .automatic, network: .forbidden))
+    await fulfillment(of: [probe.started(1)], timeout: 1)
+    XCTAssertEqual(source.state, .unavailable(.networkFailed))
+    let asset = AVMutableComposition()
+    probe.finish(1, with: .success(VideoRepresentation(asset: asset)))
+    let receipt = try await local.value()
+    XCTAssertTrue(receipt.isCurrent)
+    XCTAssertTrue(source.preferred?.asset === asset)
+    XCTAssertEqual(source.state, .available)
+    XCTAssertEqual(probe.invocations.count, 2)
+  }
+}

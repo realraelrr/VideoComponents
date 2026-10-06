@@ -5,6 +5,9 @@ import UIKit
 
 @MainActor public final class PlaybackSession: ObservableObject {
   typealias TransportSeek = @MainActor (AVPlayer, CMTime, @escaping @MainActor (Bool) -> Void) -> Void
+  typealias ObserveTimeControlStatus = @MainActor (
+    AVPlayer, @escaping @MainActor (@MainActor () -> AVPlayer.TimeControlStatus) -> Void
+  ) -> NSKeyValueObservation?
   typealias SlowStatusDelay = @MainActor (UInt64) async throws -> Void
   typealias PrepareReplacement = @MainActor (AVAsset) async throws -> AVPlayerItem
 
@@ -54,8 +57,11 @@ import UIKit
   @Published private var wantsPlayback = false
   @Published private var playbackProgress = 0.0
   @Published private var scrubProgress = 0.0
+  // The final seek ACK precedes native playback recovery. Retain its UI cause until playback resumes.
+  @Published private var isResumingAfterScrub = false
 
   private let transportSeek: TransportSeek
+  private let observeTimeControlStatus: ObserveTimeControlStatus
   private let slowStatusDelay: SlowStatusDelay
   private let prepareReplacement: PrepareReplacement
   private var replacementGeneration = UUID()
@@ -94,9 +100,11 @@ import UIKit
     transportSeek: @escaping TransportSeek,
     slowStatusDelay: @escaping SlowStatusDelay = { try await Task.sleep(nanoseconds: $0) },
     prepareReplacement: @escaping PrepareReplacement = PlaybackSession.prepareReplacementItem,
+    observeTimeControlStatus: @escaping ObserveTimeControlStatus = PlaybackSession.observeTimeControlStatus,
     onEvent: @escaping @MainActor (PlaybackEvent) -> Void = { _ in }
   ) {
     self.transportSeek = transportSeek
+    self.observeTimeControlStatus = observeTimeControlStatus
     self.slowStatusDelay = slowStatusDelay
     self.prepareReplacement = prepareReplacement
     self.onEvent = onEvent
@@ -120,7 +128,17 @@ import UIKit
 
   public var status: PlaybackStatus {
     if case .preparation = failure { return .unavailable }
-    return playbackCoordinator.overlay
+    let overlay = playbackCoordinator.overlay
+    switch overlay {
+    case .buffering, .slowBuffering:
+      // A first picture and resource/item/audio readiness still have their own waiting feedback.
+      if playbackInteraction == .scrubbing || (hasPresentedVideo && isResumingAfterScrub) {
+        return .none
+      }
+    default:
+      break
+    }
+    return overlay
   }
 
   public var canUsePlaybackControls: Bool {
@@ -844,12 +862,12 @@ import UIKit
 
     let targetProgress = scrubProgress
     playbackProgress = targetProgress
-    playbackInteraction = .idle
     beginTransport(
       to: CMTime(
         seconds: durationSeconds * targetProgress,
         preferredTimescale: CMTimeScale(NSEC_PER_SEC)
-      )
+      ),
+      fromScrubbing: true
     )
   }
 
@@ -881,7 +899,7 @@ import UIKit
     }
   }
 
-  private func beginTransport(to target: CMTime) {
+  private func beginTransport(to target: CMTime, fromScrubbing: Bool = false) {
     guard let currentItem = player.currentItem else { return }
 
     cancelPendingTransport()
@@ -896,6 +914,8 @@ import UIKit
     )
     let token = UUID()
     pendingTransport = PendingTransport(token: token, target: boundedTarget)
+    isResumingAfterScrub = fromScrubbing && isPlaybackRequested
+    if fromScrubbing { playbackInteraction = .idle }
     player.pause()
     updateTransportPresentation(to: boundedTarget)
 
@@ -946,6 +966,7 @@ import UIKit
   }
 
   private func cancelPendingTransport() {
+    isResumingAfterScrub = false
     guard pendingTransport != nil else { return }
     pendingTransport = nil
     player.currentItem?.cancelPendingSeeks()
@@ -1066,6 +1087,7 @@ import UIKit
   }
 
   private func stopPlaybackDemand() {
+    isResumingAfterScrub = false
     let request = preparationRequest
     preparationRequest = nil
     preparationTask?.cancel()
@@ -1236,21 +1258,22 @@ import UIKit
     }
   }
 
+  static func observeTimeControlStatus(
+    player: AVPlayer,
+    onChange: @escaping @MainActor (@MainActor () -> AVPlayer.TimeControlStatus) -> Void
+  ) -> NSKeyValueObservation? {
+    player.observe(\.timeControlStatus, options: [.new]) { player, _ in
+      Task { @MainActor in onChange { player.timeControlStatus } }
+    }
+  }
+
   private func observePlayerBuffering(token: PlaybackState.GenerationToken) {
     timeControlObservation?.invalidate()
-    timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) {
-      [weak self] player, _ in
-      Task { @MainActor in
-        guard let self,
-          self.playbackCoordinator.isCurrent(token)
-        else {
-          return
-        }
-        if player.timeControlStatus == .playing {
-          self.onEvent(.willPlay)
-        }
-        self.updatePlaybackBufferingOverlay(for: player.timeControlStatus, token: token)
-      }
+    timeControlObservation = observeTimeControlStatus(player) { [weak self] currentStatus in
+      guard let self, self.playbackCoordinator.isCurrent(token) else { return }
+      if currentStatus() == .playing { self.onEvent(.willPlay) }
+      // The host event may synchronously pause or replace the source; read native facts again.
+      self.updatePlaybackBufferingOverlay(for: currentStatus(), token: token)
     }
   }
 
@@ -1272,6 +1295,9 @@ import UIKit
 
     cancelSlowStatusOverlay()
     playbackCoordinator.transition(to: .ready, token: token)
+    if status == .playing, pendingTransport == nil, playbackInteraction != .scrubbing {
+      isResumingAfterScrub = false
+    }
   }
 
   private func observePlayerTime(token: PlaybackState.GenerationToken) {
