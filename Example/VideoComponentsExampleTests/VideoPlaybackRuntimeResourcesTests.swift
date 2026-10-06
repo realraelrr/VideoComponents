@@ -3153,3 +3153,96 @@ extension VideoPlaybackMountedTests {
     return (hq, play, try XCTUnwrap(progress, "The actual progress track must be rendered"))
   }
 }
+
+
+extension VideoPlaybackMountedTests {
+  func testHighQualityStatesKeepFortyPointVisual() async throws {
+    for (typeSize, locale) in [
+      (DynamicTypeSize.large, "en"), (.accessibility3, "en"),
+      (.accessibility3, "zh-Hant"), (.accessibility3, "ja"), (.accessibility3, "ko"),
+      (.accessibility5, "zh-Hant"), (.accessibility5, "ja"), (.accessibility5, "ko")
+    ] {
+      let labels = VideoPlaybackLabels(locale: Locale(identifier: locale))
+      for (name, control) in [
+        ("available", VideoHighQualityControl.available {}),
+        ("loading", .loading(nil)), ("progress", .loading(0.42))
+      ] {
+        let host = UIHostingController(rootView: ZStack {
+          Color.white.ignoresSafeArea()
+          VideoHighQualityButton(control: control, labels: labels)
+        }.environment(\.dynamicTypeSize, typeSize))
+        let window = try mountHighQualityHost(host, size: CGSize(width: 100, height: 100))
+        defer { window.isHidden = true; window.rootViewController = nil }
+        try await Task.sleep(for: .milliseconds(100))
+        let ink = try XCTUnwrap(renderedPixels(in: host.view, matching: { $0 < 240 && $1 < 240 && $2 < 240 }))
+        XCTAssertEqual(ink.width, 40, accuracy: 1, "\(name) \(locale) \(typeSize)")
+        XCTAssertEqual(ink.height, 40, accuracy: 1, "\(name) \(locale) \(typeSize)")
+        XCTAssertEqual(ink.midX, 50, accuracy: 1)
+        XCTAssertEqual(ink.midY, 50, accuracy: 1)
+        let image = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
+          XCTAssertTrue(host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true))
+        }
+        let screenshot = XCTAttachment(image: image)
+        screenshot.name = "HQ shell \(name) \(locale) \(typeSize)"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+      }
+    }
+  }
+
+  func testFullscreenHighQualityStatesKeepTheSameTopRightFrame() async throws {
+    try await requireNativeControlAccessibilityRuntime()
+    for (width, typeSize) in [
+      (CGFloat(390), DynamicTypeSize.large), (320, .large), (320, .accessibility3)
+    ] {
+      let session = try await readySession()
+      defer { session.cleanup() }
+      session.updatePlaybackRate(1.5)
+      let labels = VideoPlaybackLabels(locale: Locale(identifier: "en"))
+      var baseline: CGRect?
+      for (name, control) in [
+        ("available", VideoHighQualityControl.available {}),
+        ("loading", .loading(nil)), ("progress", .loading(0.42))
+      ] {
+        let host = UIHostingController(rootView: FullscreenPlaybackView(
+          playbackSession: session, onClose: {}, labels: labels, highQualityControl: control,
+          trailingAccessory: {
+            Button {} label: {
+              Image(systemName: "square.and.arrow.down")
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(width: 40, height: 40)
+                .background(.black.opacity(0.62), in: Circle())
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+            }.buttonStyle(.plain).accessibilityLabel("Fixture export")
+          }, statusOverlay: { EmptyView() }
+        ).environment(\.scenePhase, .active).environment(\.dynamicTypeSize, typeSize))
+        let window = try mountHighQualityHost(host, size: CGSize(width: width, height: 700))
+        defer { window.isHidden = true; window.rootViewController = nil }
+        try await Task.sleep(for: .milliseconds(100))
+        let hq = try XCTUnwrap(highQualityButton(in: host.view, label: labels.highQualityAccessibility))
+        let accessory = try XCTUnwrap(highQualityButton(in: host.view, label: "Fixture export"))
+        let rate = try XCTUnwrap(fullscreenAccessibilityElements(in: host.view).first {
+          $0.accessibilityLabel == session.playbackRateIndicatorText
+        })
+        let bounds = UIAccessibility.convertToScreenCoordinates(host.view.bounds, in: host.view)
+        XCTAssertEqual(hq.accessibilityFrame.width, 44, accuracy: 0.5)
+        XCTAssertEqual(hq.accessibilityFrame.height, 44, accuracy: 0.5)
+        XCTAssertTrue(bounds.contains(hq.accessibilityFrame))
+        XCTAssertLessThan(hq.accessibilityFrame.maxY, bounds.minY + 100)
+        XCTAssertLessThanOrEqual(rate.accessibilityFrame.maxX, hq.accessibilityFrame.minX)
+        XCTAssertLessThanOrEqual(hq.accessibilityFrame.maxX, accessory.accessibilityFrame.minX)
+        if let baseline { XCTAssertEqual(hq.accessibilityFrame, baseline) }
+        else { baseline = hq.accessibilityFrame }
+        let image = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
+          XCTAssertTrue(host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true))
+        }
+        let screenshot = XCTAttachment(image: image)
+        screenshot.name = "HQ top right \(name) \(Int(width))pt \(typeSize)"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+      }
+    }
+  }
+}

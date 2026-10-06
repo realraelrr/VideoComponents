@@ -14,18 +14,24 @@ struct VideoHighQualityButton: View {
     Button {
       if case .available(let action) = control { action() }
     } label: {
-      Group {
-        switch control {
-        case .available:
-          Text(verbatim: labels.highQuality)
-            .font(.body.weight(.semibold))
-            .frame(minWidth: 44, minHeight: 44)
-            .background(.black.opacity(0.58), in: Circle())
-        case .loading:
-          loadingIndicator
+      ZStack {
+        Circle().fill(.black.opacity(0.58))
+        Group {
+          switch control {
+          case .available:
+            Text(verbatim: labels.highQuality)
+              .font(.caption.weight(.bold))
+              .lineLimit(1)
+              .minimumScaleFactor(0.1)
+          case .loading:
+            loadingIndicator
+          }
         }
+        .foregroundStyle(.white)
       }
-      .foregroundStyle(.white)
+      .frame(width: 40, height: 40)
+      .frame(width: 44, height: 44)
+      .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
     .disabled(isLoading)
@@ -60,10 +66,6 @@ struct VideoHighQualityButton: View {
       }
     }
     .frame(width: 32, height: 32)
-    .padding(12)
-    .background(.black.opacity(0.58), in: Circle())
-    .padding()
-    .frame(width: 44, height: 44)
     .accessibilityHidden(true)
   }
 }
