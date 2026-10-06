@@ -9,6 +9,35 @@ import XCTest
 
 @MainActor
 final class VideoResourcePlaybackTests: XCTestCase {
+  func testHostObserverIsReleasedWithOwnerAndNotInheritedByNextOwner() {
+    let native = PlaybackSession()
+    var capturedHost: NSObject? = NSObject()
+    weak var releasedHost = capturedHost
+    var oldEvents = 0
+    var owner: VideoResourcePlayback? = VideoResourcePlayback(session: native) { [capturedHost] _ in
+      XCTAssertNotNil(capturedHost)
+      oldEvents += 1
+    }
+    capturedHost = nil
+    owner?.cleanup()
+    XCTAssertEqual(oldEvents, 1)
+    XCTAssertNotNil(releasedHost)
+    owner = nil
+    XCTAssertNil(releasedHost)
+    native.cleanup()
+    XCTAssertEqual(oldEvents, 1)
+
+    var newEvents = 0
+    let replacement = VideoResourcePlayback(session: native) { _ in newEvents += 1 }
+    replacement.cleanup()
+    XCTAssertEqual(newEvents, 1)
+    replacement.cleanup()
+    XCTAssertEqual(newEvents, 2)
+    XCTAssertNil(native.currentSourceIdentity)
+    XCTAssertNil(native.player.currentItem)
+    XCTAssertEqual(oldEvents, 1)
+  }
+
   func testClosingOnlyHighQualityConsumerCancelsNativeWorkAndRejectsLateSuccess() async throws {
     let probe = BindingLoaderProbe()
     let source = probe.resources().photosSource(serializedCloudIdentifier: "sole-HQ")

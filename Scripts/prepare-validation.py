@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 
 
@@ -37,6 +38,7 @@ def copy_validation(source, isolated):
     shutil.copytree(source / "Example", isolated / "Consumer",
                     ignore=shutil.ignore_patterns("xcuserdata", ".DS_Store"))
     project = isolated / "Consumer/VideoComponentsExample.xcodeproj/project.pbxproj"
+    project.chmod(project.stat().st_mode | stat.S_IWUSR)
     project_text = project.read_text()
     references = {
         'relativePath = "..";': 'relativePath = "../VideoComponents";',

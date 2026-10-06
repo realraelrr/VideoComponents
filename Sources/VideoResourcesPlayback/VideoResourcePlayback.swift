@@ -17,6 +17,8 @@ public final class VideoResourcePlayback {
   }
 
   public let session: PlaybackSession
+  /// This owner holds the sole host observer; it is released with the owner.
+  @ObservationIgnored public var onEvent: @MainActor (PlaybackEvent) -> Void
   /// Only this owner's current initial resource operation supplies loading progress.
   public var preparationProgress: Double? {
     access(keyPath: \.preparationProgress)
@@ -111,11 +113,11 @@ public final class VideoResourcePlayback {
 
   public init(session: PlaybackSession, onEvent: @escaping @MainActor (PlaybackEvent) -> Void = { _ in }) {
     self.session = session
-    let originalEvent = session.onEvent
+    self.onEvent = onEvent
     session.onEvent = { [weak self] event in
-      if case .didCleanup = event { self?.releaseVisit() }
-      originalEvent(event)
-      onEvent(event)
+      guard let self else { return }
+      if case .didCleanup = event { self.releaseVisit() }
+      self.onEvent(event)
     }
     readinessObservation = session.$isPlayerReady.sink { [weak self] ready in
       guard ready else { return }

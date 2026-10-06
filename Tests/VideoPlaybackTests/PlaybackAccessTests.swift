@@ -4,6 +4,46 @@ import XCTest
 
 @MainActor
 final class PlaybackAccessTests: XCTestCase {
+  func testSynchronousAccessFactoryCannotResurrectOrSupersedeNewerWork() async throws {
+    for action in ["cleanup", "same-identity-reload", "newer-refresh"] {
+      let (session, source, asset) = try await readySession()
+      defer { session.cleanup() }
+      var staleValidationCalls = 0
+      var reloadedPresentation: UUID?
+      session.revalidateAccess(source: source, refreshID: 1) {
+        switch action {
+        case "cleanup":
+          session.cleanup()
+        case "same-identity-reload":
+          session.cleanup()
+          session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+          reloadedPresentation = session.sourcePresentationID
+        default:
+          session.revalidateAccess(source: source, refreshID: 2) { .unavailable(TestError.denied) }
+        }
+        return .validate {
+          staleValidationCalls += 1
+          return PlaybackLoadedMedia(asset: asset)
+        }
+      }
+      switch action {
+      case "cleanup":
+        XCTAssertNil(session.currentSourceIdentity)
+        XCTAssertNil(session.player.currentItem)
+      case "same-identity-reload":
+        XCTAssertEqual(session.sourcePresentationID, reloadedPresentation)
+      default:
+        if case .source(let error) = session.failure {
+          XCTAssertTrue(error is TestError)
+        } else {
+          XCTFail("The obsolete factory replaced the newer denial")
+        }
+      }
+      await Task.yield()
+      XCTAssertEqual(staleValidationCalls, 0)
+    }
+  }
+
   func testPlayBeforeAcquisitionCanBeCancelledAndRequestedAgain() async throws {
     let asset = try audioAsset()
     let loader = SuspendedAssetOperation()
@@ -102,27 +142,33 @@ final class PlaybackAccessTests: XCTestCase {
   }
 
   func testAutoplayRequestAtEndWhileAccessIsPendingRestartsPlayback() async throws {
-    let (session, source, asset) = try await readySession()
-    let validator = SuspendedAssetOperation()
-    defer { session.cleanup(); validator.finish(asset) }
-    try await wait { session.durationSeconds > 0 }
-    let original = try XCTUnwrap(session.player.currentItem)
-    session.handleScrubEditingChanged(true)
-    session.setScrubProgress(1)
-    session.handleScrubEditingChanged(false)
-    try await wait { abs(session.player.currentTime().seconds - session.durationSeconds) < 0.01 }
-    session.revalidateAccess(source: source, refreshID: 1) { .validate { PlaybackLoadedMedia(asset: try await validator.load()) } }
-    try await wait { validator.started }
+    for usesToggle in [false, true] {
+      let (session, source, asset) = try await readySession()
+      let validator = SuspendedAssetOperation()
+      defer { session.cleanup(); validator.finish(asset) }
+      try await wait { session.durationSeconds > 0 }
+      let original = try XCTUnwrap(session.player.currentItem)
+      session.handleScrubEditingChanged(true)
+      session.setScrubProgress(1)
+      session.handleScrubEditingChanged(false)
+      try await wait { abs(session.player.currentTime().seconds - session.durationSeconds) < 0.01 }
+      session.revalidateAccess(source: source, refreshID: 1) { .validate { PlaybackLoadedMedia(asset: try await validator.load()) } }
+      try await wait { validator.started }
 
-    session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: true)
-    validator.finish(asset)
-    try await wait {
-      session.isPlayerReady && (session.player.rate > 0 || !session.isPlaybackRequested)
+      if usesToggle {
+        session.togglePlayback()
+      } else {
+        session.load(source: source, playbackRate: 1, isLooping: false, autoplayWhenReady: true)
+      }
+      validator.finish(asset)
+      try await wait {
+        session.isPlayerReady && (session.player.rate > 0 || !session.isPlaybackRequested)
+      }
+      XCTAssertTrue(session.player.currentItem === original)
+      XCTAssertTrue(session.isPlaybackRequested)
+      XCTAssertLessThan(session.player.currentTime().seconds, 0.5)
+      XCTAssertGreaterThan(session.player.rate, 0)
     }
-    XCTAssertTrue(session.player.currentItem === original)
-    XCTAssertTrue(session.isPlaybackRequested)
-    XCTAssertLessThan(session.player.currentTime().seconds, 0.5)
-    XCTAssertGreaterThan(session.player.rate, 0)
   }
 
   func testSameSourceLoadDuringResolutionKeepsOriginalLoaderAndPlaybackIntent() async throws {

@@ -393,8 +393,12 @@ import UIKit
   ) {
     guard loadedResource == video.identity, lastAccessRefreshID != refreshID else { return }
     lastAccessRefreshID = refreshID
+    let presentationID = sourcePresentationID
+    let result = validation()
+    guard loadedResource == video.identity, sourcePresentationID == presentationID,
+      lastAccessRefreshID == refreshID else { return }
     let validator: @MainActor () async throws -> PlaybackLoadedMedia
-    switch validation() {
+    switch result {
     case .unavailable(let error):
       cancelReplacement(restoreOriginal: false)
       transitionAccessToFailure(reason: .source(error), refreshID: refreshID,
@@ -582,12 +586,7 @@ import UIKit
         wantsPlayback = true
       }
       if autoplayWhenReady, playbackProgress >= 1 {
-        if let snapshot = accessPlaybackSnapshot {
-          accessPlaybackSnapshot = AccessPlaybackSnapshot(item: snapshot.item, media: snapshot.media, time: .zero)
-          updateTransportPresentation(to: .zero)
-        } else {
-          beginTransport(to: .zero)
-        }
+        beginTransport(to: .zero)
       } else {
         reconcilePlayback()
       }
@@ -900,18 +899,23 @@ import UIKit
   }
 
   private func beginTransport(to target: CMTime, fromScrubbing: Bool = false) {
-    guard let currentItem = player.currentItem else { return }
-
-    cancelPendingTransport()
-    scrubSeekCoordinator?.reset()
-    scrubSeekCoordinator = nil
-
     let seconds = playableSeconds(from: target) ?? 0
     let boundedSeconds = durationSeconds > 0 ? min(seconds, durationSeconds) : seconds
     let boundedTarget = CMTime(
       seconds: boundedSeconds,
       preferredTimescale: CMTimeScale(NSEC_PER_SEC)
     )
+    guard let currentItem = player.currentItem else {
+      guard let snapshot = accessPlaybackSnapshot else { return }
+      accessPlaybackSnapshot = AccessPlaybackSnapshot(
+        item: snapshot.item, media: snapshot.media, time: boundedTarget)
+      updateTransportPresentation(to: boundedTarget)
+      return
+    }
+
+    cancelPendingTransport()
+    scrubSeekCoordinator?.reset()
+    scrubSeekCoordinator = nil
     let token = UUID()
     pendingTransport = PendingTransport(token: token, target: boundedTarget)
     isResumingAfterScrub = fromScrubbing && isPlaybackRequested

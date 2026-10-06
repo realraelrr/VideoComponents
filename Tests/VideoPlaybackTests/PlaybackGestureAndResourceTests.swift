@@ -5,6 +5,56 @@ import XCTest
 
 @MainActor
 final class PlaybackGestureTests: XCTestCase {
+  func testRecognizedEventsDeliverBeforeUpdateAndRemovedSurfaceRejectsCallbacks() async {
+    var firstTaps = 0
+    var updatedTaps = 0
+    var holds: [UIGestureRecognizer.State] = []
+    let coordinator = VideoGestureSurface.Coordinator(isZoomed: false, isMultiTouchGestureActive: false,
+      shouldReceivePlaybackTouch: nil, onPinchUpdate: { _ in }, onPanUpdate: { _ in },
+      onLongPressStateChanged: { holds.append($0) }, onDoubleTap: { firstTaps += 1 })
+    let view = UIView()
+    let tap = TestTap()
+    let hold = TestHold()
+    view.addGestureRecognizer(tap)
+    view.addGestureRecognizer(hold)
+    coordinator.tapRecognizer = tap
+    coordinator.longPressRecognizer = hold
+    tap.simulatedState = .ended
+    coordinator.handleDoubleTap(tap)
+    coordinator.onDoubleTap = { updatedTaps += 1 }
+    await Task.yield()
+    XCTAssertEqual(firstTaps, 1)
+    XCTAssertEqual(updatedTaps, 0)
+    coordinator.handleDoubleTap(tap)
+    XCTAssertEqual(updatedTaps, 1)
+
+    var singleTaps = 0
+    let singleTap = TestTap()
+    let foreignTap = TestTap()
+    for recognizer in [singleTap, foreignTap] {
+      recognizer.simulatedState = .ended
+      view.addGestureRecognizer(recognizer)
+    }
+    coordinator.singleTapRecognizer = singleTap
+    coordinator.onSingleTap = { singleTaps += 1 }
+    coordinator.handleSingleTap(foreignTap)
+    XCTAssertEqual(singleTaps, 0)
+    coordinator.handleSingleTap(singleTap)
+    XCTAssertEqual(singleTaps, 1)
+
+    hold.simulatedState = .began
+    coordinator.handleLongPress(hold)
+    coordinator.removeGestures()
+    XCTAssertEqual(holds, [.began, .cancelled])
+    coordinator.handleDoubleTap(tap)
+    coordinator.handleLongPress(hold)
+    coordinator.handleSingleTap(singleTap)
+    await Task.yield()
+    XCTAssertEqual(singleTaps, 1)
+    XCTAssertEqual(updatedTaps, 1)
+    XCTAssertEqual(holds, [.began, .cancelled])
+  }
+
   func testPinchImmediatelyBlocksHoldDoubleTapAndPanBeforeSwiftUIRefresh() async {
     var doubleTaps = 0
     var holds: [UIGestureRecognizer.State] = []

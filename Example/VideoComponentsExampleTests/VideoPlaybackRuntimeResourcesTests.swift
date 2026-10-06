@@ -171,13 +171,17 @@ final class VideoPlaybackMountedTests: XCTestCase {
     observer.touchesCancelled([second], with: event)
     try await Task.sleep(for: .milliseconds(3_400))
     XCTAssertFalse(isMagenta(at: probe, in: host.view))
-    let tap = MountedTap()
-    surface.addGestureRecognizer(tap)
-    coordinator.handleSingleTap(tap)
+    let tap = try XCTUnwrap(coordinator.singleTapRecognizer)
+    XCTAssertTrue(tap.view === surface)
+    // UIKit dispatches the actual mounted recognizer's target once.
+    coordinator.tapRecognizer?.setValue(UIGestureRecognizer.State.failed.rawValue, forKey: "state")
+    tap.setValue(UIGestureRecognizer.State.ended.rawValue, forKey: "state")
     try await Task.sleep(for: .milliseconds(50))
     XCTAssertTrue(isMagenta(at: probe, in: host.view))
     XCTAssertFalse(session.isPlaybackRequested, "A single tap only restores controls")
-    coordinator.handleDoubleTap(tap)
+    let doubleTap = try XCTUnwrap(coordinator.tapRecognizer)
+    XCTAssertTrue(doubleTap.view === surface)
+    doubleTap.setValue(UIGestureRecognizer.State.ended.rawValue, forKey: "state")
     try await Task.sleep(for: .milliseconds(50))
     XCTAssertTrue(session.isPlaybackRequested)
     XCTAssertTrue(isMagenta(at: probe, in: host.view))
@@ -350,10 +354,6 @@ private struct MountedZoomProbe: View {
     }
     .ignoresSafeArea()
   }
-}
-
-private final class MountedTap: UITapGestureRecognizer {
-  override var state: UIGestureRecognizer.State { get { .ended } set {} }
 }
 
 /// Uses external simctl screen captures: unit-host XCTest is not authorized to use XCUIScreen.
@@ -2532,9 +2532,11 @@ extension VideoPlaybackMountedTests {
 
     let surface = try XCTUnwrap(findGestureSurface(host.view))
     let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
-    let tap = MountedTap()
-    surface.addGestureRecognizer(tap)
-    coordinator.handleSingleTap(tap)
+    let tap = try XCTUnwrap(coordinator.singleTapRecognizer)
+    XCTAssertTrue(tap.view === surface)
+    // UIKit dispatches the actual mounted recognizer's target once.
+    coordinator.tapRecognizer?.setValue(UIGestureRecognizer.State.failed.rawValue, forKey: "state")
+    tap.setValue(UIGestureRecognizer.State.ended.rawValue, forKey: "state")
     try await Task.sleep(for: .milliseconds(50))
     XCTAssertTrue(hasHighQualityPixels(in: host.view, region: region))
     let restored = try XCTUnwrap(highQualityButton(in: host.view, label: labels.highQualityAccessibility))
@@ -2763,9 +2765,11 @@ extension VideoPlaybackMountedTests {
     XCTAssertEqual(hidden.navigation, 0)
     let surface = try XCTUnwrap(findGestureSurface(host.view))
     let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
-    let tap = MountedTap()
-    surface.addGestureRecognizer(tap)
-    coordinator.handleSingleTap(tap)
+    let tap = try XCTUnwrap(coordinator.singleTapRecognizer)
+    XCTAssertTrue(tap.view === surface)
+    // UIKit dispatches the actual mounted recognizer's target once.
+    coordinator.tapRecognizer?.setValue(UIGestureRecognizer.State.failed.rawValue, forKey: "state")
+    tap.setValue(UIGestureRecognizer.State.ended.rawValue, forKey: "state")
     try await Task.sleep(for: .milliseconds(50))
     assertRenderedFullscreenControls(in: host.view, visible: true, name: "Single tap restores paused controls")
     XCTAssertFalse(session.isPlaybackRequested)

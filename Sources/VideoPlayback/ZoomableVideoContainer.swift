@@ -430,7 +430,7 @@ struct VideoGestureSurface: UIViewRepresentable {
 
     @objc
     func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
-      guard let view = recognizer.view else { return }
+      guard recognizer === pinchRecognizer, let view = recognizer.view else { return }
       let state = recognizer.state
       if isActive(state) {
         isPinchActive = true
@@ -451,6 +451,7 @@ struct VideoGestureSurface: UIViewRepresentable {
 
     @objc
     func handlePan(_ recognizer: UIPanGestureRecognizer) {
+      guard recognizer === panRecognizer, recognizer.view != nil else { return }
       let state = recognizer.state
       if isActive(state) {
         cancelLongPressIfNeeded()
@@ -467,19 +468,20 @@ struct VideoGestureSurface: UIViewRepresentable {
 
     @objc
     func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
+      guard recognizer === longPressRecognizer, recognizer.view != nil else { return }
       let state = recognizer.state
       guard VideoGesturePolicy.allowsHoldBoost(
         isMultiTouchGestureActive: hasActiveMultiTouchGesture
       ) else {
         if isActive(state) {
-          Task { @MainActor in onLongPressStateChanged(.cancelled) }
+          MainActor.assumeIsolated { onLongPressStateChanged(.cancelled) }
         }
         return
       }
 
       switch state {
       case .began, .ended, .cancelled, .failed:
-        Task { @MainActor in onLongPressStateChanged(state) }
+        MainActor.assumeIsolated { onLongPressStateChanged(state) }
       default:
         break
       }
@@ -487,19 +489,20 @@ struct VideoGestureSurface: UIViewRepresentable {
 
     @objc
     func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
-      guard recognizer.state == .ended,
+      guard recognizer === tapRecognizer, recognizer.view != nil, recognizer.state == .ended,
             VideoGesturePolicy.allowsDoubleTapPlayback(
               isMultiTouchGestureActive: hasActiveMultiTouchGesture
             ) else {
         return
       }
-      Task { @MainActor in onDoubleTap() }
+      MainActor.assumeIsolated { onDoubleTap() }
     }
 
     @objc
     func handleSingleTap(_ recognizer: UITapGestureRecognizer) {
-      guard recognizer.state == .ended, !hasActiveMultiTouchGesture else { return }
-      Task { @MainActor in onSingleTap?() }
+      guard recognizer === singleTapRecognizer, recognizer.view != nil,
+        recognizer.state == .ended, !hasActiveMultiTouchGesture else { return }
+      MainActor.assumeIsolated { onSingleTap?() }
     }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -558,7 +561,7 @@ struct VideoGestureSurface: UIViewRepresentable {
 
     private func cancelLongPressIfNeeded() {
       guard isActive(longPressRecognizer) else { return }
-      Task { @MainActor in onLongPressStateChanged(.cancelled) }
+      MainActor.assumeIsolated { onLongPressStateChanged(.cancelled) }
     }
 
     private func remove(_ recognizer: UIGestureRecognizer?) {

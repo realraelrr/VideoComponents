@@ -22,10 +22,17 @@ The exercised toolchain is Xcode 27.0 (27A266a), Apple Swift 6.4, with iOS 27 Si
 ## Installation
 
 Choose **File → Add Package Dependencies** in Xcode, enter
-`https://github.com/realraelrr/VideoComponents.git`, and select **Branch** `main`
-for the current unreleased APIs shown below. Link only the products your target needs.
-Released `0.3.0` retains the previous raw-asset playback API; use that tag's README
-when consuming the release. The new resources products have no release tag yet.
+`https://github.com/realraelrr/VideoComponents.git`, and select version `0.4.0`.
+Link only the products your target needs. Version `0.4.0` adds the three resources
+products alongside playback, processing and frame selection.
+When upgrading from `0.3.0`, return
+`PlaybackLoadedMedia(asset: asset)` from playback loaders and access validators,
+and pass it to `replaceAsset(_:for:)`. Supply the representation's audio mix and
+synchronous authority check when applicable. `PlaybackFailure` adds the
+`preparation` case; update exhaustive switches. Host readiness belongs to
+`PlaybackPreparation`; `willPlay` is observational. Register resource playback
+observers on `VideoResourcePlayback.onEvent` or its initializer, rather than
+chaining the owned native session hook.
 Version `0.2.0` adds the optional picker and automatic poster V2; the original
 `VideoPlayback` and `VideoProcessing` products were introduced in `0.1.0`.
 Version `0.2.1` fixes fullscreen idle chrome, zoomed pan boundaries and cancelled scrubbing.
@@ -116,6 +123,10 @@ session.preparation = PlaybackPreparation(
 
 The host's `prepare` closure must synchronously register or submit the UUID reservation before its first suspension. Serialize that submitted preparation with `release`, which can be called while preparation is pending, and guarantee that late completion cannot resurrect a released reservation. Task cancellation alone does not roll back physical activation already underway. `release` must also tolerate an unknown UUID: if the session pauses before the preparation task enters, the host receives only release and that task will never invoke prepare. These host ordering requirements are part of the contract; arbitrary asynchronous preparation does not provide them. The session captures the preparation/release pair for each lease; configure a different pair before loading another source or after cleanup.
 
+Access-validation factories may synchronously close or replace the source or request a newer refresh. Once that happens, the obsolete factory result cannot reload or suspend the current source. During asynchronous access validation, user replay and same-source autoplay at the end update the retained snapshot's seek target even while its item is detached; playback resumes only after the restoring seek succeeds.
+
+Gesture callbacks are delivered synchronously on UIKit's main thread to the currently attached surface. Removing the surface cancels an active hold and pinch and rejects subsequent callbacks from its removed recognizers. Ordinary updates of a mounted surface use its latest host callbacks.
+
 A current preparation error publishes `PlaybackFailure.preparation(error)` and `.unavailable`, ends intent and hold, and releases the lease while retaining the source, ready item and position. Map this distinct failure to the host's concise audio recovery message. Call `retryPlaybackPreparation()` only from an explicit user retry; it prepares a new lease and resumes the retained item at its current position. Ordinary load updates, rate changes and gestures do not retry a preparation failure. Access revalidation, same-source representation replacement and even a forced same-identity source reload preserve that failure and stopped intent. Source retry remains a separate loading operation; a new source identity clears the old failure.
 
 For a different representation of the same media, call `try await session.replaceAsset(media, for: source.identity)`. `PlaybackLoadedMedia` carries the actual asset, optional audio mix and a synchronous throwing validity check; native validates this same result before installation and after asynchronous readiness/seek boundaries. An invalid previous result cannot be restored on rollback. Native never imports the resource core. `currentLoadedMedia` describes the actual current item; a newly obtained access result does not replace the retained snapshot's media. Asset preparation keeps the existing item usable. Native item readiness briefly pauses the same player after candidate installation; native readiness or restoring-seek failure restores the previous item. The switch uses the latest position or pending seek/scrub target, playback intent, configured rate and loop setting. A hold ends rather than becoming the new playback rate or intent. The operation waits for the restoring seek to succeed. A newer user seek can instead adopt the ready candidate, completing the replacement while its own transport continues; the obsolete restoring callback is rejected. Playback always waits for the current seek to succeed. Task cancellation restores the previous item while the operation is pending. Source replacement, cleanup and newer representation requests invalidate older results, including A → B → A reuse of an identity.
@@ -151,13 +162,11 @@ playback.requestHighQuality()
 playback.cleanup()
 ```
 
-A `VideoResourcePlayback` owns the native session's event hook. Supply host observations through its initializer; do not replace `session.onEvent`. Its loader starts a source visit only when native loading actually enters. Cleanup synchronously withdraws only this owner's initial/HQ shares, before forwarding the host event. Inline/fullscreen share this owner. HQ success is installed independently in each session; one session's installation failure does not invalidate the shared result. `installedReceipt` is available only for a current, ready, matching asset/mix. Initial loading may have obtained a result before this property becomes available. `qualityFailure` is local to this session, with host-owned recovery copy and interactions. This product adds no UI, audio policy or operation-progress controller.
+A `VideoResourcePlayback` exclusively owns the native session's event hook. Supply the single host observer through its initializer or `binding.onEvent`; do not wrap or replace `session.onEvent`. Only one resource owner may be alive for a native session. Constructing that owner replaces rather than chains any existing `session.onEvent`; move host observations to the owner. The observer belongs to that owner and is not retained or notified after its release; release still synchronously cleans up resource consumption and the native item. A retained native session may be used by a new owner after the previous owner is released, without inheriting old observers. Explicit `cleanup()` on a live owner sends the host event after releasing its consumption; repeated calls leave resources released but each still sends an observational cleanup event. Deinitialization does not send a host event through the dying owner. Its loader starts a source visit only when native loading actually enters. Cleanup synchronously withdraws only this owner's initial/HQ shares, before forwarding the host event. Inline/fullscreen share this owner. HQ success is installed independently in each session; one session's installation failure does not invalidate the shared result. `installedReceipt` is available only for a current, ready, matching asset/mix. Initial loading may have obtained a result before this property becomes available. `qualityFailure` is local to this session, with host-owned recovery copy and interactions. This product adds no UI, audio policy or operation-progress controller.
 
 Observe `highQualityAction` for this owner’s `hidden`, `available`, or `loading(progress)` projection. Progress comes from its own finite preparation, including a shared acquisition, rather than another request’s source status. From the host’s existing ready-item observation, call `checkLocalHighQuality()` for one forbidden-network check per installed representation. Only a confirmed acquisition-stage `networkRequired` sets `localHighQualityAvailability` to `requiresNetwork`; unknown local failures keep usable media and do not offer a network action. An explicit request or native installation failure keeps only this owner’s retry intent. Verified local files already have highest-quality evidence.
 
 Audio preparation Retry calls the native preparation path with zero resource acquisitions. Resource Retry explicitly accepts the host's currently selected source and creates a new finite consumption for this owner, including after native source invalidation has released the old visit; callers preserve their explicit autoplay choice through `retry(source:request:thumbnail:autoplayWhenReady:)`. Rate and loop settings remain owned by the native session. Business draft/save/export consumers use their own shares and final receipt validation; a playback owner cannot cancel their work.
-
-The DanceCheckin production resolver has not been migrated to these products. Its eventual cutover must replace every resource consumer together: playback, editor/frame selection, HQ/export, draft preview and save. Remove the old resolver's acquisition task/cache, owner/consumer bookkeeping, preferred/revision facts and global retry startup with that switch. Retain host resource mapping, local Store integrity/materialization, Photos authorization interactions, account isolation, audio FIFO, poster masters/thumbnail cache, cancellation at final business mutations and the actual feature-exit boundary. Do not copy the isolated HostHarness Store into production or operate two source authorities for one media identity.
 
 ## Optional frame and export receipts
 
@@ -197,8 +206,6 @@ A stateless source factory and use-boundary validator do not immediately detach 
 idle paused preview on external permission/content revocation. The host must connect
 its authority refresh to the existing mounted owner's lifecycle. Progress and HQ
 preferred updates must not change picker identity or trigger another acquisition.
-These UI refresh and per-playback HQ progress/classification seams remain prerequisites
-for the DanceCheckin App cutover; the App has not selected this package revision.
 
 ## Manual frame selection
 
