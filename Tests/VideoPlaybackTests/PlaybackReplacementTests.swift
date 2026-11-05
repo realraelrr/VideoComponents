@@ -357,6 +357,44 @@ final class PlaybackReplacementTests: XCTestCase {
     XCTAssertTrue(session.player.currentItem === current)
   }
 
+  func testNativePlayingNotificationHonorsLatestRateAndPause() async throws {
+    enum Scenario: CaseIterable { case rate, alreadyPaused, pauseFromEvent }
+    for scenario in Scenario.allCases {
+      var nativeChange: (@MainActor (@MainActor () -> AVPlayer.TimeControlStatus) -> Void)?
+      var status: AVPlayer.TimeControlStatus = .playing
+      let session = PlaybackSession(transportSeek: PlaybackSession.seekTransport,
+        observeTimeControlStatus: { _, onChange in nativeChange = onChange; return nil })
+      defer { session.onEvent = { _ in }; session.cleanup() }
+      let asset = try audioAsset(seconds: 8)
+      session.load(source: PlaybackSource(identity: "A", load: { PlaybackLoadedMedia(asset: asset) }),
+        playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+      try await waitUntil { session.isPlayerReady }
+      session.togglePlayback()
+      if scenario == .alreadyPaused {
+        session.pausePlayback()
+      } else {
+        session.updatePlaybackRate(0.5)
+      }
+      if scenario == .pauseFromEvent {
+        session.onEvent = { event in
+          if case .willPlay = event { status = .paused; session.pausePlayback() }
+        }
+      }
+      // Recreate the observed late native rate/start notification. The getter
+      // remains live so a host pause in onEvent changes the subsequent read.
+      session.player.rate = 1
+      let send = try XCTUnwrap(nativeChange)
+      send { status }
+      if scenario == .rate {
+        XCTAssertEqual(session.playbackConfig.playbackRate, 0.5)
+        XCTAssertEqual(session.player.rate, 0.5, accuracy: 0.01)
+      } else {
+        XCTAssertFalse(session.isPlaybackRequested)
+        XCTAssertEqual(session.player.rate, 0)
+      }
+    }
+  }
+
   private func readySession(
     prepare: PlaybackSession.PrepareReplacement? = nil,
     transport: @escaping PlaybackSession.TransportSeek = PlaybackSession.seekTransport

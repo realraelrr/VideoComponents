@@ -1278,6 +1278,13 @@ import UIKit
       if currentStatus() == .playing { self.onEvent(.willPlay) }
       // The host event may synchronously pause or replace the source; read native facts again.
       self.updatePlaybackBufferingOverlay(for: currentStatus(), token: token)
+      guard self.playbackCoordinator.isCurrent(token), currentStatus() == .playing else { return }
+      let requestedRate = self.playbackInteraction == .holding
+        ? self.playbackConfig.holdBoostedRate : self.playbackConfig.playbackRate
+      // Native startup can report an older rate or Play after a newer request.
+      if !self.isPlaybackRequested || self.player.rate != requestedRate {
+        self.reconcilePlayback()
+      }
     }
   }
 
