@@ -75,7 +75,7 @@ public final class VideoResourcePlayback {
     return storedQualityAttempt
   }
   @ObservationIgnored private var qualityTask: Task<Void, Never>?
-  @ObservationIgnored private var readinessObservation: AnyCancellable?
+  @ObservationIgnored private var readinessObservation: (@MainActor () -> Void)?
   @ObservationIgnored private var lastHighQualityInstallation: VideoRepresentationID?
   @ObservationIgnored private var lastLocalCheckRepresentation: VideoRepresentationID?
   @ObservationIgnored private var hasRequestedHighQuality = false
@@ -119,7 +119,7 @@ public final class VideoResourcePlayback {
       if case .didCleanup = event { self.releaseVisit() }
       self.onEvent(event)
     }
-    readinessObservation = session.$isPlayerReady.sink { [weak self] ready in
+    let observation = session.$isPlayerReady.sink { [weak self] ready in
       guard ready else { return }
       let visitID = MainActor.assumeIsolated { self?.visit?.id }
       guard let visitID else { return }
@@ -129,12 +129,23 @@ public final class VideoResourcePlayback {
         self?.reconcilePreferred(visitID: visitID)
       }
     }
+    readinessObservation = { observation.cancel() }
   }
 
-  isolated deinit {
-    readinessObservation?.cancel()
-    releaseVisit()
-    session.cleanup()
+  deinit {
+    qualityTask?.cancel()
+    let cleanup: @MainActor @Sendable () -> Void = { [readinessObservation, initialPreparation,
+      quality = storedQualityAttempt?.preparation, session] in
+      readinessObservation?()
+      initialPreparation?.cancel()
+      quality?.cancel()
+      session.cleanup()
+    }
+    if Thread.isMainThread {
+      MainActor.assumeIsolated { cleanup() }
+    } else {
+      Task.detached { @MainActor in cleanup() }
+    }
   }
 
   public func load(

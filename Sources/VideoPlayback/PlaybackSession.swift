@@ -61,6 +61,7 @@ import UIKit
   @Published private var isResumingAfterScrub = false
 
   private let transportSeek: TransportSeek
+  private let cancelPendingSeeks: @MainActor (AVPlayerItem) -> Void
   private let observeTimeControlStatus: ObserveTimeControlStatus
   private let slowStatusDelay: SlowStatusDelay
   private let prepareReplacement: PrepareReplacement
@@ -74,10 +75,10 @@ import UIKit
   private(set) var sourcePresentationID = UUID()
   private var lastAccessRefreshID: UInt64?
   private var pendingTransport: PendingTransport?
-  private var playbackEndObserver: NSObjectProtocol?
+  private var playbackEndObserver: (@MainActor () -> Void)?
   private var playerItemStatusObservation: NSKeyValueObservation?
   private var timeControlObservation: NSKeyValueObservation?
-  private var periodicTimeObserver: Any?
+  private var periodicTimeObserver: (@MainActor () -> Void)?
   private var slowStatusTask: Task<Void, Never>?
   private var previewImageTask: Task<Void, Never>?
   private var aspectRatioTask: Task<Void, Never>?
@@ -101,17 +102,47 @@ import UIKit
     slowStatusDelay: @escaping SlowStatusDelay = { try await Task.sleep(nanoseconds: $0) },
     prepareReplacement: @escaping PrepareReplacement = PlaybackSession.prepareReplacementItem,
     observeTimeControlStatus: @escaping ObserveTimeControlStatus = PlaybackSession.observeTimeControlStatus,
+    cancelPendingSeeks: @escaping @MainActor (AVPlayerItem) -> Void = { $0.cancelPendingSeeks() },
     onEvent: @escaping @MainActor (PlaybackEvent) -> Void = { _ in }
   ) {
     self.transportSeek = transportSeek
+    self.cancelPendingSeeks = cancelPendingSeeks
     self.observeTimeControlStatus = observeTimeControlStatus
     self.slowStatusDelay = slowStatusDelay
     self.prepareReplacement = prepareReplacement
     self.onEvent = onEvent
   }
 
-  isolated deinit {
-    cleanup()
+  deinit {
+    slowStatusTask?.cancel()
+    previewImageTask?.cancel()
+    aspectRatioTask?.cancel()
+    currentLoadTask?.cancel()
+    accessValidationTask?.cancel()
+    preparationTask?.cancel()
+    // An isolated deinit can crash the iOS26 runtime when a synchronous caller
+    // has thread-local TaskLocal bindings. Transfer handles, never the owner.
+    let cleanup: @MainActor @Sendable () -> Void = { [player, preparationRequest, replacementObservation,
+      replacementContinuation, pendingTransport, cancelPendingSeeks, scrubSeekCoordinator, playbackEndObserver,
+      playerItemStatusObservation, timeControlObservation, periodicTimeObserver, onEvent] in
+      player.pause()
+      if let request = preparationRequest { request.preparation.release(request.id) }
+      replacementObservation?.invalidate()
+      replacementContinuation?.resume(throwing: CancellationError())
+      if pendingTransport != nil, let item = player.currentItem { cancelPendingSeeks(item) }
+      scrubSeekCoordinator?.reset()
+      playbackEndObserver?()
+      playerItemStatusObservation?.invalidate()
+      timeControlObservation?.invalidate()
+      periodicTimeObserver?()
+      player.replaceCurrentItem(with: nil)
+      onEvent(.didCleanup)
+    }
+    if Thread.isMainThread {
+      MainActor.assumeIsolated { cleanup() }
+    } else {
+      Task.detached { @MainActor in cleanup() }
+    }
   }
 
   public var hasCurrentItem: Bool {
@@ -973,7 +1004,7 @@ import UIKit
     isResumingAfterScrub = false
     guard pendingTransport != nil else { return }
     pendingTransport = nil
-    player.currentItem?.cancelPendingSeeks()
+    if let item = player.currentItem { cancelPendingSeeks(item) }
     if let replacementItem, player.currentItem === replacementItem {
       // A newer user transport intent adopts this ready representation. Its old
       // restoring callback cannot undo adoption or overwrite the new target.
@@ -1200,7 +1231,7 @@ import UIKit
     token: PlaybackState.GenerationToken
   ) {
     removePlaybackEndObserver()
-    playbackEndObserver = NotificationCenter.default.addObserver(
+    let observer = NotificationCenter.default.addObserver(
       forName: .AVPlayerItemDidPlayToEndTime,
       object: playerItem,
       queue: .main
@@ -1209,6 +1240,7 @@ import UIKit
         self?.handlePlaybackEnded(for: playerItem, token: token)
       }
     }
+    playbackEndObserver = { NotificationCenter.default.removeObserver(observer) }
   }
 
   private func handlePlaybackEnded(
@@ -1315,7 +1347,7 @@ import UIKit
   private func observePlayerTime(token: PlaybackState.GenerationToken) {
     removePeriodicTimeObserver()
     let interval = CMTime(seconds: 0.25, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
-    periodicTimeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) {
+    let observer = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) {
       [weak self] time in
       MainActor.assumeIsolated {
         guard let self,
@@ -1326,6 +1358,7 @@ import UIKit
         self.updatePlaybackProgress(from: time)
       }
     }
+    periodicTimeObserver = { [player] in player.removeTimeObserver(observer) }
   }
 
   private func updatePlaybackProgress(from time: CMTime) {
@@ -1360,7 +1393,7 @@ import UIKit
 
   private func removePlaybackEndObserver() {
     guard let playbackEndObserver else { return }
-    NotificationCenter.default.removeObserver(playbackEndObserver)
+    playbackEndObserver()
     self.playbackEndObserver = nil
   }
 
@@ -1375,7 +1408,7 @@ import UIKit
 
   private func removePeriodicTimeObserver() {
     guard let periodicTimeObserver else { return }
-    player.removeTimeObserver(periodicTimeObserver)
+    periodicTimeObserver()
     self.periodicTimeObserver = nil
   }
 

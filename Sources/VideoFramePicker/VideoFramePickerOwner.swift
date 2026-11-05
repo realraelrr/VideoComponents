@@ -75,13 +75,20 @@ final class VideoFramePickerOwner {
     self.extractFrame = extractFrame
   }
 
-  isolated deinit {
+  deinit {
     loadTask?.cancel()
     frameTask?.cancel()
-    player?.pause()
-    seekCoordinator?.reset()
-    player?.replaceCurrentItem(with: nil)
-    cancelInvalidation?()
+    let cleanup: @MainActor @Sendable () -> Void = { [storedPlayer, seekCoordinator, cancelInvalidation] in
+      storedPlayer?.pause()
+      seekCoordinator?.reset()
+      storedPlayer?.replaceCurrentItem(with: nil)
+      cancelInvalidation?()
+    }
+    if Thread.isMainThread {
+      MainActor.assumeIsolated { cleanup() }
+    } else {
+      Task.detached { @MainActor in cleanup() }
+    }
   }
 
   func start(

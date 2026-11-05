@@ -453,7 +453,16 @@ public final class VideoPreparation {
     self.cancelled = cancelled
     shareID = cancelled ? UUID() : operation.register()
   }
-  isolated deinit { operation.release(shareID) }
+  deinit {
+    let cleanup: @MainActor @Sendable () -> Void = { [operation, shareID] in
+      operation.release(shareID)
+    }
+    if Thread.isMainThread {
+      MainActor.assumeIsolated { cleanup() }
+    } else {
+      Task.detached { @MainActor in cleanup() }
+    }
+  }
 
   /// Progress reported by this finite acquisition, independently of other source requests.
   public var progress: Double? { cancelled ? nil : operation.progress }
