@@ -10,4 +10,14 @@ final class PhotosReferenceResolverTests: XCTestCase {
       }
     }
   }
+
+  func testMalformedReferenceFromAsyncCallerRemainsTyped() async {
+    do {
+      _ = try PhotosReferenceResolver.localIdentifier(for: "mounted-roundtrip")
+      XCTFail("Malformed native reference must fail")
+    } catch {
+      XCTAssertEqual(error as? VideoResourceFailure, .sourceUnavailable)
+    }
+  }
+
 }
