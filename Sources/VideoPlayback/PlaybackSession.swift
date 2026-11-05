@@ -1282,7 +1282,8 @@ import UIKit
       let requestedRate = self.playbackInteraction == .holding
         ? self.playbackConfig.holdBoostedRate : self.playbackConfig.playbackRate
       // Native startup can report an older rate or Play after a newer request.
-      if !self.isPlaybackRequested || self.player.rate != requestedRate {
+      if !self.isPlaybackRequested || self.pendingTransport != nil
+        || self.playbackInteraction == .scrubbing || self.player.rate != requestedRate {
         self.reconcilePlayback()
       }
     }

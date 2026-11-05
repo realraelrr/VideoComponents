@@ -395,6 +395,40 @@ final class PlaybackReplacementTests: XCTestCase {
     }
   }
 
+  func testNativePlayingNotificationStaysPausedDuringScrubAndPendingSeek() async throws {
+    for pendingSeek in [false, true] {
+      var nativeChange: (@MainActor (@MainActor () -> AVPlayer.TimeControlStatus) -> Void)?
+      let transport = ReplacementTransport()
+      let session = PlaybackSession(transportSeek: transport.seek,
+        observeTimeControlStatus: { _, onChange in nativeChange = onChange; return nil })
+      defer { session.cleanup() }
+      let asset = try audioAsset(seconds: 8)
+      session.load(source: PlaybackSource(identity: "A", load: { PlaybackLoadedMedia(asset: asset) }),
+        playbackRate: 1, isLooping: false, autoplayWhenReady: false)
+      try await waitUntil { session.isPlayerReady && session.durationSeconds > 0 }
+      session.togglePlayback()
+      session.handleScrubEditingChanged(true)
+      session.setScrubProgress(0.4)
+      if pendingSeek {
+        session.handleScrubEditingChanged(false)
+        try await waitUntil { transport.finished.first == true }
+      }
+      XCTAssertTrue(session.isPlaybackRequested)
+      XCTAssertEqual(session.player.rate, 0)
+      // Controlled late notification at exactly the requested rate: this must
+      // still respect the transport/scrub pause boundary.
+      session.player.rate = session.playbackConfig.playbackRate
+      let send = try XCTUnwrap(nativeChange)
+      send { .playing }
+      XCTAssertTrue(session.isPlaybackRequested)
+      XCTAssertEqual(session.player.rate, 0, "pendingSeek=\(pendingSeek)")
+      if pendingSeek {
+        transport.deliverLast()
+        XCTAssertEqual(session.player.rate, 1, accuracy: 0.01)
+      }
+    }
+  }
+
   private func readySession(
     prepare: PlaybackSession.PrepareReplacement? = nil,
     transport: @escaping PlaybackSession.TransportSeek = PlaybackSession.seekTransport
