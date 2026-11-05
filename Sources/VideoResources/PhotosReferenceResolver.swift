@@ -1,0 +1,15 @@
+import Foundation
+import PhotosMappingBridge
+
+/// Resolves Apple's opaque serialized reference without allowing a native
+/// Photos exception to terminate the process. Does not request authorization.
+@MainActor
+public enum PhotosReferenceResolver {
+  public static func localIdentifier(for serialized: String) throws -> String {
+    guard !serialized.isEmpty else { throw VideoResourceFailure.sourceUnavailable }
+    var error: NSError?
+    if let identifier = VRResolvePhotosReference(serialized, &error) { return identifier }
+    if let error, error.domain != "VideoResources.PhotosReference" { throw error }
+    throw VideoResourceFailure.sourceUnavailable
+  }
+}

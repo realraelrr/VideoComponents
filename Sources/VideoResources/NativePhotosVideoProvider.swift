@@ -76,12 +76,10 @@ private final class NativePhotosSource {
       traceVideoPreparation("photos.mapping.begin", id: traceID)
       defer { traceVideoPreparation("photos.mapping.end", id: traceID) }
       #endif
-      let cloudIdentifier = PHCloudIdentifier(stringValue: serializedCloudIdentifier)
-      guard let mapping = PHPhotoLibrary.shared()
-        .localIdentifierMappings(for: [cloudIdentifier])[cloudIdentifier]
-      else { throw VideoResourceFailure.sourceUnavailable }
       do {
-        localIdentifier = try mapping.get()
+        localIdentifier = try PhotosReferenceResolver.localIdentifier(for: serializedCloudIdentifier)
+      } catch let failure as VideoResourceFailure {
+        throw failure
       } catch {
         throw nativePhotosFailure(error)
       }

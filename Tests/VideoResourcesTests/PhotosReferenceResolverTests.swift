@@ -1,0 +1,11 @@
+import XCTest
+@testable import VideoResources
+
+@MainActor
+final class PhotosReferenceResolverTests: XCTestCase {
+  func testMalformedNativeReferencesFailWithoutTerminatingProcess() {
+    for reference in ["", "not-a-cloud-identifier", "photos-test", " ", "\u{0}"] {
+      XCTAssertThrowsError(try PhotosReferenceResolver.localIdentifier(for: reference))
+    }
+  }
+}

@@ -14,7 +14,8 @@ let package = Package(
     .library(name: "VideoFramePicker", targets: ["VideoFramePicker"]),
   ],
   targets: [
-    .target(name: "VideoResources"),
+    .target(name: "VideoResources", dependencies: ["PhotosMappingBridge"]),
+    .target(name: "PhotosMappingBridge", linkerSettings: [.linkedFramework("Photos")]),
     .target(name: "VideoResourcesPlayback", dependencies: ["VideoResources", "VideoPlayback"]),
     .target(name: "VideoResourcesFrames", dependencies: ["VideoResources", "VideoPlayback", "VideoFramePicker", "VideoProcessing"]),
     .testTarget(name: "VideoResourcesFramesTests", dependencies: ["VideoResourcesFrames", "VideoResources", "VideoFramePicker", "VideoPlayback", "VideoProcessing"]),
