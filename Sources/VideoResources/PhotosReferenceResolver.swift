@@ -1,8 +1,9 @@
 import Foundation
 import PhotosMappingBridge
 
-/// Resolves Apple's opaque serialized reference without allowing a native
-/// Photos exception to terminate the process. Does not request authorization.
+/// Resolves Apple's opaque reference, translating synchronous invalid-argument
+/// exceptions into sourceUnavailable. Other exceptions are not contained.
+/// Does not request authorization.
 @MainActor
 public enum PhotosReferenceResolver {
   public static func localIdentifier(for serialized: String) throws -> String {
