@@ -14,6 +14,8 @@ struct VideoComponentsExampleApp: App {
 private struct VideoComponentsDemo: View {
   @StateObject private var media = DemoMedia()
   @State private var isFullscreen = false
+  // Keep inline detached until the cover finishes its dismissal animation.
+  @State private var isFullscreenActive = false
   @State private var isScrollLocked = false
   @State private var exportRequest = 0
 
@@ -26,11 +28,14 @@ private struct VideoComponentsDemo: View {
             .foregroundStyle(.secondary)
           InlinePlaybackView(
             playbackSession: media.session,
-            isFullscreenPresented: isFullscreen,
+            isFullscreenPresented: isFullscreenActive,
             isScrollInteractionActive: $isScrollLocked,
             maximumCardSize: CGSize(width: 640, height: 420),
             topTrailingAccessory: { EmptyView() },
-            onRequestFullscreen: { isFullscreen = true },
+            onRequestFullscreen: {
+              isFullscreenActive = true
+              isFullscreen = true
+            },
             statusOverlay: { PlaybackStatusOverlay(status: media.session.status) }
           )
           Text("Double-tap to play or pause. Pinch to zoom, or hold to boost playback speed.")
@@ -56,7 +61,7 @@ private struct VideoComponentsDemo: View {
       .scrollDisabled(isScrollLocked)
       .navigationTitle("Video Components")
       .controlSize(.large)
-      .fullScreenCover(isPresented: $isFullscreen) {
+      .fullScreenCover(isPresented: $isFullscreen, onDismiss: { isFullscreenActive = false }) {
         FullscreenPlaybackView(
           playbackSession: media.session,
           onClose: { isFullscreen = false },

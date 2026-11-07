@@ -1541,6 +1541,71 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     }
   }
 
+  func testActualCoverPreservesFirstAndRepeatedNaturallyPausedPosition() async throws {
+    try await exerciseActualCoverReturn(keepPlaying: false)
+  }
+
+  func testActualCoverPreservesPlayingPositionAndRate() async throws {
+    try await exerciseActualCoverReturn(keepPlaying: true)
+  }
+
+  private func exerciseActualCoverReturn(keepPlaying: Bool) async throws {
+    let asset = try await solidVideo(red: 0, green: 255, blue: 0, frameCount: 360)
+    let session = PlaybackSession()
+    let presentation = PlaybackCoverPresentation()
+    let host = UIHostingController(rootView: PlaybackCoverHost(session: session, presentation: presentation))
+    let window = try mount(host)
+    defer { session.cleanup(); unmount(window) }
+    session.load(source: PlaybackSource(identity: UUID(), load: { PlaybackLoadedMedia(asset: asset) }),
+      playbackRate: 0.5, isLooping: false, autoplayWhenReady: false)
+    try await poll("ready cover source") { session.isPlayerReady && self.findMedia(in: host.view) != nil }
+    let inline = try XCTUnwrap(findMedia(in: host.view))
+    let item = try XCTUnwrap(session.player.currentItem)
+    for round in 1...(keepPlaying ? 1 : 2) {
+      session.togglePlayback()
+      // Do not seek first: a completed seek can mask a first-return time reset.
+      try await poll("naturally playing nonzero frame") {
+        session.player.currentTime().seconds >= Double(round) * 0.35 && inline.playerLayer.isReadyForDisplay
+      }
+      if !keepPlaying { session.pausePlayback() }
+      let before = session.player.currentTime().seconds
+      XCTAssertGreaterThan(before, 0.3)
+      presentation.isActive = true
+      presentation.isPresented = true
+      try await poll("actual fullscreen cover mounted") {
+        guard let modal = host.presentedViewController, !modal.isBeingPresented else { return false }
+        return self.findMedia(in: modal.view) != nil
+      }
+      let fullscreen = try XCTUnwrap(findMedia(in: try XCTUnwrap(host.presentedViewController).view))
+      XCTAssertNil(inline.playerLayer.player)
+      XCTAssertTrue(fullscreen.playerLayer.player === session.player)
+      if !keepPlaying {
+        XCTAssertEqual(session.player.currentTime().seconds, before, accuracy: 0.025)
+      }
+      var previousTime = session.player.currentTime().seconds
+      var movedBackward = false
+      presentation.isPresented = false
+      try await poll("actual fullscreen dismissal and inline handoff") {
+        let time = session.player.currentTime().seconds
+        movedBackward = movedBackward || time < previousTime - 0.025
+        previousTime = time
+        return host.presentedViewController == nil && !presentation.isActive
+          && inline.playerLayer.player === session.player
+      }
+      try await Task.sleep(for: .milliseconds(100))
+      XCTAssertTrue(findMedia(in: host.view) === inline, "The return reuses the mounted inline view")
+      XCTAssertNil(fullscreen.playerLayer.player)
+      XCTAssertTrue(session.player.currentItem === item)
+      XCTAssertEqual(session.player.rate, keepPlaying ? 0.5 : 0)
+      if keepPlaying {
+        XCTAssertFalse(movedBackward, "Playback time must not jump backward during the dismissal")
+        XCTAssertGreaterThan(session.player.currentTime().seconds, before)
+      } else {
+        XCTAssertEqual(session.player.currentTime().seconds, before, accuracy: 0.025)
+      }
+    }
+  }
+
   func testSharedViewsTransferSamePlayerToFullscreenAndBack() async throws {
     let asset = try await greenVideo()
     let poster = image(.red)
@@ -2141,14 +2206,14 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
   }
 
   private func solidVideo(
-    red: UInt8, green: UInt8, blue: UInt8, alternatingGreenBrightness: Bool = false
+    red: UInt8, green: UInt8, blue: UInt8, alternatingGreenBrightness: Bool = false, frameCount: Int = 60
   ) async throws -> AVURLAsset {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("poster-handoff-\(UUID()).mov")
     addTeardownBlock { try? FileManager.default.removeItem(at: url) }
     let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
     var completed = false
     defer { if !completed { writer.cancelWriting() } }
-    let width = 160, height = 120, frameCount = 60
+    let width = 160, height = 120
     let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
       AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height
     ])
@@ -2191,6 +2256,26 @@ final class VideoPlaybackPosterHandoffTests: XCTestCase {
     guard writer.status == .completed else { throw writer.error ?? FixtureError.writerFailed }
     completed = true
     return AVURLAsset(url: url)
+  }
+}
+
+@MainActor @Observable
+private final class PlaybackCoverPresentation {
+  var isPresented = false
+  var isActive = false
+}
+
+private struct PlaybackCoverHost: View {
+  let session: PlaybackSession
+  @Bindable var presentation: PlaybackCoverPresentation
+
+  var body: some View {
+    InlinePlaybackView(playbackSession: session, isFullscreenPresented: presentation.isActive,
+      topTrailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() })
+      .fullScreenCover(isPresented: $presentation.isPresented, onDismiss: { presentation.isActive = false }) {
+        FullscreenPlaybackView(playbackSession: session, onClose: { presentation.isPresented = false },
+          trailingAccessory: { EmptyView() }, statusOverlay: { EmptyView() })
+      }
   }
 }
 

@@ -190,6 +190,8 @@ python3 "$script_dir/assert-results.py" "$result_dir/ConsumerTests.xcresult" \
   --expectations "$isolated/ExpectedConsumerTests.json" \
   --suite VideoPlaybackRuntimeResourcesTests --suite VideoFramePickerRuntimeResourcesTests \
   --suite VideoFramePickerMountedTests \
+  --test VideoPlaybackPosterHandoffTests/testActualCoverPreservesFirstAndRepeatedNaturallyPausedPosition \
+  --test VideoPlaybackPosterHandoffTests/testActualCoverPreservesPlayingPositionAndRate \
   --test VideoPlaybackRuntimeResourcesTests/testEnglishResourcesResolveFromTheConsumedPackage \
   --test VideoPlaybackRuntimeResourcesTests/testSimplifiedChineseResourcesResolveFromTheConsumedPackage \
   --test VideoPlaybackRuntimeResourcesTests/testRegionalLocalesResolveFromTheConsumedPackage \
