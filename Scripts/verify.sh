@@ -14,7 +14,8 @@ else
   result_dir=$(mktemp -d "${TMPDIR:-/tmp}/video-components-validation.XXXXXX")
 fi
 for name in IsolatedConsumer Metadata.log PackageTests.log ConsumerTests.log \
-  PackageTests.xcresult ConsumerTests.xcresult PackageDerivedData ConsumerDerivedData \
+  PackageTests.xcresult ConsumerTests.xcresult PackageEnumeration.json ConsumerEnumeration.json \
+  PackageEnumeration.log ConsumerEnumeration.log PackageDerivedData ConsumerDerivedData \
   ConsumerDeviceDerivedData ConsumerSimulatorBuild.log ConsumerDeviceBuild.log \
   CaptureScreens CaptureDriver.log \
   PlaybackOnlyDerivedData ProcessingOnlyDerivedData FramePickerOnlyDerivedData \
@@ -50,6 +51,11 @@ print("Simulator OS: " + runtime["name"] + " " + runtime["version"])
 print("Simulator OS build: " + runtime["buildversion"])
 ' "$simulator_id"
 } 2>&1 | tee "$result_dir/Metadata.log"
+
+# Match the App verification preflight: hosted accessibility checks need the
+# Simulator semantic runtime, even when VoiceOver itself is not enabled.
+xcrun simctl bootstatus "$simulator_id" -b
+xcrun simctl spawn "$simulator_id" defaults write com.apple.Accessibility ApplicationAccessibilityEnabled -bool YES
 
 # Each consumer references exactly one product from the same external package copy.
 for product in Playback Processing FramePicker Resources ResourcesPlayback ResourcesFrames; do
@@ -87,68 +93,25 @@ done
 
 (
   cd "$isolated/VideoComponents"
-  # Product schemes do not include test actions; the package scheme runs all targets.
-  xcodebuild -jobs "$jobs" -scheme VideoComponents-Package -destination "$destination" \
-    -derivedDataPath "$result_dir/PackageDerivedData" \
-    -resultBundlePath "$result_dir/PackageTests.xcresult" \
-    -parallel-testing-enabled NO -collect-test-diagnostics never CODE_SIGNING_ALLOWED=NO test
+  # Enumerate the compiled package, including XCTest methods declared in extensions.
+  package_command=(xcodebuild -jobs "$jobs" -scheme VideoComponents-Package
+    -destination "$destination" -derivedDataPath "$result_dir/PackageDerivedData"
+    -parallel-testing-enabled NO -collect-test-diagnostics never CODE_SIGNING_ALLOWED=NO)
+  "${package_command[@]}" test -enumerate-tests -test-enumeration-style flat \
+    -test-enumeration-format json -test-enumeration-output-path "$result_dir/PackageEnumeration.json" \
+    2>&1 | tee "$result_dir/PackageEnumeration.log"
+  "${package_command[@]}" -resultBundlePath "$result_dir/PackageTests.xcresult" test-without-building
 ) 2>&1 | tee "$result_dir/PackageTests.log"
 
 python3 "$script_dir/assert-results.py" "$result_dir/PackageTests.xcresult" \
-  --expectations "$isolated/ExpectedPackageTests.json" \
-  --suite VideoFrameTests --suite SlowVideoExportIntegrationTests \
-  --suite SlowVideoExportRunnerTests --suite VideoPosterSelectionAlgorithmTests \
-  --suite AutomaticVideoPosterSelectionTests --suite VideoFramePickerOwnerTests \
-  --suite VideoFramePickerLifecycleTests --suite VideoFramePickerBoundaryTests \
-  --suite VideoFramePickerMediaTests \
-  --suite VideoAdaptiveLayoutTests --suite PlaybackTransportTests --suite PlaybackAccessTests \
-  --suite PlaybackGestureTests --suite PlaybackLocalizationTests \
-  --suite PlaybackSeekCancellationTests \
-  --test VideoFrameTests/testZeroAndNonexactFrameReturnActualTimeAndRotatedPixels \
-  --test VideoFrameTests/testEndAndOutOfRangeRequestsDoNotInventAnExactFrame \
-  --test VideoFrameTests/testAutomaticPosterSelectsUsablePixelsThroughRealVideoPipeline \
-  --test SlowVideoExportIntegrationTests/testRealExporterScalesDurationAndPreservesRotatedDecodableFrames \
-  --test SlowVideoExportIntegrationTests/testShortOffsetAudioKeepsItsScaledTimeline \
-  --test SlowVideoExportRunnerTests/testCancellationRacingNativeCompletionStillCancelsAndRemovesOutput \
-  --test PlaybackAccessTests/testNoItemRefreshCancelsOldLoadAndPreservesAutoplayIntent \
-  --test PlaybackAccessTests/testCleanupCancelsSuspendedValidatorAndDiscardsLateSuccess \
-  --test PlaybackAccessTests/testReplacementCancelsSuspendedValidatorAndKeepsNewItem \
-  --test PlaybackAccessTests/testSuspendedValidatorDoesNotRetainOwnerAndReceivesCancellation \
-  --test PlaybackAccessTests/testFrameworkCancellationIsFailureAndLaterRefreshCanLoadWithoutOldIntent \
-  --test PlaybackTransportTests/testPlaybackEndSettlesSynchronouslyBeforeFollowingToggle \
-  --test PlaybackTransportTests/testPendingRestartTransfersToHoldAndUsesLatestRates \
-  --test PlaybackTransportTests/testCleanupDoesNotPublishPositionFromLateSuccessfulScrub \
-  --test PlaybackSeekCancellationTests/testResetRejectsOldCompletionWhenNewRequestHasSameTimeAndPrecision \
-  --test PlaybackGestureTests/testPinchImmediatelyBlocksHoldDoubleTapAndPanBeforeSwiftUIRefresh \
-  --test PlaybackGestureTests/testDismantleCancelsActivePinchHoldAndRemovesAllRecognizers \
-  --test PlaybackLocalizationTests/testRegionLocalesSelectTheirLanguageResource \
-  --test AutomaticVideoPosterSelectionTests/testDeduplicatesEquivalentActualTimesBeforeChoosingRepresentativeFrame \
-  --test AutomaticVideoPosterSelectionTests/testFinalRequestPreservesRationalTimeWithoutDoubleRoundTrip \
-  --test AutomaticVideoPosterSelectionTests/testFinalExtractionRejectsDifferentActualFrameWithoutFallback \
-  --test VideoPosterSelectionAlgorithmTests/testQualityThresholdPrecedesRepresentativeness \
-  --test VideoPosterSelectionAlgorithmTests/testRepresentativeFrameAtQualityThresholdBeatsTechnicalMaximum \
-  --test VideoFramePickerOwnerTests/testInitialPreviewNeverConsumesAndPreservesActualFrameTime \
-  --test VideoFramePickerOwnerTests/testScrubbingDoesNotExtractUntilReleaseAndConsumesLatestValueOnce \
-  --test VideoFramePickerOwnerTests/testTouchWithoutValueChangeDoesNotConsume \
-  --test VideoFramePickerOwnerTests/testPendingRetouchWithoutChangeKeepsIntentAndOriginalCallbacks \
-  --test VideoFramePickerOwnerTests/testNonScrubbingValueChangeUsesExactPipeline \
-  --test VideoFramePickerOwnerTests/testSameTimeReplacementRejectsLateFrameAndLateFailure \
-  --test VideoFramePickerOwnerTests/testHostAwaitLocksSliderAndFailureKeepsExactPreview \
-  --test VideoFramePickerOwnerTests/testHostAwaitSuccessEndsActivityOnlyWhenConsumerReturns \
-  --test VideoFramePickerOwnerTests/testSourceAToBToARejectsOriginalLoaderEvenWhenIdentityMatchesAgain \
-  --test VideoFramePickerOwnerTests/testSourceSwitchDuringConsumerCannotUnlockNewPendingSelection \
-  --test VideoFramePickerOwnerTests/testStopSynchronouslyDetachesPlayerAndRejectsLateFrame \
-  --test VideoFramePickerLifecycleTests/testSuspendedLoaderDoesNotRetainOwnerAndReceivesCancellation \
-  --test VideoFramePickerLifecycleTests/testSuspendedMetadataInspectionDoesNotRetainOwnerOrCancelBorrowedAsset \
-  --test VideoFramePickerLifecycleTests/testSuspendedFrameExtractionDoesNotRetainOwnerAndDetachesItsItem \
-  --test VideoFramePickerLifecycleTests/testSuspendedConsumerDoesNotRetainOwnerAndReceivesCancellation \
-  --test VideoFramePickerBoundaryTests/testInvalidConfigurationFailsBeforeCallingLoader \
-  --test VideoFramePickerBoundaryTests/testInvalidAndUnrepresentableDurationsNeverReachPlayerOrExtractor \
-  --test VideoFramePickerBoundaryTests/testSixLanguageResourcesResolveEveryFieldAndRegionFallback \
-  --test VideoFramePickerMediaTests/testRealInitialPipelineHandlesLandscapePortraitRotationAndFrameBudget \
-  --test VideoFramePickerMediaTests/testRealUserSelectionReturnsDecodedFrameInPausedMutedPlayer \
-  --test VideoFramePickerMediaTests/testRealEndpointReturnsActualEncodedTimeOrTypedFrameFailure \
-  --test VideoFramePickerMediaTests/testRealMissingVideoAndUnreadableFileProduceSourceFailure
+  --enumeration "$result_dir/PackageEnumeration.json"
+
+consumer_command=(xcodebuild -jobs "$jobs" -project "$consumer_project" -scheme VideoComponentsExample
+  -destination "$destination" -derivedDataPath "$result_dir/ConsumerDerivedData"
+  -parallel-testing-enabled NO -collect-test-diagnostics never CODE_SIGNING_ALLOWED=NO)
+"${consumer_command[@]}" test -enumerate-tests -test-enumeration-style flat \
+  -test-enumeration-format json -test-enumeration-output-path "$result_dir/ConsumerEnumeration.json" \
+  2>&1 | tee "$result_dir/ConsumerEnumeration.log"
 
 # Application-host XCTest cannot use XCUIAutomation screen capture. A bounded
 # external driver supplies real compositor pixels for the poster handoff tests.
@@ -176,10 +139,7 @@ else:
 PYTHON
 export TEST_RUNNER_VIDEO_COMPONENTS_CAPTURE_DIRECTORY="$capture_dir"
 
-xcodebuild -jobs "$jobs" -project "$consumer_project" -scheme VideoComponentsExample \
-  -destination "$destination" -derivedDataPath "$result_dir/ConsumerDerivedData" \
-  -resultBundlePath "$result_dir/ConsumerTests.xcresult" \
-  -parallel-testing-enabled NO -collect-test-diagnostics never CODE_SIGNING_ALLOWED=NO test \
+"${consumer_command[@]}" -resultBundlePath "$result_dir/ConsumerTests.xcresult" test-without-building \
   2>&1 | tee "$result_dir/ConsumerTests.log"
 
 touch "$capture_dir/quit"
@@ -187,21 +147,7 @@ wait "$capture_pid"
 trap - EXIT
 
 python3 "$script_dir/assert-results.py" "$result_dir/ConsumerTests.xcresult" \
-  --expectations "$isolated/ExpectedConsumerTests.json" \
-  --suite VideoPlaybackRuntimeResourcesTests --suite VideoFramePickerRuntimeResourcesTests \
-  --suite VideoFramePickerMountedTests \
-  --test VideoPlaybackPosterHandoffTests/testActualCoverPreservesFirstAndRepeatedNaturallyPausedPosition \
-  --test VideoPlaybackPosterHandoffTests/testActualCoverPreservesPlayingPositionAndRate \
-  --test VideoPlaybackRuntimeResourcesTests/testEnglishResourcesResolveFromTheConsumedPackage \
-  --test VideoPlaybackRuntimeResourcesTests/testSimplifiedChineseResourcesResolveFromTheConsumedPackage \
-  --test VideoPlaybackRuntimeResourcesTests/testRegionalLocalesResolveFromTheConsumedPackage \
-  --test VideoFramePickerRuntimeResourcesTests/testEnglishResourcesResolveFromTheConsumedPackage \
-  --test VideoFramePickerRuntimeResourcesTests/testSimplifiedChineseResourcesResolveFromTheConsumedPackage \
-  --test VideoFramePickerRuntimeResourcesTests/testRegionalLocalesResolveFromTheConsumedPackage \
-  --test VideoFramePickerMountedTests/testMountedSliderUsesUpdatedHandlerWithoutReloadingSameIdentity \
-  --test VideoFramePickerMountedTests/testMountedConsumerKeepsNativeSliderDisabledAndUnmountUnlocksSynchronously \
-  --test VideoFramePickerMountedTests/testAppearanceCycleRestartsStoppedSameIdentityWithoutRebuildingForRedraw \
-  --test VideoFramePickerMountedTests/testSeparateMountedInstancesSettleOnlyTheirOwnActivity
+  --enumeration "$result_dir/ConsumerEnumeration.json"
 
 xcodebuild -jobs "$jobs" -project "$consumer_project" -scheme VideoComponentsExample \
   -destination 'generic/platform=iOS Simulator' -derivedDataPath "$result_dir/ConsumerDerivedData" \

@@ -1,30 +1,10 @@
 #!/usr/bin/env python3
 """Copy the package and build public consumers outside the source package."""
 
-import json
 from pathlib import Path
-import re
 import shutil
 import stat
 import sys
-
-
-def discover_tests(root):
-    suites, tests = set(), set()
-    for file in sorted(root.rglob("*.swift")):
-        current = None
-        for line in file.read_text().splitlines():
-            declaration = re.search(r"\bclass\s+(\w+)\s*:\s*([^\{]+)", line)
-            if declaration:
-                current = declaration[1] if "XCTestCase" in declaration[2] else None
-            # XCTest discovery excludes private helpers and methods with parameters.
-            test = re.search(r"^\s*(?:public\s+|internal\s+)?func\s+(test\w+)\s*\(\s*\)", line)
-            if current and test:
-                suites.add(current)
-                tests.add(current + "/" + test[1])
-    if not suites or not tests:
-        raise ValueError(f"no discoverable XCTest cases in {root}")
-    return {"suites": sorted(suites), "tests": sorted(tests)}
 
 
 def copy_validation(source, isolated):
@@ -50,11 +30,6 @@ def copy_validation(source, isolated):
             raise ValueError(f"expected exactly one project reference: {original}")
         project_text = project_text.replace(original, replacement)
     project.write_text(project_text)
-
-    package_tests = discover_tests(package / "Tests")
-    consumer_tests = discover_tests(isolated / "Consumer/VideoComponentsExampleTests")
-    for name, expectations in [("Package", package_tests), ("Consumer", consumer_tests)]:
-        (isolated / f"Expected{name}Tests.json").write_text(json.dumps(expectations, indent=2) + "\n")
 
     consumers = {
         "PlaybackOnlyConsumer": ("VideoPlayback", """import AVFoundation
@@ -192,8 +167,7 @@ let package = Package(
 )
 ''')
         (target / (name + ".swift")).write_text(code)
-    print(f"prepared independent consumers and {len(package_tests['tests'])} package / "
-          f"{len(consumer_tests['tests'])} consumer required tests in {isolated}")
+    print(f"prepared independent consumers in {isolated}; enumerate tests with Xcode before running")
 
 
 if __name__ == "__main__":
