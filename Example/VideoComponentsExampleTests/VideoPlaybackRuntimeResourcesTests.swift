@@ -3121,7 +3121,7 @@ private func requireNativeControlAccessibilityRuntime() async throws {
 }
 
 extension VideoPlaybackMountedTests {
-  func testFullscreenControlCoordinatesDoNotRouteToPlaybackGestureSurface() async throws {
+  func testFullscreenControlCoordinatesAreExcludedFromPlaybackGestures() async throws {
     for (width, typeSize) in [(CGFloat(390), DynamicTypeSize.large), (320, .accessibility3)] {
       let session = try await readySession()
       session.updatePlaybackRate(1.5)
@@ -3145,13 +3145,28 @@ extension VideoPlaybackMountedTests {
         ("play glyph center", CGPoint(x: targets.play.midX, y: targets.play.midY)),
         ("progress rendered track center", CGPoint(x: targets.progress.midX, y: targets.progress.midY))
       ]
+      let playbackGestures = (surface.gestureRecognizers ?? []).filter {
+        $0 is UITapGestureRecognizer || $0 is UILongPressGestureRecognizer
+      }
+      XCTAssertEqual(playbackGestures.compactMap { ($0 as? UITapGestureRecognizer)?.numberOfTapsRequired }.sorted(), [1, 2])
+      XCTAssertEqual(playbackGestures.filter { $0 is UILongPressGestureRecognizer }.count, 1)
+      for gesture in playbackGestures {
+        XCTAssertTrue(gesture.isEnabled, "The mounted playback gestures must remain enabled")
+      }
       var routes: [String] = []
       for (name, point) in points {
         let windowPoint = host.view.convert(point, to: window)
         let hit = try XCTUnwrap(window.hitTest(windowPoint, with: nil),
           "\(name) must have a natural UIKit hit")
-        XCTAssertFalse(hit === surface || hit.isDescendant(of: surface),
-          "\(name) must not route to the playback gesture UIView; hit=\(type(of: hit))")
+        // A nil-event UIKit hit can be the underlying UIView even for a working
+        // SwiftUI Button. Assert the mounted recognizers' actual filtering policy,
+        // not SwiftUI's private hit-test hierarchy. This is not touch injection.
+        let touch = ControlCoordinateTouch(point: point, root: host.view)
+        for gesture in playbackGestures {
+          let delegate = try XCTUnwrap(gesture.delegate)
+          XCTAssertEqual(delegate.gestureRecognizer?(gesture, shouldReceive: touch), false,
+            "\(name) must be excluded from \(type(of: gesture))")
+        }
         var path: [String] = []
         var ancestor: UIView? = hit
         while let view = ancestor {
@@ -3161,14 +3176,21 @@ extension VideoPlaybackMountedTests {
         routes.append("\(name): root=\(point), window=\(windowPoint), route=\(path.joined(separator: " -> "))")
       }
 
-      // A positive control rules out an entirely disabled/misidentified surface.
+      // A positive control rules out an entirely disabled/misidentified surface
+      // or a filter that rejects every coordinate.
       let videoCenter = CGPoint(x: host.view.bounds.midX, y: host.view.bounds.midY)
       let videoHit = try XCTUnwrap(window.hitTest(host.view.convert(videoCenter, to: window), with: nil))
       XCTAssertTrue(videoHit === surface || videoHit.isDescendant(of: surface),
         "The unobstructed video center must route to the actual playback gesture UIView")
+      let videoTouch = ControlCoordinateTouch(point: videoCenter, root: host.view)
+      for gesture in playbackGestures {
+        let delegate = try XCTUnwrap(gesture.delegate)
+        XCTAssertEqual(delegate.gestureRecognizer?(gesture, shouldReceive: videoTouch), true,
+          "The video center must remain available to \(type(of: gesture))")
+      }
       routes.append("video center: root=\(videoCenter), hit=\(type(of: videoHit))")
       let diagnostic = XCTAttachment(string: routes.joined(separator: "\n"))
-      diagnostic.name = "Natural UIKit control routing \(Int(width)) \(typeSize)"
+      diagnostic.name = "UIKit hits and playback gesture exclusions \(Int(width)) \(typeSize)"
       diagnostic.lifetime = .keepAlways
       add(diagnostic)
     }
@@ -3334,4 +3356,20 @@ extension VideoPlaybackMountedTests {
       }
     }
   }
+}
+
+// Supplies coordinates to the public gesture delegate without synthesizing an
+// event or claiming an end-to-end touch. Real control actions are checked separately.
+@MainActor
+private final class ControlCoordinateTouch: UITouch {
+  let point: CGPoint
+  let root: UIView
+
+  init(point: CGPoint, root: UIView) {
+    self.point = point
+    self.root = root
+    super.init()
+  }
+
+  override func location(in view: UIView?) -> CGPoint { root.convert(point, to: view) }
 }

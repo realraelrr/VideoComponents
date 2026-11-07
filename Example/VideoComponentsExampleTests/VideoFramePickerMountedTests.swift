@@ -157,6 +157,9 @@ final class VideoFramePickerMountedTests: XCTestCase {
   private func setSlider(_ slider: UISlider, fraction: Float) {
     slider.setValue(slider.minimumValue + fraction * (slider.maximumValue - slider.minimumValue), animated: false)
     slider.sendActions(for: .valueChanged)
+    // SwiftUI treats valueChanged as the beginning of editing. Complete the
+    // release too, just as a user drag does, so selection is not left scrubbing.
+    slider.sendActions(for: .touchUpInside)
   }
 }
 
