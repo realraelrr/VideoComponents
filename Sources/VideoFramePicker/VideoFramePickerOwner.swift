@@ -530,8 +530,26 @@ final class VideoFramePickerOwner {
   private static func extract(
     _ asset: AVAsset, seconds: Double, maximumSize: CGSize
   ) async throws -> VideoFrameSelection {
+    var frameSeconds = seconds
+    let duration = try await asset.load(.duration)
+    if duration > .zero, seconds >= duration.seconds {
+      // The slider's right edge is an exclusive end, not a frame timestamp.
+      // Use a media tick inside the last enabled video track, not an audio tail.
+      var lastVideoTime = CMTime.invalid
+      for track in try await asset.loadTracks(withMediaType: .video) {
+        let (range, timescale, enabled) = try await track.load(.timeRange, .naturalTimeScale, .isEnabled)
+        guard enabled, range.isValid, range.duration > .zero, timescale > 0 else { continue }
+        let end = CMTimeConvertScale(range.end, timescale: max(range.end.timescale, timescale), method: .default)
+        let time = CMTimeSubtract(end, CMTime(value: 1, timescale: end.timescale))
+        if !lastVideoTime.isNumeric || time > lastVideoTime { lastVideoTime = time }
+      }
+      guard lastVideoTime.isNumeric, lastVideoTime >= .zero else {
+        throw VideoFrameExtractionError.frameUnavailable(cause: nil)
+      }
+      frameSeconds = lastVideoTime.seconds
+    }
     let frame = try await VideoFrameExtractor.frame(
-      for: asset, at: seconds, maximumSize: maximumSize, exact: true
+      for: asset, at: frameSeconds, maximumSize: maximumSize, exact: true
     )
     return VideoFrameSelection(
       image: frame.image, requestedSeconds: seconds, actualTime: frame.actualTime
