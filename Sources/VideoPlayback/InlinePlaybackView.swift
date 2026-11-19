@@ -73,12 +73,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
       .frame(maxWidth: .infinity, alignment: .center)
 
       if playbackSession.canTogglePlayback {
-        // Keep the media proposal stable while a pinch is in progress.
-        let hidesControls = isInlineZooming || isInlineMultiTouchGestureActive
         inlinePlaybackControls
-          .opacity(hidesControls ? 0 : 1)
-          .allowsHitTesting(!hidesControls)
-          .accessibilityHidden(hidesControls)
       }
     }
   }

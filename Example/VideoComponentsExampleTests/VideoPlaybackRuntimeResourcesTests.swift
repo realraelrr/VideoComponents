@@ -62,6 +62,34 @@ final class VideoFramePickerRuntimeResourcesTests: XCTestCase {
 
 @MainActor
 final class VideoPlaybackMountedTests: XCTestCase {
+  func testInlineProgressRemainsAdjustableAfterPinching() async throws {
+    try await requireNativeControlAccessibilityRuntime()
+    let session = try await readySession()
+    let labels = VideoPlaybackLabels(locale: Locale(identifier: "en"))
+    let host = UIHostingController(rootView: InlinePlaybackView(
+      playbackSession: session, topTrailingAccessory: { EmptyView() },
+      labels: labels, statusOverlay: { EmptyView() }
+    ))
+    let window = try mountHighQualityHost(host, size: CGSize(width: 390, height: 700))
+    defer { window.isHidden = true; window.rootViewController = nil; session.cleanup() }
+    let surface = try XCTUnwrap(findGestureSurface(host.view))
+    let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
+    let focus = CGPoint(x: surface.bounds.midX, y: surface.bounds.midY)
+    for (state, scale) in [(UIGestureRecognizer.State.began, CGFloat(1)), (.changed, 2), (.ended, 2)] {
+      coordinator.onPinchUpdate(.init(scale: scale, location: focus, state: state, numberOfTouches: 2))
+      try await Task.sleep(for: .milliseconds(50))
+      XCTAssertNotNil(fullscreenAccessibilityElements(in: host.view).first { $0.accessibilityLabel == labels.progress })
+    }
+    XCTAssertTrue(coordinator.isZoomed)
+    let progress = try XCTUnwrap(fullscreenAccessibilityElements(in: host.view).first { $0.accessibilityLabel == labels.progress })
+    progress.accessibilityIncrement()
+    for _ in 0..<100 where session.player.currentTime().seconds < 0.04 {
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    XCTAssertEqual(session.player.currentTime().seconds, session.durationSeconds * 0.05, accuracy: 0.01)
+    XCTAssertTrue(coordinator.isZoomed)
+  }
+
   func testSecondPinchKeepsTheCurrentFingerFocusAfterPanning() async throws {
     let probe = PinchFocusProbe()
     let host = UIHostingController(rootView: MountedZoomProbe(probe: probe))
