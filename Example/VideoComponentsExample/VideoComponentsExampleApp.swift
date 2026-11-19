@@ -16,7 +16,6 @@ private struct VideoComponentsDemo: View {
   @State private var isFullscreen = false
   // Keep inline detached until the cover finishes its dismissal animation.
   @State private var isFullscreenActive = false
-  @State private var isScrollLocked = false
   @State private var exportRequest = 0
 
   var body: some View {
@@ -29,7 +28,6 @@ private struct VideoComponentsDemo: View {
           InlinePlaybackView(
             playbackSession: media.session,
             isFullscreenPresented: isFullscreenActive,
-            isScrollInteractionActive: $isScrollLocked,
             maximumCardSize: CGSize(width: 640, height: 420),
             topTrailingAccessory: { EmptyView() },
             onRequestFullscreen: {
@@ -58,7 +56,6 @@ private struct VideoComponentsDemo: View {
         .frame(maxWidth: 720)
         .frame(maxWidth: .infinity)
       }
-      .scrollDisabled(isScrollLocked)
       .navigationTitle("Video Components")
       .controlSize(.large)
       .fullScreenCover(isPresented: $isFullscreen, onDismiss: { isFullscreenActive = false }) {

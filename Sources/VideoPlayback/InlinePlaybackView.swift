@@ -86,6 +86,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
         isMultiTouchGestureActive: $isInlineMultiTouchGestureActive,
         isGestureEnabled: playbackSession.canUsePlaybackControls,
         cornerRadius: 12,
+        isInline: true,
         shouldReceivePlaybackTouch: shouldReceiveInlinePlaybackTouch,
         onLongPressStateChanged: { state in
           playbackSession.handleHoldGestureStateChanged(state, allowsHoldBoost: allowsHoldBoost)

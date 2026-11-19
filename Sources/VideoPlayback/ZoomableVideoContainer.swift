@@ -13,6 +13,7 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
   @Binding var isMultiTouchGestureActive: Bool
   let isGestureEnabled: Bool
   let cornerRadius: CGFloat
+  let isInline: Bool
   let shouldReceivePlaybackTouch: ((UITouch, UIView) -> Bool)?
   let onLongPressStateChanged: @MainActor (UIGestureRecognizer.State) -> Void
   let onDoubleTap: @MainActor () -> Void
@@ -26,7 +27,6 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
   @State private var gestureStartLocation: CGPoint = .zero
   @State private var gestureStartOffset: CGSize = .zero
   @State private var gestureStartScale: CGFloat = 1
-  @State private var panStartOffset: CGSize = .zero
 
   init(
     contentAspectRatio: CGFloat?,
@@ -34,6 +34,7 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
     isMultiTouchGestureActive: Binding<Bool>,
     isGestureEnabled: Bool,
     cornerRadius: CGFloat,
+    isInline: Bool = false,
     shouldReceivePlaybackTouch: ((UITouch, UIView) -> Bool)?,
     onLongPressStateChanged: @escaping @MainActor (UIGestureRecognizer.State) -> Void,
     onDoubleTap: @escaping @MainActor () -> Void,
@@ -46,6 +47,7 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
     _isMultiTouchGestureActive = isMultiTouchGestureActive
     self.isGestureEnabled = isGestureEnabled
     self.cornerRadius = cornerRadius
+    self.isInline = isInline
     self.shouldReceivePlaybackTouch = shouldReceivePlaybackTouch
     self.onLongPressStateChanged = onLongPressStateChanged
     self.onDoubleTap = onDoubleTap
@@ -66,8 +68,10 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
         .frame(width: proxy.size.width, height: proxy.size.height)
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
 
-        if isGestureEnabled {
+        if isGestureEnabled || isInline {
           VideoGestureSurface(
+            isInline: isInline,
+            isGestureEnabled: isGestureEnabled,
             isZoomed: isCurrentScaleZoomed,
             isMultiTouchGestureActive: isMultiTouchGestureActive,
             shouldReceivePlaybackTouch: shouldReceivePlaybackTouch,
@@ -80,9 +84,6 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
             onSingleTap: onSingleTap
           )
           .frame(width: proxy.size.width, height: proxy.size.height)
-          .onDisappear {
-            hardResetZoom()
-          }
         }
 
         overlay(zoomContext)
@@ -94,6 +95,9 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
       .onChange(of: contentAspectRatio) { _, _ in
         constrainOffset(in: proxy.size)
       }
+    }
+    .onChange(of: isGestureEnabled) { _, enabled in
+      if !enabled { hardResetZoom() }
     }
     .onDisappear {
       hardResetZoom()
@@ -117,7 +121,6 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
 
       gestureStartLocation = value.location
       gestureStartOffset = currentOffset
-      panStartOffset = currentOffset
       gestureStartScale = currentScale
       updatePinch(value, in: containerSize)
     case .changed:
@@ -132,27 +135,11 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
   }
 
   private func handlePan(_ value: SupplementPanGestureValue, in containerSize: CGSize) {
-    guard VideoGesturePolicy.allowsSingleFingerPan(
-      isZoomed: VideoZoomConfig.isZoomed(currentScale),
-      isMultiTouchGestureActive: isMultiTouchGestureActive
-    ) else {
-      panStartOffset = currentOffset
-      return
-    }
-
-    switch value.state {
-    case .began:
-      panStartOffset = currentOffset
-    case .changed:
-      currentOffset = boundedOffset(CGSize(
-        width: panStartOffset.width + value.translation.width,
-        height: panStartOffset.height + value.translation.height
-      ), in: containerSize)
-    case .ended, .cancelled, .failed:
-      panStartOffset = currentOffset
-    default:
-      break
-    }
+    guard value.state == .changed, isCurrentScaleZoomed, !isMultiTouchGestureActive else { return }
+    currentOffset = boundedOffset(CGSize(
+      width: currentOffset.width + value.translation.width,
+      height: currentOffset.height + value.translation.height
+    ), in: containerSize)
   }
 
   private func updatePinch(_ value: SupplementPinchGestureValue, in containerSize: CGSize) {
@@ -188,7 +175,6 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
     gestureStartLocation = .zero
     gestureStartOffset = .zero
     gestureStartScale = 1
-    panStartOffset = .zero
   }
 
   private func restoreIdentityZoom() {
@@ -222,7 +208,6 @@ struct ZoomableVideoContainer<Content: View, Overlay: View>: View {
 
   private func constrainOffset(in containerSize: CGSize) {
     currentOffset = boundedOffset(currentOffset, in: containerSize)
-    panStartOffset = currentOffset
     gestureStartOffset = currentOffset
   }
 }
@@ -268,6 +253,8 @@ struct SupplementPanGestureValue: Equatable {
 }
 
 struct VideoGestureSurface: UIViewRepresentable {
+  var isInline = false
+  var isGestureEnabled = true
   let isZoomed: Bool
   let isMultiTouchGestureActive: Bool
   var shouldReceivePlaybackTouch: ((UITouch, UIView) -> Bool)?
@@ -291,7 +278,7 @@ struct VideoGestureSurface: UIViewRepresentable {
   }
 
   func makeUIView(context: Context) -> UIView {
-    let view = UIView()
+    let view = isInline ? InlineVideoGestureView() : UIView()
     view.backgroundColor = .clear
     view.isMultipleTouchEnabled = true
 
@@ -307,8 +294,7 @@ struct VideoGestureSurface: UIViewRepresentable {
       target: context.coordinator,
       action: #selector(Coordinator.handlePan(_:))
     )
-    panRecognizer.minimumNumberOfTouches = 1
-    panRecognizer.maximumNumberOfTouches = 1
+    if !isInline { panRecognizer.maximumNumberOfTouches = 1 }
     panRecognizer.cancelsTouchesInView = false
     panRecognizer.delegate = context.coordinator
     view.addGestureRecognizer(panRecognizer)
@@ -348,6 +334,7 @@ struct VideoGestureSurface: UIViewRepresentable {
   }
 
   func updateUIView(_ view: UIView, context: Context) {
+    view.isUserInteractionEnabled = isGestureEnabled
     context.coordinator.isZoomed = isZoomed
     context.coordinator.isMultiTouchGestureActive = isMultiTouchGestureActive
     context.coordinator.shouldReceivePlaybackTouch = shouldReceivePlaybackTouch
@@ -359,6 +346,7 @@ struct VideoGestureSurface: UIViewRepresentable {
   }
 
   static func dismantleUIView(_ view: UIView, coordinator: Coordinator) {
+    (view as? InlineVideoGestureView)?.detachFromScrollView()
     coordinator.removeGestures()
   }
 
@@ -457,6 +445,7 @@ struct VideoGestureSurface: UIViewRepresentable {
         cancelLongPressIfNeeded()
       }
       let translation = recognizer.translation(in: recognizer.view)
+      recognizer.setTranslation(.zero, in: recognizer.view)
       onPanUpdate(
         SupplementPanGestureValue(
           translation: CGSize(width: translation.x, height: translation.y),
@@ -506,7 +495,10 @@ struct VideoGestureSurface: UIViewRepresentable {
     }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+      let inlineSurface = gestureRecognizer.view as? InlineVideoGestureView
+      if inlineSurface?.touchStartedOutside == true { return false }
       if let panRecognizer, gestureRecognizer === panRecognizer {
+        if inlineSurface != nil { return true }
         return VideoGesturePolicy.allowsSingleFingerPan(
           isZoomed: isZoomed,
           isMultiTouchGestureActive: hasActiveMultiTouchGesture
@@ -529,7 +521,8 @@ struct VideoGestureSurface: UIViewRepresentable {
       _ gestureRecognizer: UIGestureRecognizer,
       shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
-      isPinchGesture(gestureRecognizer) || isPinchGesture(otherGestureRecognizer)
+      gestureRecognizer.view === otherGestureRecognizer.view &&
+        (isPinchGesture(gestureRecognizer) || isPinchGesture(otherGestureRecognizer))
     }
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {

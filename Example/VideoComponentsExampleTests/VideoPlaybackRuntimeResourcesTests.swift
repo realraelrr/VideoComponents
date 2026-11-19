@@ -3150,6 +3150,36 @@ private func requireNativeControlAccessibilityRuntime() async throws {
 }
 
 extension VideoPlaybackMountedTests {
+  func testInlineTouchOwnershipLastsUntilTheLastFingerLifts() throws {
+    let host = UIHostingController(rootView: Color.clear)
+    let window = try mountHighQualityHost(host, size: CGSize(width: 320, height: 480))
+    defer { window.isHidden = true; window.rootViewController = nil }
+    let scroll = UIScrollView(frame: host.view.bounds)
+    host.view.addSubview(scroll)
+    let existing = Set(scroll.gestureRecognizers ?? [])
+    let surface = InlineVideoGestureView(frame: CGRect(x: 20, y: 50, width: 280, height: 160))
+    scroll.addSubview(surface)
+    let boundary = try XCTUnwrap(Set(scroll.gestureRecognizers ?? []).subtracting(existing).first)
+    let inside = ControlCoordinateTouch(point: surface.center, root: scroll)
+    let outside = ControlCoordinateTouch(point: CGPoint(x: 10, y: 130), root: scroll)
+    let event = UIEvent()
+
+    for startsInside in [true, false] {
+      let first = startsInside ? inside : outside
+      let second = startsInside ? outside : inside
+      boundary.touchesBegan([first], with: event)
+      boundary.touchesBegan([second], with: event)
+      boundary.touchesEnded([first], with: event)
+      XCTAssertEqual(surface.touchStartedOutside, !startsInside)
+      XCTAssertEqual(boundary.canPrevent(scroll.panGestureRecognizer), startsInside)
+      XCTAssertFalse(boundary.canPrevent(UITapGestureRecognizer()))
+      boundary.touchesEnded([second], with: event)
+      boundary.reset()
+    }
+    surface.removeFromSuperview()
+    XCTAssertEqual(Set(scroll.gestureRecognizers ?? []), existing)
+  }
+
   func testFullscreenControlCoordinatesAreExcludedFromPlaybackGestures() async throws {
     for (width, typeSize) in [(CGFloat(390), DynamicTypeSize.large), (320, .accessibility3)] {
       let session = try await readySession()
