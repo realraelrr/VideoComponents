@@ -14,7 +14,6 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
   let placeholderImage: (@MainActor () -> UIImage?)?
   let sourceIdentity: AnyHashable?
 
-  @State private var isZooming = false
   @State private var isMultiTouchGestureActive = false
   @State private var isChromeVisible = true
   @State private var isVideoTouchActive = false
@@ -78,7 +77,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
 
       ZoomableVideoContainer(
         contentAspectRatio: playbackSession.videoAspectRatio,
-        isZooming: $isZooming,
+        isZooming: .constant(false),
         isMultiTouchGestureActive: $isMultiTouchGestureActive,
         isGestureEnabled: playbackSession.canUsePlaybackControls,
         cornerRadius: 0,
@@ -228,7 +227,7 @@ public struct FullscreenPlaybackView<TrailingAccessory: View, StatusOverlay: Vie
   }
 
   private var showsPlaybackControls: Bool {
-    playbackSession.canTogglePlayback && showsChrome && !isZooming && !isMultiTouchGestureActive
+    playbackSession.canTogglePlayback && showsChrome && !isMultiTouchGestureActive
   }
 
   private var autoHideRequestID: UUID? {

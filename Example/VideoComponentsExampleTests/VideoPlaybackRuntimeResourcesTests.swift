@@ -2734,7 +2734,7 @@ extension VideoPlaybackMountedTests {
     }
   }
 
-  func testFullscreenHighQualityAndPlaybackControlsHideWhileZoomedUntilReset() async throws {
+  func testFullscreenProgressRemainsAdjustableAfterPinching() async throws {
     try await requireNativeControlAccessibilityRuntime()
     let session = try await readySession()
     session.updatePlaybackRate(1.5)
@@ -2757,7 +2757,14 @@ extension VideoPlaybackMountedTests {
         state: state, numberOfTouches: 2))
     }
     try await Task.sleep(for: .milliseconds(50))
-    assertFullscreenPlaybackControls(in: host.view, session: session, labels: labels, region: region, visible: false)
+    assertFullscreenPlaybackControls(in: host.view, session: session, labels: labels, region: region, visible: true)
+    let progress = try XCTUnwrap(fullscreenAccessibilityElements(in: host.view).first { $0.accessibilityLabel == labels.progress })
+    progress.accessibilityIncrement()
+    for _ in 0..<100 where session.player.currentTime().seconds < 0.04 {
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    XCTAssertEqual(session.player.currentTime().seconds, session.durationSeconds * 0.05, accuracy: 0.01)
+    XCTAssertTrue(coordinator.isZoomed)
     let close = try XCTUnwrap(highQualityButton(in: host.view, label: labels.close))
     XCTAssertTrue(close.accessibilityActivate())
     XCTAssertEqual(closes, 1)
@@ -2822,7 +2829,7 @@ extension VideoPlaybackMountedTests {
     }
   }
 
-  func testRenderedFullscreenControlsStayHiddenWhileZoomed() async throws {
+  func testRenderedFullscreenControlsFollowChromeVisibilityWhileZoomed() async throws {
     let session = try await readySession()
     session.updatePlaybackRate(1.5)
     let host = UIHostingController(rootView: FullscreenPlaybackView(
@@ -2835,12 +2842,25 @@ extension VideoPlaybackMountedTests {
     assertRenderedFullscreenControls(in: host.view, visible: true, name: "Controls before zoom")
     let surface = try XCTUnwrap(findGestureSurface(host.view))
     let coordinator = try XCTUnwrap(surface.gestureRecognizers?.first?.delegate as? VideoGestureSurface.Coordinator)
-    for (state, scale) in [(UIGestureRecognizer.State.began, CGFloat(1)), (.changed, 2), (.ended, 2)] {
+    for (state, scale) in [(UIGestureRecognizer.State.began, CGFloat(1)), (.changed, 2)] {
       coordinator.onPinchUpdate(.init(scale: scale, location: CGPoint(x: 195, y: 350),
         state: state, numberOfTouches: 2))
     }
     try await Task.sleep(for: .milliseconds(50))
-    assertRenderedFullscreenControls(in: host.view, visible: false, name: "Zoom ended with playback controls hidden")
+    assertRenderedFullscreenControls(in: host.view, visible: false, name: "Controls hidden during pinch")
+    coordinator.onPinchUpdate(.init(scale: 2, location: CGPoint(x: 195, y: 350), state: .ended, numberOfTouches: 0))
+    try await Task.sleep(for: .milliseconds(50))
+    assertRenderedFullscreenControls(in: host.view, visible: true, name: "Zoomed controls after release")
+
+    try await Task.sleep(for: .milliseconds(3_400))
+    let hidden = try fullscreenRenderedControlPixelCounts(in: host.view, name: "Zoomed controls after idle timeout")
+    XCTAssertEqual(hidden.playback, 0)
+    let tap = try XCTUnwrap(coordinator.singleTapRecognizer)
+    coordinator.tapRecognizer?.setValue(UIGestureRecognizer.State.failed.rawValue, forKey: "state")
+    tap.setValue(UIGestureRecognizer.State.ended.rawValue, forKey: "state")
+    try await Task.sleep(for: .milliseconds(50))
+    assertRenderedFullscreenControls(in: host.view, visible: true, name: "Single tap while zoomed restores controls")
+    XCTAssertTrue(coordinator.isZoomed)
     XCTAssertFalse(session.isPlaybackRequested)
   }
 
