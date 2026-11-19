@@ -14,7 +14,7 @@ public enum SlowVideoExportError: Error {
 
 @MainActor
 public enum SlowVideoExporter {
-  /// Exports an MP4 at a finite rate in 0.25...1.0, preserving track orientation
+  /// Exports an MP4 at a finite rate in 0.25...1.25, preserving track orientation
   /// and audio timing. The actual source audio mix follows rebuilt audio track IDs
   /// and the scaled volume timeline. The existing local output directory receives a unique file.
   ///
@@ -29,7 +29,7 @@ public enum SlowVideoExporter {
     onProgress: @escaping @MainActor (Double) -> Void
   ) async throws -> URL {
     try Task.checkCancellation()
-    guard rate.isFinite, (0.25...1).contains(rate) else {
+    guard rate.isFinite, (0.25...1.25).contains(rate) else {
       throw SlowVideoExportError.invalidRate
     }
     let slowed: (composition: AVMutableComposition, audioMix: AVAudioMix?)

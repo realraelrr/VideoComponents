@@ -244,7 +244,7 @@ final class PlaybackReplacementTests: XCTestCase {
     defer { session.cleanup() }
     session.updatePlaybackRate(1.25)
     session.handleHoldGestureStateChanged(.began, allowsHoldBoost: true)
-    XCTAssertEqual(session.player.rate, 2.5, accuracy: 0.01)
+    XCTAssertEqual(session.player.rate, 2, accuracy: 0.01)
     let replacement = Task { try await session.replaceAsset(PlaybackLoadedMedia(asset: asset), for: "A") }
     defer { replacement.cancel() }
     try await waitUntil { transport.finished.last == true }

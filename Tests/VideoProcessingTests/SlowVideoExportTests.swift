@@ -10,7 +10,7 @@ final class SlowVideoExportIntegrationTests: XCTestCase {
   func testRejectsInvalidRatesWithoutCreatingFilesOrReportingProgress() async throws {
     let directory = try outputDirectory()
     var progress: [Double] = []
-    for rate in [Double.nan, .infinity, -.infinity, -1, 0, 0.249, 1.001] {
+    for rate in [Double.nan, .infinity, -.infinity, -1, 0, 0.249, 1.251] {
       do {
         _ = try await SlowVideoExporter.exportSlowedVideo(
           asset: AVMutableComposition(), rate: rate, outputDirectory: directory,
@@ -65,7 +65,7 @@ final class SlowVideoExportIntegrationTests: XCTestCase {
 
   func testRealExporterScalesDurationAndPreservesRotatedDecodableFrames() async throws {
     let source = try await videoFixture()
-    for speed in [0.25, 0.5, 0.75, 1.0] {
+    for speed in [0.25, 0.5, 0.75, 1.0, 1.25] {
       var progress: [Double] = []
       let output = try await SlowVideoExporter.exportSlowedVideo(
         asset: source, rate: speed, onProgress: { progress.append($0) }
@@ -242,7 +242,7 @@ final class SlowVideoExportIntegrationTests: XCTestCase {
     let mix = AVMutableAudioMix()
     mix.inputParameters = [parameters]
     let directory = try outputDirectory()
-    for rate in [0.5, 1.0] {
+    for rate in [0.5, 1.0, 1.25] {
       let untreated = try await SlowVideoExporter.exportSlowedVideo(
         asset: source, rate: rate, outputDirectory: directory, onProgress: { _ in })
       let mixed = try await SlowVideoExporter.exportSlowedVideo(
@@ -277,7 +277,7 @@ final class SlowVideoExportIntegrationTests: XCTestCase {
     // Ordering differs deliberately from source track ordering.
     mix.inputParameters = [quiet, loud]
     let directory = try outputDirectory()
-    for rate in [0.5, 1.0] {
+    for rate in [0.5, 1.0, 1.25] {
       let untreated = try await SlowVideoExporter.exportSlowedVideo(
         asset: source, rate: rate, outputDirectory: directory, onProgress: { _ in })
       let mixed = try await SlowVideoExporter.exportSlowedVideo(

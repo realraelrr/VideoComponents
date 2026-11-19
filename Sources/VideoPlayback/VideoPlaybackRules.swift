@@ -3,7 +3,6 @@ import Foundation
 
 public struct VideoPlaybackConfig: Equatable {
   public static let normalRate: Float = 1.0
-  private static let holdBoostMultiplier: Float = 2.0
 
   public private(set) var playbackRate: Float
   public private(set) var isLooping: Bool
@@ -17,9 +16,7 @@ public struct VideoPlaybackConfig: Equatable {
   }
 
   public var holdBoostedRate: Float {
-    let rate = playbackRate
-    guard rate >= Self.normalRate else { return Self.normalRate }
-    return rate * Self.holdBoostMultiplier
+    playbackRate < Self.normalRate ? Self.normalRate : max(2, playbackRate)
   }
 
   mutating func update(playbackRate: Float, isLooping: Bool) {
