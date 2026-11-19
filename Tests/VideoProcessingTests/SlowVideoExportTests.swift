@@ -91,6 +91,31 @@ final class SlowVideoExportIntegrationTests: XCTestCase {
     }
   }
 
+  func testAcceleratedVideoEndsAtItsOwnEditBoundaryBeforeTheAudioTail() async throws {
+    let source = try await videoFixture()
+    let sourceTracks = try await source.loadTracks(withMediaType: .video)
+    let picture = try XCTUnwrap(sourceTracks.first)
+    let audioSource = AVURLAsset(url: try audioFixture())
+    let audioTracks = try await audioSource.loadTracks(withMediaType: .audio)
+    let sound = try XCTUnwrap(audioTracks.first)
+    let input = AVMutableComposition()
+    let video = try XCTUnwrap(input.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid))
+    let audio = try XCTUnwrap(input.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid))
+    let pictureDuration = CMTime(value: 575, timescale: 600)
+    try video.insertTimeRange(CMTimeRange(start: .zero, duration: pictureDuration), of: picture, at: .zero)
+    try audio.insertTimeRange(CMTimeRange(start: .zero, duration: CMTime(value: 1, timescale: 1)), of: sound, at: .zero)
+
+    for rate in [1.16, 1.17, 1.25] {
+      let result = try await SlowVideoExporter.slowedComposition(from: input, audioMix: nil, rate: rate)
+      let resultVideo = try await result.composition.loadTracks(withMediaType: .video)
+      let resultAudio = try await result.composition.loadTracks(withMediaType: .audio)
+      let videoEnd = try await XCTUnwrap(resultVideo.first).load(.timeRange).end.seconds
+      let audioEnd = try await XCTUnwrap(resultAudio.first).load(.timeRange).end.seconds
+      XCTAssertEqual(videoEnd, pictureDuration.seconds / rate, accuracy: 0.002)
+      XCTAssertEqual(audioEnd, 1 / rate, accuracy: 0.002)
+    }
+  }
+
   func testShortOffsetAudioKeepsItsScaledTimeline() async throws {
     let source = try await videoFixture()
     let composition = AVMutableComposition()

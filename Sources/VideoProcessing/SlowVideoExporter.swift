@@ -57,7 +57,7 @@ public enum SlowVideoExporter {
       .export(onProgress: onProgress)
   }
 
-  private static func slowedComposition(
+  static func slowedComposition(
     from asset: AVAsset,
     audioMix: AVAudioMix?,
     rate: Double
@@ -70,54 +70,33 @@ public enum SlowVideoExporter {
 
     let composition = AVMutableComposition()
     let sourceTimeRange = CMTimeRange(start: .zero, duration: duration)
-    let scaledDuration = CMTimeMultiplyByFloat64(duration, multiplier: 1.0 / rate)
-    var insertedTrack = false
-
-    let videoTracks = try await asset.loadTracks(withMediaType: .video)
-    for sourceTrack in videoTracks {
-      guard try await sourceTrack.load(.isEnabled) else { continue }
-      guard let compositionTrack = composition.addMutableTrack(
-        withMediaType: .video,
-        preferredTrackID: kCMPersistentTrackID_Invalid
-      ) else {
-        continue
-      }
-      try compositionTrack.insertTimeRange(
-        sourceTimeRange,
-        of: sourceTrack,
-        at: .zero
-      )
-      compositionTrack.scaleTimeRange(
-        sourceTimeRange,
-        toDuration: scaledDuration
-      )
-      compositionTrack.preferredTransform = try await sourceTrack.load(.preferredTransform)
-      insertedTrack = true
-    }
-
-    let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+    var insertedVideo = false
     var rebuiltAudioTracks: [CMPersistentTrackID: AVMutableCompositionTrack] = [:]
-    for sourceTrack in audioTracks {
-      guard try await sourceTrack.load(.isEnabled) else { continue }
-      guard let compositionTrack = composition.addMutableTrack(
-        withMediaType: .audio,
-        preferredTrackID: kCMPersistentTrackID_Invalid
-      ) else {
-        continue
+    for sourceTrack in try await asset.load(.tracks) {
+      let type = sourceTrack.mediaType
+      guard type == .video || type == .audio, try await sourceTrack.load(.isEnabled) else { continue }
+
+      // A movie's edit list can end the picture before the soundtrack or start a track late.
+      let trackRange = try await sourceTrack.load(.timeRange)
+      let range = CMTimeRangeGetIntersection(trackRange, otherRange: sourceTimeRange)
+      guard range.duration.isNumeric, range.duration > .zero,
+            let track = composition.addMutableTrack(withMediaType: type, preferredTrackID: kCMPersistentTrackID_Invalid)
+      else { continue }
+
+      let start = CMTimeMultiplyByFloat64(range.start, multiplier: 1 / rate)
+      let end = CMTimeMultiplyByFloat64(range.end, multiplier: 1 / rate)
+      try track.insertTimeRange(range, of: sourceTrack, at: start)
+      track.scaleTimeRange(CMTimeRange(start: start, duration: range.duration), toDuration: end - start)
+
+      if type == .video {
+        track.preferredTransform = try await sourceTrack.load(.preferredTransform)
+        insertedVideo = true
+      } else {
+        rebuiltAudioTracks[sourceTrack.trackID] = track
       }
-      try compositionTrack.insertTimeRange(
-        sourceTimeRange,
-        of: sourceTrack,
-        at: .zero
-      )
-      compositionTrack.scaleTimeRange(
-        sourceTimeRange,
-        toDuration: scaledDuration
-      )
-      rebuiltAudioTracks[sourceTrack.trackID] = compositionTrack
     }
 
-    guard insertedTrack else {
+    guard insertedVideo else {
       throw SlowVideoExportError.noVideoTrack
     }
 
