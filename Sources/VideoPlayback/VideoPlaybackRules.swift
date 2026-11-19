@@ -57,7 +57,7 @@ enum VideoPlaybackRateDisplay {
 
 enum VideoZoomConfig {
   static let minScale: CGFloat = 1.0
-  static let maxScale: CGFloat = 3.0
+  static let maxScale: CGFloat = 6.0
   static let zoomThreshold: CGFloat = 1.01
 
   static func clampedScale(_ scale: CGFloat) -> CGFloat {

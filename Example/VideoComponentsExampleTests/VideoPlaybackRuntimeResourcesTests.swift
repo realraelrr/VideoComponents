@@ -83,13 +83,14 @@ final class VideoPlaybackMountedTests: XCTestCase {
     try await Task.sleep(for: .milliseconds(50))
     // This source point is under the second pinch's fingers after the first zoom and pan.
     let before = try XCTUnwrap(renderedPixels(in: host.view, matching: { $0 > 200 && $1 < 60 && $2 > 200 }))
-    let focusBefore = CGPoint(x: before.midX, y: before.midY)
-    XCTAssertEqual(focusBefore.x, 260, accuracy: 1)
-    try await pinch(at: focusBefore, scale: 1.5)
+    let focus = CGPoint(x: 260, y: 225)
+    XCTAssertEqual(before.midX, focus.x, accuracy: 1)
+    XCTAssertEqual(before.midY, focus.y, accuracy: 1)
+    try await pinch(at: focus, scale: 4)
     let after = try XCTUnwrap(renderedPixels(in: host.view, matching: { $0 > 200 && $1 < 60 && $2 > 200 }))
-    let focusAfter = CGPoint(x: after.midX, y: after.midY)
-    XCTAssertEqual(focusAfter.x, focusBefore.x, accuracy: 1, "The video point beneath the fingers must remain there on a second pinch")
-    XCTAssertEqual(focusAfter.y, focusBefore.y, accuracy: 1)
+    XCTAssertEqual(after.width, before.width * 3, accuracy: 2, "A second pinch from 2× stops at 6×")
+    XCTAssertEqual(after.midX, focus.x, accuracy: 1, "The video point beneath the fingers must remain there on a second pinch")
+    XCTAssertEqual(after.midY, focus.y, accuracy: 1)
   }
 
   func testBlockingStatusCannotCoverOrInterceptFullscreenClose() async throws {
