@@ -7,6 +7,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
   let allowsHoldBoost: Bool
   let isFullscreenPresented: Bool
   let isScrollInteractionActive: Binding<Bool>?
+  let contentLayout: ((_ video: AnyView, _ transport: AnyView?) -> AnyView)?
   let maximumCardSize: CGSize
   let topTrailingAccessory: () -> TopTrailingAccessory
   let onRequestFullscreen: (() -> Void)?
@@ -31,6 +32,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
     style: VideoPlaybackStyle = .init(),
     placeholderImage: (@MainActor () -> UIImage?)? = nil,
     sourceIdentity: AnyHashable? = nil,
+    contentLayout: ((_ video: AnyView, _ transport: AnyView?) -> AnyView)? = nil,
     @ViewBuilder statusOverlay: @escaping () -> StatusOverlay
   ) {
     self.playbackSession = playbackSession
@@ -45,6 +47,7 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
     self.statusOverlay = statusOverlay
     self.placeholderImage = placeholderImage
     self.sourceIdentity = sourceIdentity
+    self.contentLayout = contentLayout
   }
 
   public var body: some View {
@@ -62,20 +65,26 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
 
   @ViewBuilder
   private var playerBody: some View {
-    VStack(alignment: .center, spacing: 12) {
-      AdaptiveVideoCardLayout(
-        contentAspectRatio: videoAspectRatio,
-        maximumSize: maximumCardSize
-      ) {
-        videoCard
-          .clipShape(RoundedRectangle(cornerRadius: 12))
-      }
-      .frame(maxWidth: .infinity, alignment: .center)
-
-      if playbackSession.canTogglePlayback {
-        inlinePlaybackControls
+    if let contentLayout {
+      contentLayout(AnyView(mediaCard), playbackSession.canTogglePlayback ? AnyView(inlinePlaybackControls) : nil)
+    } else {
+      VStack(alignment: .center, spacing: 12) {
+        mediaCard
+        if playbackSession.canTogglePlayback {
+          inlinePlaybackControls
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(style.background, in: RoundedRectangle(cornerRadius: 12))
+        }
       }
     }
+  }
+
+  private var mediaCard: some View {
+    AdaptiveVideoCardLayout(contentAspectRatio: videoAspectRatio, maximumSize: maximumCardSize) {
+      videoCard.clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+    .frame(maxWidth: .infinity, alignment: .center)
   }
 
   private var videoCard: some View {
@@ -159,9 +168,6 @@ public struct InlinePlaybackView<TopTrailingAccessory: View, StatusOverlay: View
     )
     .buttonStyle(.plain)
     .foregroundStyle(style.foreground)
-    .padding(.horizontal, 12)
-    .padding(.vertical, 8)
-    .background(style.background, in: RoundedRectangle(cornerRadius: 12))
   }
 
   private var shouldLockOuterScroll: Bool {
